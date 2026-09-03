@@ -32,6 +32,9 @@ dependencies = [
     "llama-index-vector-stores-postgres>=0.7.3",
     "llama-index-vector-stores-milvus>=0.9.6",
     "llama-index-vector-stores-weaviate>=1.4.1",
+    # LlamaIndex imports a private Weaviate client helper that was removed in
+    # 4.20.0; keep the adapter runtime on the compatible client line.
+    "weaviate-client==4.18.3",
     "llama-index-vector-stores-pinecone>=0.7.1",
     "llama-index-vector-stores-qdrant>=0.9.1",
     # 1.17.0 has a bug: grpc.UpdateMode | None fails with protobuf's EnumTypeWrapper

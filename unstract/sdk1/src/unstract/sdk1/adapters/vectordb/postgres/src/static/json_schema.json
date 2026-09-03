@@ -1,5 +1,6 @@
 {
   "title": "Postgres Vector DB",
+  "description": "Local Docker defaults are pre-filled for the bundled pgvector service. Replace them when connecting to another PostgreSQL server.",
   "type": "object",
   "required": [
     "adapter_name",
@@ -13,17 +14,19 @@
     "adapter_name": {
       "type": "string",
       "title": "Name",
-      "default": "",
+      "default": "postgres-vector-local",
       "description": "Provide a unique name for this adapter instance. Example: pg-vdb-1"
     },
     "database": {
       "type": "string",
       "title": "Database",
+      "default": "unstract_db",
       "description": "Provide a name for the database"
     },
     "host": {
       "type": "string",
       "title": "Host",
+      "default": "postgres-vector",
       "description": "Hostname"
     },
     "port": {
@@ -34,19 +37,20 @@
     "user": {
       "type": "string",
       "title": "User",
+      "default": "unstract_dev",
       "description": "Username"
     },
     "password": {
       "type": "string",
       "title": "Password",
       "format": "password",
-      "default": ""
+      "default": "unstract_pass"
     },
     "enable_ssl": {
       "type": "boolean",
       "title": "Enable SSL",
       "description": "On selecting the checkbox, data encryption using SSL is enabled",
-      "default": true
+      "default": false
     }
   }
 }

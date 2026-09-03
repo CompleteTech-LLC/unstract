@@ -1,5 +1,6 @@
 {
   "title": "Weaviate Vector DB",
+  "description": "Local Docker defaults are pre-filled for the bundled anonymous Weaviate service. Replace them when connecting to Weaviate Cloud or another server.",
   "type": "object",
   "required": [
     "adapter_name",
@@ -9,20 +10,20 @@
     "adapter_name": {
       "type": "string",
       "title": "Name",
-      "default": "",
+      "default": "weaviate-local",
       "description": "Provide a unique name for this adapter instance. Example: weaviate-vdb-1"
     },
     "url": {
       "type": "string",
       "title": "URL",
-      "default": "",
+      "default": "http://weaviate:8080",
       "format": "uri",
-      "description": "The URL of the Vector DB instance. Example: https://<your-instance>.weaviate.network"
+      "description": "The URL of the Vector DB instance. Local Docker: http://weaviate:8080. Cloud example: https://<your-instance>.weaviate.network"
     },
     "api_key": {
       "type": "string",
       "title": "Api Key",
-      "deafult": "",
+      "default": "",
       "format": "password"
     }
   }
