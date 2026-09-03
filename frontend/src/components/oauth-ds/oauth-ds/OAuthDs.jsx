@@ -17,6 +17,8 @@ function OAuthDs({
   setStatus,
   selectedSourceId,
   isExistingConnector,
+  hasOAuthCredentials = false,
+  oauthAccountLabel,
   adapterInstanceId,
   onModelsLoaded,
   disabled = false,
@@ -31,6 +33,12 @@ function OAuthDs({
 
   // Determine button text based on connector state and provider
   const getButtonText = () => {
+    if (
+      oAuthProvider === O_AUTH_PROVIDERS.OPENAI &&
+      hasOAuthCredentials
+    ) {
+      return "Authenticated";
+    }
     if (isExistingConnector) {
       return "Reauthenticate";
     }
@@ -341,7 +349,7 @@ function OAuthDs({
         disabled={disabled}
         verificationUrl={deviceLogin?.verification_url}
         userCode={deviceLogin?.user_code}
-        accountLabel={deviceLogin?.account_label}
+        accountLabel={deviceLogin?.account_label || oauthAccountLabel}
       />
     );
   }
@@ -355,6 +363,8 @@ OAuthDs.propTypes = {
   setStatus: PropTypes.func,
   selectedSourceId: PropTypes.string.isRequired,
   isExistingConnector: PropTypes.bool,
+  hasOAuthCredentials: PropTypes.bool,
+  oauthAccountLabel: PropTypes.string,
   adapterInstanceId: PropTypes.string,
   onModelsLoaded: PropTypes.func,
   disabled: PropTypes.bool,

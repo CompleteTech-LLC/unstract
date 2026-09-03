@@ -163,6 +163,21 @@ def test_openai_oauth_dynamic_schema_uses_model_specific_reasoning_levels() -> N
     ]
 
 
+def test_openai_oauth_dynamic_schema_accepts_string_reasoning_levels() -> None:
+    schema = build_openai_oauth_json_schema(
+        [
+            {
+                "slug": "account-model",
+                "supported_reasoning_levels": ["low", "medium", "high"],
+            }
+        ],
+        base_schema=json.loads(OpenAIOAuthLLMAdapter.get_json_schema()),
+    )
+
+    reasoning = schema["allOf"][1]["then"]["properties"]["reasoning_effort"]
+    assert reasoning["enum"] == ["low", "medium", "high"]
+
+
 def test_openai_oauth_parameters_normalize_model_and_fix_endpoint() -> None:
     metadata = _metadata("access", "account")
     metadata["model"] = "openai/gpt-5-codex"

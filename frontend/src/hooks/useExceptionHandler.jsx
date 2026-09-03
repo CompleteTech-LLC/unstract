@@ -1,3 +1,4 @@
+import { useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { getRequestIdFromError } from "../helpers/requestId";
@@ -5,7 +6,7 @@ import { getRequestIdFromError } from "../helpers/requestId";
 const useExceptionHandler = () => {
   const navigate = useNavigate();
 
-  const handleException = (
+  const handleException = useCallback((
     err,
     errMessage = "Something went wrong",
     setBackendErrors = undefined,
@@ -99,7 +100,7 @@ const useExceptionHandler = () => {
     } else {
       return alert(errMessage);
     }
-  };
+  }, [navigate]);
 
   return handleException;
 };

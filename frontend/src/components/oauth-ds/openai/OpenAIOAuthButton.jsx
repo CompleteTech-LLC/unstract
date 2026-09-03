@@ -41,7 +41,7 @@ const OpenAIOAuthButton = ({
           and enter code <strong>{userCode}</strong>.
         </Typography.Paragraph>
       )}
-      {status === "success" && accountLabel && (
+      {accountLabel && (
         <Typography.Text type="secondary" className="openai-oauth-account">
           {accountLabel}
         </Typography.Text>

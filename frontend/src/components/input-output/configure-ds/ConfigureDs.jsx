@@ -128,6 +128,9 @@ function ConfigureDs({
       (metadata.provider && metadata.uid) ||
       metadata.oauth_authenticated);
   const isExistingConnector = Boolean(editItemId || hasOAuthCredentials);
+  const hasPersistedOAuthCredentials = Boolean(
+    !isConnector && isExistingConnector && hasOAuthCredentials,
+  );
 
   // Determine if OAuth authentication method is selected
   const isOAuthMethodSelected = () => {
@@ -227,14 +230,6 @@ function ConfigureDs({
     }
   }, [selectedSourceId, oAuthProvider, oauthStatusKey, oauthCacheKey]);
 
-  // Cleanup OAuth localStorage when component unmounts (modal close)
-  useEffect(() => {
-    return () => {
-      localStorage.removeItem(oauthCacheKey);
-      localStorage.removeItem(oauthStatusKey);
-    };
-  }, [oauthCacheKey, oauthStatusKey]);
-
   const handleTestConnection = (updatedFormData) => {
     // Check if there any error in form proceed to test connection only there is no error.
     if (formRef && !formRef.current?.validateForm()) {
@@ -243,7 +238,10 @@ function ConfigureDs({
     if (
       oAuthProvider?.length &&
       isOAuthMethodSelected() &&
-      (status !== "success" || !cacheKey?.length)
+      !(
+        (status === "success" && cacheKey?.length) ||
+        hasPersistedOAuthCredentials
+      )
     ) {
       const providerName =
         oAuthProvider === "google-oauth2"
@@ -290,8 +288,10 @@ function ConfigureDs({
           ...body["connector_metadata"],
           ...{ "oauth-key": cacheKey },
         };
-      } else {
+      } else if (cacheKey?.length) {
         url = `${url}?oauth-key=${encodeURIComponent(cacheKey)}`;
+      } else if (editItemId && hasPersistedOAuthCredentials) {
+        url = `${url}?adapter-instance-id=${encodeURIComponent(editItemId)}`;
       }
     }
 
@@ -487,6 +487,8 @@ function ConfigureDs({
             setStatus={handleSetStatus}
             selectedSourceId={selectedSourceId}
             isExistingConnector={isExistingConnector}
+            hasOAuthCredentials={hasPersistedOAuthCredentials}
+            oauthAccountLabel={metadata?.oauth_account_label}
             adapterInstanceId={editItemId}
             onModelsLoaded={handleOpenAIModelSchema}
           />

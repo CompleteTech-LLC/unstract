@@ -162,15 +162,19 @@ def _reasoning_levels(value: object) -> list[dict[str, str]]:
     levels: list[dict[str, str]] = []
     seen: set[str] = set()
     for item in value:
-        if not isinstance(item, Mapping):
+        if isinstance(item, str):
+            effort = item
+            description = item
+        elif isinstance(item, Mapping):
+            effort = item.get("effort") or item.get("reasoning_effort")
+            description = item.get("description")
+        else:
             continue
-        effort = item.get("effort") or item.get("reasoning_effort")
         if not isinstance(effort, str) or not effort.strip():
             continue
         effort = effort.strip()
         if effort in seen:
             continue
-        description = item.get("description")
         if not isinstance(description, str) or not description.strip():
             description = effort.replace("_", " ").replace("-", " ").title()
         levels.append({"effort": effort, "description": description.strip()})
@@ -346,24 +350,12 @@ def _selected_catalog_model(slugs: Sequence[str], current_model: str | None) -> 
 def _reasoning_schema_for_model(
     model: Mapping[str, Any],
 ) -> dict[str, Any] | None:
-    levels_value = model.get("supported_reasoning_levels")
-    if not isinstance(levels_value, list):
-        return None
-    levels = [
-        dict(level)
-        for level in levels_value
-        if isinstance(level, Mapping)
-        and isinstance(level.get("effort"), str)
-        and level["effort"].strip()
-    ]
+    levels = _reasoning_levels(model.get("supported_reasoning_levels"))
     if not levels:
         return None
 
-    efforts = [str(level["effort"]).strip() for level in levels]
-    effort_labels = [
-        str(level.get("description") or effort).strip()
-        for level, effort in zip(levels, efforts, strict=True)
-    ]
+    efforts = [level["effort"] for level in levels]
+    effort_labels = [level["description"] for level in levels]
     default_effort = model.get("default_reasoning_level")
     if default_effort not in efforts:
         default_effort = efforts[0]

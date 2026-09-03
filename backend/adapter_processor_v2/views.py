@@ -111,6 +111,31 @@ def _prepare_openai_oauth_payload(
     return payload, oauth_key
 
 
+def _saved_openai_oauth_metadata(request: Request) -> dict[str, Any] | None:
+    """Load one owned adapter's encrypted OAuth metadata for a test request."""
+    adapter_instance_id = request.query_params.get("adapter-instance-id")
+    if not adapter_instance_id:
+        return None
+    try:
+        adapter_uuid = uuid.UUID(adapter_instance_id)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValidationError(
+            {"adapter-instance-id": "OpenAI OAuth adapter was not found"}
+        ) from exc
+
+    adapter = (
+        AdapterInstance.objects.for_user(request.user)
+        .filter(pk=adapter_uuid)
+        .first()
+    )
+    if adapter is None or not is_openai_oauth_adapter(adapter.adapter_id):
+        raise ValidationError(
+            {"adapter-instance-id": "OpenAI OAuth adapter was not found"}
+        )
+    metadata = adapter.metadata
+    return metadata if isinstance(metadata, dict) else None
+
+
 def _consume_openai_oauth_key(cache_key: str | None, request: Request) -> None:
     """Best-effort cleanup after credentials are durably stored."""
     if not cache_key:
@@ -191,7 +216,12 @@ class AdapterViewSet(GenericViewSet):
     def test(self, request: Request) -> Response:
         """Tests the connector against the credentials passed."""
         payload = request.data.copy()
-        payload, _ = _prepare_openai_oauth_payload(request, payload)
+        existing_metadata = None
+        if is_openai_oauth_adapter(payload.get(AdapterKeys.ADAPTER_ID)):
+            existing_metadata = _saved_openai_oauth_metadata(request)
+        payload, _ = _prepare_openai_oauth_payload(
+            request, payload, existing_metadata=existing_metadata
+        )
         serializer: AdapterInstanceSerializer = self.get_serializer(data=payload)
         serializer.is_valid(raise_exception=True)
         adapter_id = serializer.validated_data.get(AdapterKeys.ADAPTER_ID)
