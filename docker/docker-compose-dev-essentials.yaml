@@ -127,10 +127,6 @@ services:
       - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_data:/var/lib/qdrant/data/
-    environment:
-      # This is a development-only key. The service is also bound to loopback
-      # so it is not exposed on the host's network interfaces.
-      QDRANT__SERVICE__API_KEY: "${LOCAL_VECTOR_DB_API_KEY:-unstract_vector_pass}"
     labels:
       - traefik.enable=false
 
@@ -159,9 +155,9 @@ services:
     labels:
       - traefik.enable=false
 
-  # Weaviate is configured for API-key auth so its connection settings match
-  # the local Qdrant setup. The adapter uses the local connector for this HTTP
-  # endpoint; no cloud account is required.
+  # Weaviate uses anonymous access for this loopback-only development service.
+  # The adapter uses the local connector for this HTTP endpoint; no cloud
+  # account or API key is required.
   weaviate:
     image: "cr.weaviate.io/semitechnologies/weaviate:1.39.2"
     container_name: unstract-weaviate
@@ -180,12 +176,7 @@ services:
       - weaviate_data:/var/lib/weaviate
     environment:
       QUERY_DEFAULTS_LIMIT: "25"
-      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "false"
-      AUTHENTICATION_APIKEY_ENABLED: "true"
-      AUTHENTICATION_APIKEY_ALLOWED_KEYS: "${LOCAL_VECTOR_DB_API_KEY:-unstract_vector_pass}"
-      AUTHENTICATION_APIKEY_USERS: "unstract-local"
-      AUTHORIZATION_ENABLE_RBAC: "true"
-      AUTHORIZATION_RBAC_ROOT_USERS: "unstract-local"
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
       PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
       DEFAULT_VECTORIZER_MODULE: "none"
       CLUSTER_HOSTNAME: "node1"

@@ -44,14 +44,16 @@ Pinecone is supported as a hosted provider and is intentionally not included
 in the local stack because it is not a self-hosted open-source service.
 
 The services use persistent named volumes and are bound to loopback on the host.
-The Unstract workers connect over the Compose network, so use the internal
-addresses below when creating an adapter in the UI:
+Qdrant and Weaviate use anonymous access because this is a local development
+stack; do not expose these ports beyond the local machine without adding
+authentication and TLS. The Unstract workers connect over the Compose network,
+so use the internal addresses below when creating an adapter in the UI:
 
 | Adapter | UI fields | Address from Unstract containers | Host address | Local credentials |
 |---------|-----------|----------------------------------|--------------|-------------------|
-| Qdrant | URL, API Key | `http://qdrant:6333` | `http://localhost:6333` | API key from `LOCAL_VECTOR_DB_API_KEY` (default: `unstract_vector_pass`) |
+| Qdrant | URL, API Key | `http://qdrant:6333` | `http://localhost:6333` | Leave API Key empty |
 | Postgres | Database, Host, Port, User, Password, Enable SSL | Host `postgres-vector`, port `5432` | Host `localhost`, port `5433` | Values from `docker/essentials.env`; set Enable SSL to `false` |
-| Weaviate | URL, API Key | `http://weaviate:8080` | `http://localhost:8084` | API key from `LOCAL_VECTOR_DB_API_KEY` (default: `unstract_vector_pass`) |
+| Weaviate | URL, API Key | `http://weaviate:8080` | `http://localhost:8084` | Leave API Key empty |
 | Milvus | URI, Token | `http://milvus:19530` | `http://localhost:19530` | Leave Token empty |
 
 For the Postgres adapter, use the `POSTGRES_USER`, `POSTGRES_PASSWORD`, and
