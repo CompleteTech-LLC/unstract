@@ -64,9 +64,12 @@ def test_openai_oauth_adapter_is_registered_with_auth_metadata() -> None:
         "gpt-5-codex",
     ]
     assert schema["allOf"][0]["then"]["properties"]["reasoning_effort"]["enum"] == [
+        "none",
         "low",
         "medium",
         "high",
+        "xhigh",
+        "max",
     ]
 
 

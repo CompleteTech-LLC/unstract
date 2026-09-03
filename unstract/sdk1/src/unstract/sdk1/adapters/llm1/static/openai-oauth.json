@@ -79,13 +79,24 @@
           "reasoning_effort": {
             "type": "string",
             "enum": [
+              "none",
               "low",
               "medium",
-              "high"
+              "high",
+              "xhigh",
+              "max"
+            ],
+            "enumNames": [
+              "None",
+              "Low",
+              "Medium",
+              "High",
+              "Extra high",
+              "Maximum"
             ],
             "default": "medium",
             "title": "Reasoning Effort",
-            "description": "Sets the reasoning strength when reasoning is enabled."
+            "description": "Sets the reasoning strength when reasoning is enabled. Use None to minimize reasoning overhead."
           }
         },
         "required": [
