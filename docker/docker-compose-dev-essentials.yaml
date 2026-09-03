@@ -159,7 +159,7 @@ services:
   # The adapter uses the local connector for this HTTP endpoint; no cloud
   # account or API key is required.
   weaviate:
-    image: "cr.weaviate.io/semitechnologies/weaviate:1.39.2"
+    image: "docker.io/semitechnologies/weaviate:1.39.2"
     container_name: unstract-weaviate
     restart: unless-stopped
     command:
