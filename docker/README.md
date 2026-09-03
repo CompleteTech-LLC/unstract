@@ -83,6 +83,12 @@ CPU and GPU services are separate so they can be benchmarked against the same
 model and workload. Model files are cached in persistent, model-specific
 volumes.
 
+The CPU services are defined in `docker-compose-local-embeddings.yaml`; the
+GPU services are defined in the separately included
+`docker-compose-local-embeddings-gpu.yaml`. This keeps the GPU runtime setup
+isolated while the root Compose file still exposes one consistent service
+matrix.
+
 | Model | Vector dimensions | CPU service / host port | GPU service / host port |
 |-------|-------------------:|-------------------------|-------------------------|
 | Qwen3-Embedding-0.6B | 1024 | qwen3-embedding-06b-cpu / 8101 | qwen3-embedding-06b-gpu / 8201 |

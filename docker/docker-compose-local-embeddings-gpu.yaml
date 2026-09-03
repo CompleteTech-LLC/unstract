@@ -1,0 +1,159 @@
+# Optional local Qwen3 GPU embedding services.
+#
+# This file is included separately from the CPU service file so the GPU
+# runtime can be reviewed, configured, and enabled without changing CPU
+# service definitions. Every service is still profile-gated.
+
+x-qwen3-gpu-healthcheck: &qwen3_gpu_healthcheck
+  test:
+    - CMD-SHELL
+    - >-
+      curl --fail --silent http://localhost:80/health >/dev/null ||
+      exit 1
+  interval: 15s
+  timeout: 10s
+  retries: 40
+  start_period: 10m
+
+x-qwen3-gpu-common: &qwen3_gpu_common
+  restart: unless-stopped
+  shm_size: 1gb
+  expose:
+    - "80"
+  environment:
+    HF_HOME: /data
+    HF_HUB_DISABLE_TELEMETRY: "1"
+    DO_NOT_TRACK: "1"
+    HF_TOKEN: ${HF_TOKEN:-}
+    TOKENIZERS_PARALLELISM: "false"
+  labels:
+    traefik.enable: "false"
+  stop_grace_period: 30s
+  healthcheck:
+    <<: *qwen3_gpu_healthcheck
+
+x-qwen3-gpu-image: &qwen3_gpu_image
+  ${QWEN3_TEI_GPU_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cuda-1.9}
+
+services:
+  qwen3-embedding-06b-gpu:
+    <<: *qwen3_gpu_common
+    image: *qwen3_gpu_image
+    container_name: unstract-qwen3-embedding-06b-gpu
+    profiles:
+      - embeddings-gpu
+      - embeddings-both
+    ports:
+      - "127.0.0.1:${QWEN3_06B_GPU_PORT:-8201}:80"
+    volumes:
+      - qwen3_embedding_06b_gpu_cache:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities:
+                - gpu
+    command:
+      - --model-id
+      - Qwen/Qwen3-Embedding-0.6B
+      - --revision
+      - ${QWEN3_06B_REVISION:-97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3}
+      - --served-model-name
+      - qwen3-embedding-06b
+      - --dtype
+      - float16
+      - --pooling
+      - last-token
+      - --max-batch-tokens
+      - ${QWEN3_GPU_MAX_BATCH_TOKENS:-8192}
+      - --max-client-batch-size
+      - ${QWEN3_GPU_MAX_CLIENT_BATCH_SIZE:-32}
+      - --max-concurrent-requests
+      - ${QWEN3_GPU_MAX_CONCURRENT_REQUESTS:-4}
+      - --tokenization-workers
+      - ${QWEN3_GPU_TOKENIZATION_WORKERS:-4}
+
+  qwen3-embedding-4b-gpu:
+    <<: *qwen3_gpu_common
+    image: *qwen3_gpu_image
+    container_name: unstract-qwen3-embedding-4b-gpu
+    profiles:
+      - embeddings-gpu
+      - embeddings-both
+    ports:
+      - "127.0.0.1:${QWEN3_4B_GPU_PORT:-8202}:80"
+    volumes:
+      - qwen3_embedding_4b_gpu_cache:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities:
+                - gpu
+    command:
+      - --model-id
+      - Qwen/Qwen3-Embedding-4B
+      - --revision
+      - ${QWEN3_4B_REVISION:-5cf2132abc99cad020ac570b19d031efec650f2b}
+      - --served-model-name
+      - qwen3-embedding-4b
+      - --dtype
+      - float16
+      - --pooling
+      - last-token
+      - --max-batch-tokens
+      - ${QWEN3_GPU_MAX_BATCH_TOKENS:-8192}
+      - --max-client-batch-size
+      - ${QWEN3_GPU_MAX_CLIENT_BATCH_SIZE:-32}
+      - --max-concurrent-requests
+      - ${QWEN3_GPU_MAX_CONCURRENT_REQUESTS:-4}
+      - --tokenization-workers
+      - ${QWEN3_GPU_TOKENIZATION_WORKERS:-4}
+
+  qwen3-embedding-8b-gpu:
+    <<: *qwen3_gpu_common
+    image: *qwen3_gpu_image
+    container_name: unstract-qwen3-embedding-8b-gpu
+    profiles:
+      - embeddings-gpu
+      - embeddings-both
+    ports:
+      - "127.0.0.1:${QWEN3_8B_GPU_PORT:-8203}:80"
+    volumes:
+      - qwen3_embedding_8b_gpu_cache:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities:
+                - gpu
+    command:
+      - --model-id
+      - Qwen/Qwen3-Embedding-8B
+      - --revision
+      - ${QWEN3_8B_REVISION:-1d8ad4ca9b3dd8059ad90a75d4983776a23d44af}
+      - --served-model-name
+      - qwen3-embedding-8b
+      - --dtype
+      - float16
+      - --pooling
+      - last-token
+      - --max-batch-tokens
+      - ${QWEN3_GPU_MAX_BATCH_TOKENS:-8192}
+      - --max-client-batch-size
+      - ${QWEN3_GPU_MAX_CLIENT_BATCH_SIZE:-32}
+      - --max-concurrent-requests
+      - ${QWEN3_GPU_MAX_CONCURRENT_REQUESTS:-4}
+      - --tokenization-workers
+      - ${QWEN3_GPU_TOKENIZATION_WORKERS:-4}
+
+volumes:
+  qwen3_embedding_06b_gpu_cache:
+  qwen3_embedding_4b_gpu_cache:
+  qwen3_embedding_8b_gpu_cache:
