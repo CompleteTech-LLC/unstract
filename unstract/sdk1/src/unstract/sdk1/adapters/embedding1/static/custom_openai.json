@@ -33,6 +33,18 @@
       "title": "API Base",
       "description": "Base URL for the OpenAI-compatible embeddings endpoint. Examples: https://gateway.example.com/v1, https://llm.example.net/openai/v1"
     },
+    "query_prefix": {
+      "type": "string",
+      "title": "Query Prefix",
+      "default": "",
+      "description": "Optional text prepended to search queries before embedding. Use this for asymmetric models such as Qwen3. Example: Instruct: Given a web search query, retrieve relevant passages that answer the query\\nQuery: "
+    },
+    "passage_prefix": {
+      "type": "string",
+      "title": "Passage Prefix",
+      "default": "",
+      "description": "Optional text prepended to indexed passages before embedding. Leave empty when the model's retrieval instructions apply only to queries."
+    },
     "max_retries": {
       "type": "number",
       "minimum": 0,
