@@ -56,6 +56,15 @@ so use the internal addresses below when creating an adapter in the UI:
 | Weaviate | URL, API Key | `http://weaviate:8080` | `http://localhost:8084` | Leave API Key empty |
 | Milvus | URI, Token | `http://milvus:19530` | `http://localhost:19530` | Leave Token empty |
 
+When the adapter schema is served by the local development stack, these
+internal values are pre-filled in the form, including the sample PostgreSQL
+credentials from `docker/essentials.env` and SSL disabled for the local
+connection. If `essentials.env` has customized the PostgreSQL credentials,
+replace the pre-filled values with the customized values before testing the
+connection. Keep the container DNS names (`qdrant`, `postgres-vector`,
+`weaviate`, and `milvus`) when the adapter is used by Unstract workers; use the
+host addresses only for clients running outside the Compose network.
+
 For the Postgres adapter, use the `POSTGRES_USER`, `POSTGRES_PASSWORD`, and
 `POSTGRES_DB` values in `docker/essentials.env`; the vector database has its own
 container and volume even though it reuses the platform's local development
