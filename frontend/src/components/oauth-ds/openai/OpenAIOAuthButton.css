@@ -1,0 +1,17 @@
+.openai-oauth-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 20px;
+}
+
+.openai-oauth-instructions {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.openai-oauth-account {
+  display: block;
+  font-size: 12px;
+}

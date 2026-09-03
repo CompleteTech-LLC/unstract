@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
+
 from unstract.sdk1.adapters.constants import AdapterDocs, Common
 from unstract.sdk1.adapters.enums import AdapterTypes
 
@@ -254,6 +255,11 @@ class BaseAdapter(ABC):
     @classmethod
     def get_doc_url(cls) -> str:
         return AdapterDocs.type_index_url(cls.get_adapter_type())
+
+    @classmethod
+    def get_auth_metadata(cls) -> dict[str, "Any"]:
+        """Return optional authentication metadata for the UI/API catalog."""
+        return {}
 
     @classmethod
     def get_json_schema(cls) -> str:

@@ -1,6 +1,6 @@
 import { Info } from "lucide-react";
 import PropTypes from "prop-types";
-import { createRef, useEffect, useState } from "react";
+import { createRef, useCallback, useEffect, useState } from "react";
 import { Col, Row } from "@/components/ui/shims/antd-layout";
 import { Popover } from "@/components/ui/shims/antd-overlays";
 
@@ -36,6 +36,7 @@ function ConfigureDs({
   const [isTcSuccessful, setIsTcSuccessful] = useState(false);
   const [isTcLoading, setIsTcLoading] = useState(false);
   const [isSubmitApiLoading, setIsSubmitApiLoading] = useState(false);
+  const [oauthSpec, setOAuthSpec] = useState(null);
 
   const [cacheKey, setCacheKey] = useState("");
   const [status, setStatus] = useState("");
@@ -54,9 +55,78 @@ function ConfigureDs({
   const oauthCacheKey = `oauth-cachekey-${selectedSourceId}`;
   const oauthStatusKey = `oauth-status-${selectedSourceId}`;
 
+  const findReasoningSchema = useCallback((schema, model) => {
+    if (!schema || !model || !Array.isArray(schema.allOf)) {
+      return undefined;
+    }
+    const condition = schema.allOf.find(
+      (candidate) =>
+        candidate?.if?.properties?.enable_reasoning?.const === true &&
+        candidate?.if?.properties?.model?.const === model,
+    );
+    return condition?.then?.properties?.reasoning_effort;
+  }, []);
+
+  const handleOpenAIModelSchema = useCallback(
+    (dynamicSchema) => {
+      const modelSchema = dynamicSchema?.properties?.model;
+      if (!Array.isArray(modelSchema?.enum) || modelSchema.enum.length === 0) {
+        return;
+      }
+
+      setOAuthSpec(dynamicSchema);
+      setFormData((currentFormData) => {
+        const current = currentFormData || {};
+        const next = { ...current };
+        if (!modelSchema.enum.includes(next.model)) {
+          next.model = modelSchema.default || modelSchema.enum[0];
+        }
+
+        if (next.enable_reasoning) {
+          const reasoningSchema = findReasoningSchema(dynamicSchema, next.model);
+          if (
+            Array.isArray(reasoningSchema?.enum) &&
+            reasoningSchema.enum.length > 0 &&
+            !reasoningSchema.enum.includes(next.reasoning_effort)
+          ) {
+            next.reasoning_effort =
+              reasoningSchema.default || reasoningSchema.enum[0];
+          }
+        }
+        return next;
+      });
+    },
+    [findReasoningSchema, setFormData],
+  );
+
+  useEffect(() => {
+    setOAuthSpec(null);
+  }, [spec]);
+
+  useEffect(() => {
+    if (!oauthSpec || !formData?.enable_reasoning || !formData?.model) {
+      return;
+    }
+    const reasoningSchema = findReasoningSchema(oauthSpec, formData.model);
+    if (
+      !Array.isArray(reasoningSchema?.enum) ||
+      reasoningSchema.enum.length === 0 ||
+      reasoningSchema.enum.includes(formData.reasoning_effort)
+    ) {
+      return;
+    }
+    setFormData((currentFormData) => ({
+      ...(currentFormData || {}),
+      reasoning_effort: reasoningSchema.default || reasoningSchema.enum[0],
+    }));
+  }, [findReasoningSchema, formData, oauthSpec, setFormData]);
+
   // Determine if this is a new or existing connector
   const hasOAuthCredentials =
-    metadata && (metadata.access_token || (metadata.provider && metadata.uid));
+    metadata &&
+    (metadata.access_token ||
+      (metadata.provider && metadata.uid) ||
+      metadata.oauth_authenticated);
   const isExistingConnector = Boolean(editItemId || hasOAuthCredentials);
 
   // Determine if OAuth authentication method is selected
@@ -176,7 +246,11 @@ function ConfigureDs({
       (status !== "success" || !cacheKey?.length)
     ) {
       const providerName =
-        oAuthProvider === "google-oauth2" ? "Google" : "OAuth provider";
+        oAuthProvider === "google-oauth2"
+          ? "Google"
+          : oAuthProvider === "openai-oauth"
+            ? "OpenAI"
+            : "OAuth provider";
       setAlertDetails({
         type: "error",
         content: `OAuth authentication required. Please sign in with ${providerName} first.`,
@@ -211,10 +285,14 @@ function ConfigureDs({
     }
 
     if (oAuthProvider?.length > 0 && isOAuthMethodSelected()) {
-      body["connector_metadata"] = {
-        ...body["connector_metadata"],
-        ...{ "oauth-key": cacheKey },
-      };
+      if (isConnector) {
+        body["connector_metadata"] = {
+          ...body["connector_metadata"],
+          ...{ "oauth-key": cacheKey },
+        };
+      } else {
+        url = `${url}?oauth-key=${encodeURIComponent(cacheKey)}`;
+      }
     }
 
     const requestOptions = {
@@ -311,7 +389,11 @@ function ConfigureDs({
       url = `${url}${editItemId}/`;
     }
 
-    if (oAuthProvider?.length > 0 && isOAuthMethodSelected()) {
+    if (
+      oAuthProvider?.length > 0 &&
+      isOAuthMethodSelected() &&
+      cacheKey?.length
+    ) {
       const encodedCacheKey = encodeURIComponent(cacheKey);
       url = url + `?oauth-key=${encodedCacheKey}`;
     }
@@ -342,6 +424,7 @@ function ConfigureDs({
         if (oAuthProvider?.length > 0 && isOAuthMethodSelected()) {
           localStorage.removeItem(oauthCacheKey);
           localStorage.removeItem(oauthStatusKey);
+          localStorage.removeItem(`oauth-device-${selectedSourceId}`);
         }
 
         setOpen(false);
@@ -389,7 +472,7 @@ function ConfigureDs({
         </div>
       )}
       <RjsfFormLayout
-        schema={spec}
+        schema={oauthSpec || spec}
         formData={formData}
         setFormData={setFormData}
         isLoading={isLoading}
@@ -404,6 +487,8 @@ function ConfigureDs({
             setStatus={handleSetStatus}
             selectedSourceId={selectedSourceId}
             isExistingConnector={isExistingConnector}
+            adapterInstanceId={editItemId}
+            onModelsLoaded={handleOpenAIModelSchema}
           />
         )}
         <Row className="config-row">
