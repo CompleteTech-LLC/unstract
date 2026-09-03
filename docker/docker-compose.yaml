@@ -403,7 +403,8 @@ services:
     # which is a different script and does understand roles.
     command: ["pg-queue-consumer"]
     ports:
-      - "8101:8090"
+      # 8101-8103 are reserved for the local Qwen3 CPU embedding profile.
+      - "8111:8090"
     env_file:
       - ../workers/.env
       - ./essentials.env

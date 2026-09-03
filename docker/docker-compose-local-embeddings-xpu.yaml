@@ -26,6 +26,8 @@ x-qwen3-xpu-common: &qwen3_xpu_common
     DO_NOT_TRACK: "1"
     HF_TOKEN: ${HF_TOKEN:-}
     TOKENIZERS_PARALLELISM: "false"
+    # Allow Level Zero to use large allocations on Intel XPU devices.
+    UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS: "1"
   labels:
     traefik.enable: "false"
   stop_grace_period: 30s
