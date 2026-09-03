@@ -52,8 +52,10 @@ function ConfigureDs({
   } = usePostHogEvents();
   const { getUrl } = useRequestUrl();
 
-  const oauthCacheKey = `oauth-cachekey-${selectedSourceId}`;
-  const oauthStatusKey = `oauth-status-${selectedSourceId}`;
+  const oauthStateScope = editItemId || selectedSourceId;
+  const oauthCacheKey = `oauth-cachekey-${oauthStateScope}`;
+  const oauthStatusKey = `oauth-status-${oauthStateScope}`;
+  const oauthDeviceKey = `oauth-device-${oauthStateScope}`;
 
   const findReasoningSchema = useCallback((schema, model) => {
     if (!schema || !model || !Array.isArray(schema.allOf)) {
@@ -424,7 +426,7 @@ function ConfigureDs({
         if (oAuthProvider?.length > 0 && isOAuthMethodSelected()) {
           localStorage.removeItem(oauthCacheKey);
           localStorage.removeItem(oauthStatusKey);
-          localStorage.removeItem(`oauth-device-${selectedSourceId}`);
+          localStorage.removeItem(oauthDeviceKey);
         }
 
         setOpen(false);

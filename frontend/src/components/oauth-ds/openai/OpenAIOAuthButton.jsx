@@ -12,22 +12,26 @@ const OpenAIOAuthButton = ({
   verificationUrl,
   userCode,
   accountLabel,
+  isStarting = false,
 }) => {
   const isPending = status === "pending";
-  const buttonLabel =
-    status === "success"
+  const buttonLabel = isStarting
+    ? "Starting OpenAI sign-in"
+    : status === "success"
       ? "Authenticated"
       : isPending && verificationUrl
         ? "Open OpenAI device login"
-        : buttonText;
+        : isPending
+          ? "Retry OpenAI sign-in"
+          : buttonText;
 
   return (
     <div className="openai-oauth-layout">
       <Button
         type="primary"
         onClick={handleOAuth}
-        disabled={disabled || (isPending && !verificationUrl)}
-        loading={isPending && !verificationUrl}
+        disabled={disabled || isStarting}
+        loading={isStarting}
       >
         {buttonLabel}
       </Button>
@@ -58,6 +62,7 @@ OpenAIOAuthButton.propTypes = {
   verificationUrl: PropTypes.string,
   userCode: PropTypes.string,
   accountLabel: PropTypes.string,
+  isStarting: PropTypes.bool,
 };
 
 export default OpenAIOAuthButton;

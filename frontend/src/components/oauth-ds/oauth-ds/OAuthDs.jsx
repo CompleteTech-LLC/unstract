@@ -27,9 +27,13 @@ function OAuthDs({
   const { setAlertDetails } = useAlertStore();
   const handleException = useExceptionHandler();
 
-  // Simple OAuth storage keys per connector
-  const oauthCacheKey = `oauth-cachekey-${selectedSourceId}`;
-  const oauthStatusKey = `oauth-status-${selectedSourceId}`;
+  // Keep transient OAuth hand-off state isolated per saved adapter. New
+  // adapters use the provider id until they are saved; saved adapters use
+  // their instance id so multiple ChatGPT accounts never share browser state.
+  const oauthStateScope = adapterInstanceId || selectedSourceId;
+  const oauthCacheKey = `oauth-cachekey-${oauthStateScope}`;
+  const oauthStatusKey = `oauth-status-${oauthStateScope}`;
+  const oauthDeviceKey = `oauth-device-${oauthStateScope}`;
 
   // Determine button text based on connector state and provider
   const getButtonText = () => {
@@ -57,20 +61,24 @@ function OAuthDs({
   const buttonText = getButtonText();
 
   const [oauthStatus, setOAuthStatus] = useState(() => {
-    // Initialize from connector-specific status
-    return localStorage.getItem(oauthStatusKey);
+    // A durable OAuth adapter is authenticated even when there is no
+    // browser-side hand-off session left to restore.
+    return hasOAuthCredentials
+      ? "success"
+      : localStorage.getItem(oauthStatusKey);
   });
   const [loginCacheKey, setLoginCacheKey] = useState(() =>
     localStorage.getItem(oauthCacheKey),
   );
   const [deviceLogin, setDeviceLogin] = useState(() => {
     try {
-      return JSON.parse(localStorage.getItem(`oauth-device-${selectedSourceId}`));
+      return JSON.parse(localStorage.getItem(oauthDeviceKey));
     } catch {
       return null;
     }
   });
   const [activeLoginCacheKey, setActiveLoginCacheKey] = useState(null);
+  const [isStarting, setIsStarting] = useState(false);
 
   const updateOAuthStatus = useCallback((newStatus) => {
     setOAuthStatus(newStatus);
@@ -128,14 +136,12 @@ function OAuthDs({
     setStatus(connectorStatus || "");
     setOAuthStatus(connectorStatus || "");
 
-    const persistedDeviceLogin = localStorage.getItem(
-      `oauth-device-${selectedSourceId}`,
-    );
+    const persistedDeviceLogin = localStorage.getItem(oauthDeviceKey);
     if (persistedDeviceLogin) {
       try {
         setDeviceLogin(JSON.parse(persistedDeviceLogin));
       } catch {
-        localStorage.removeItem(`oauth-device-${selectedSourceId}`);
+        localStorage.removeItem(oauthDeviceKey);
       }
     } else {
       setDeviceLogin(null);
@@ -145,7 +151,38 @@ function OAuthDs({
       window.removeEventListener("storage", handleStorageChange);
       // Don't clear localStorage on unmount to persist across tab switches
     };
-  }, [selectedSourceId, oauthCacheKey, oauthStatusKey, setCacheKey, setStatus]);
+  }, [
+    oauthCacheKey,
+    oauthDeviceKey,
+    oauthStatusKey,
+    selectedSourceId,
+    setCacheKey,
+    setStatus,
+  ]);
+
+  useEffect(() => {
+    // Do not let an old pending browser state mask credentials already saved
+    // on an existing adapter. A live reauthentication session is allowed to
+    // remain pending and can still replace those credentials after testing.
+    if (
+      oAuthProvider !== O_AUTH_PROVIDERS.OPENAI ||
+      !hasOAuthCredentials ||
+      loginCacheKey ||
+      activeLoginCacheKey ||
+      oauthStatus === "success"
+    ) {
+      return;
+    }
+    setOAuthStatus("success");
+    setStatus("success");
+  }, [
+    activeLoginCacheKey,
+    hasOAuthCredentials,
+    loginCacheKey,
+    oAuthProvider,
+    oauthStatus,
+    setStatus,
+  ]);
 
   useEffect(() => {
     if (oAuthProvider !== O_AUTH_PROVIDERS.OPENAI || !onModelsLoaded) {
@@ -247,6 +284,7 @@ function OAuthDs({
   ]);
 
   const handleOAuth = async () => {
+    let loginWindow;
     try {
       if (oAuthProvider === O_AUTH_PROVIDERS.OPENAI) {
         if (oauthStatus === "pending" && deviceLogin?.verification_url) {
@@ -258,6 +296,15 @@ function OAuthDs({
           return;
         }
 
+        setIsStarting(true);
+        // Open a user-initiated window before awaiting the API call. Browsers
+        // may block a window opened only after the device-code request returns;
+        // the visible link below remains the fallback when that happens.
+        loginWindow = window.open(
+          "about:blank",
+          "_blank",
+          "toolbar=yes,scrollbars=yes,resizable=yes,top=200,left=500,width=500,height=600",
+        );
         const response = await axiosPrivate({
           method: "POST",
           url: "/api/v1/oauth/openai/start/",
@@ -276,10 +323,19 @@ function OAuthDs({
         localStorage.setItem(oauthCacheKey, newCacheKey);
         setDeviceLogin(loginDetails);
         localStorage.setItem(
-          `oauth-device-${selectedSourceId}`,
+          oauthDeviceKey,
           JSON.stringify(loginDetails),
         );
         updateOAuthStatus("pending");
+        if (loginWindow && loginDetails.verification_url) {
+          loginWindow.location.href = loginDetails.verification_url;
+        } else if (loginDetails.verification_url) {
+          window.open(
+            loginDetails.verification_url,
+            "_blank",
+            "toolbar=yes,scrollbars=yes,resizable=yes,top=200,left=500,width=500,height=600",
+          );
+        }
         return;
       }
 
@@ -310,7 +366,18 @@ function OAuthDs({
         "toolbar=yes,scrollbars=yes,resizable=yes,top=200,left=500,width=500,height=600",
       );
     } catch (err) {
+      if (loginWindow && !loginWindow.closed) {
+        loginWindow.close();
+      }
+      if (oAuthProvider === O_AUTH_PROVIDERS.OPENAI) {
+        setIsStarting(false);
+        updateOAuthStatus("error");
+      }
       setAlertDetails(handleException(err));
+    } finally {
+      if (oAuthProvider === O_AUTH_PROVIDERS.OPENAI) {
+        setIsStarting(false);
+      }
     }
   };
 
@@ -350,6 +417,7 @@ function OAuthDs({
         verificationUrl={deviceLogin?.verification_url}
         userCode={deviceLogin?.user_code}
         accountLabel={deviceLogin?.account_label || oauthAccountLabel}
+        isStarting={isStarting}
       />
     );
   }
