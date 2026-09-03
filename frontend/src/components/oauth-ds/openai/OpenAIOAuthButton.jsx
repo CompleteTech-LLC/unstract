@@ -13,20 +13,27 @@ const OpenAIOAuthButton = ({
   userCode,
   accountLabel,
 }) => {
-  const buttonLabel = status === "success" ? "Authenticated" : buttonText;
+  const isPending = status === "pending";
+  const buttonLabel =
+    status === "success"
+      ? "Authenticated"
+      : isPending && verificationUrl
+        ? "Open OpenAI device login"
+        : buttonText;
 
   return (
     <div className="openai-oauth-layout">
       <Button
         type="primary"
         onClick={handleOAuth}
-        disabled={disabled || status === "pending"}
-        loading={status === "pending"}
+        disabled={disabled || (isPending && !verificationUrl)}
+        loading={isPending && !verificationUrl}
       >
         {buttonLabel}
       </Button>
       {status === "pending" && verificationUrl && userCode && (
         <Typography.Paragraph className="openai-oauth-instructions">
+          Waiting for authorization. {" "}
           Open{" "}
           <a href={verificationUrl} target="_blank" rel="noreferrer">
             OpenAI device login

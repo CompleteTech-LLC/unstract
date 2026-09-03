@@ -170,6 +170,15 @@ function OAuthDs({
   const handleOAuth = async () => {
     try {
       if (oAuthProvider === O_AUTH_PROVIDERS.OPENAI) {
+        if (oauthStatus === "pending" && deviceLogin?.verification_url) {
+          window.open(
+            deviceLogin.verification_url,
+            "_blank",
+            "toolbar=yes,scrollbars=yes,resizable=yes,top=200,left=500,width=500,height=600",
+          );
+          return;
+        }
+
         const response = await axiosPrivate({
           method: "POST",
           url: "/api/v1/oauth/openai/start/",
