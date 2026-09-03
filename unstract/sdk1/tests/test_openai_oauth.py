@@ -54,15 +54,24 @@ def test_openai_oauth_adapter_is_registered_with_auth_metadata() -> None:
         "python_social_auth_backend": "openai-oauth",
     }
     schema = json.loads(OpenAIOAuthLLMAdapter.get_json_schema())
-    assert schema["properties"]["model"]["default"] == "gpt-5-codex"
+    assert schema["properties"]["model"]["default"] == "gpt-5.6"
     assert schema["properties"]["model"]["enum"] == [
+        "gpt-6-astra",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
         "gpt-5.6",
+        "gpt-5.3-codex-spark",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.2",
         "gpt-5.3-codex",
         "gpt-5-codex",
     ]
+    assert len(schema["properties"]["model"]["enum"]) == len(
+        schema["properties"]["model"]["enumNames"]
+    )
     assert schema["allOf"][0]["then"]["properties"]["reasoning_effort"]["enum"] == [
         "none",
         "low",
