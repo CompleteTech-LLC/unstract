@@ -15,8 +15,24 @@
     "model": {
       "type": "string",
       "title": "Model",
+      "enum": [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.6",
+        "gpt-5.3-codex",
+        "gpt-5-codex"
+      ],
+      "enumNames": [
+        "GPT-5.6 Sol (flagship)",
+        "GPT-5.6 Terra (balanced)",
+        "GPT-5.6 Luna (efficient)",
+        "GPT-5.6 (default alias)",
+        "GPT-5.3 Codex",
+        "GPT-5 Codex (legacy)"
+      ],
       "default": "gpt-5-codex",
-      "description": "The Codex-capable model to use through your ChatGPT account."
+      "description": "Choose the Codex-capable model to use through your ChatGPT account."
     },
     "max_tokens": {
       "type": "number",
