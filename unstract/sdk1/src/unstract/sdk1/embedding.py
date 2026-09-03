@@ -107,6 +107,11 @@ class Embedding:
             self.platform_kwargs: dict[str, object] = kwargs
             self.kwargs: dict[str, object] = self.adapter.validate(self._adapter_metadata)
             self._cost_model: str | None = self.kwargs.pop("cost_model", None)
+            # Some local embedding models use asymmetric query/document
+            # prefixes. These are adapter controls, not provider request
+            # parameters, so consume them before calling LiteLLM.
+            self._query_prefix = str(self.kwargs.pop("query_prefix", "") or "")
+            self._passage_prefix = str(self.kwargs.pop("passage_prefix", "") or "")
             # Client-side batching hint, not an API field — keep it off the wire.
             self.kwargs.pop("embed_batch_size", None)
         except (ValidationError, ValueError) as e:
@@ -134,12 +139,21 @@ class Embedding:
             kwargs["input_type"] = input_type
         return model, kwargs, max_retries
 
+    def _prepare_text(self, text: str, input_type: str | None) -> str:
+        """Apply an optional query or passage prefix before provider dispatch."""
+        prefix = self._query_prefix if input_type == "query" else self._passage_prefix
+        return f"{prefix}{text}" if prefix else text
+
     def get_embedding(self, text: str, input_type: str = "query") -> list[float]:
         """Return embedding vector for query string."""
         try:
             model, kwargs, max_retries = self._prepare_call(input_type)
             resp = call_with_retry(
-                lambda: litellm.embedding(model=model, input=[text], **kwargs),
+                lambda: litellm.embedding(
+                    model=model,
+                    input=[self._prepare_text(text, input_type)],
+                    **kwargs,
+                ),
                 max_retries=max_retries,
                 retry_predicate=is_retryable_litellm_error,
                 description=self._get_adapter_info(),
@@ -155,7 +169,11 @@ class Embedding:
         try:
             model, kwargs, max_retries = self._prepare_call(input_type)
             resp = call_with_retry(
-                lambda: litellm.embedding(model=model, input=texts, **kwargs),
+                lambda: litellm.embedding(
+                    model=model,
+                    input=[self._prepare_text(text, input_type) for text in texts],
+                    **kwargs,
+                ),
                 max_retries=max_retries,
                 retry_predicate=is_retryable_litellm_error,
                 description=self._get_adapter_info(),
@@ -169,7 +187,11 @@ class Embedding:
         try:
             model, kwargs, max_retries = self._prepare_call(input_type)
             resp = await acall_with_retry(
-                lambda: litellm.aembedding(model=model, input=[text], **kwargs),
+                lambda: litellm.aembedding(
+                    model=model,
+                    input=[self._prepare_text(text, input_type)],
+                    **kwargs,
+                ),
                 max_retries=max_retries,
                 retry_predicate=is_retryable_litellm_error,
                 description=self._get_adapter_info(),
@@ -185,7 +207,11 @@ class Embedding:
         try:
             model, kwargs, max_retries = self._prepare_call(input_type)
             resp = await acall_with_retry(
-                lambda: litellm.aembedding(model=model, input=texts, **kwargs),
+                lambda: litellm.aembedding(
+                    model=model,
+                    input=[self._prepare_text(text, input_type) for text in texts],
+                    **kwargs,
+                ),
                 max_retries=max_retries,
                 retry_predicate=is_retryable_litellm_error,
                 description=self._get_adapter_info(),

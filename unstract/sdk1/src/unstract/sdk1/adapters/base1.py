@@ -1733,6 +1733,10 @@ class OpenAICompatibleEmbeddingParameters(OpenAIEmbeddingParameters):
     # Some gateways are keyless; the endpoint is always required.
     api_key: str | None = None
     api_base: str
+    # Optional asymmetric retrieval controls. They are consumed by the SDK
+    # wrapper before dispatch and never sent as provider request parameters.
+    query_prefix: str = ""
+    passage_prefix: str = ""
 
     @staticmethod
     def validate(adapter_metadata: dict[str, "Any"]) -> dict[str, "Any"]:

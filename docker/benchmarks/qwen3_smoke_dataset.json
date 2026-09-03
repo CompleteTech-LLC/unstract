@@ -1,0 +1,76 @@
+{
+  "documents": [
+    {
+      "id": "qdrant",
+      "text": "Qdrant is an open-source vector database used to store and search dense embeddings. In the local Unstract stack it listens on port 6333."
+    },
+    {
+      "id": "pgvector",
+      "text": "pgvector adds vector similarity search to PostgreSQL. Unstract's local PostgreSQL vector adapter uses a separate pgvector-enabled service."
+    },
+    {
+      "id": "weaviate",
+      "text": "Weaviate is a vector database with an HTTP API. The local Unstract development stack runs it with anonymous access on a loopback port."
+    },
+    {
+      "id": "milvus",
+      "text": "Milvus is a vector database for similarity search. A standalone local deployment uses Milvus together with etcd metadata and MinIO object storage."
+    },
+    {
+      "id": "openai-compatible",
+      "text": "An OpenAI-compatible embedding endpoint accepts a model name and one or more input texts, then returns vectors in the standard embeddings response shape."
+    },
+    {
+      "id": "qwen3",
+      "text": "Qwen3 embedding models are multilingual text encoders. For retrieval, Qwen recommends an instruction and Query prefix for queries, while passages are encoded without that query instruction."
+    },
+    {
+      "id": "vector-dimension",
+      "text": "Every vector collection must use the embedding dimension produced by its model. Changing from one embedding model to another normally requires a separate collection and a full reindex."
+    },
+    {
+      "id": "cpu",
+      "text": "CPU inference does not require an NVIDIA device, but it generally has lower embedding throughput and higher latency than GPU inference for the same model."
+    },
+    {
+      "id": "gpu",
+      "text": "GPU inference requires an NVIDIA driver, the NVIDIA Container Toolkit, and enough device memory for the model and its inference batches."
+    },
+    {
+      "id": "benchmark",
+      "text": "A useful embedding benchmark records vector dimension, warm and cold startup behavior, single-request latency, batch throughput, and retrieval quality on representative documents and queries."
+    }
+  ],
+  "queries": [
+    {
+      "id": "which-service-stores-vectors",
+      "text": "Which local service stores and searches dense embeddings?",
+      "relevant": ["qdrant", "pgvector", "weaviate", "milvus"]
+    },
+    {
+      "id": "which-service-uses-postgres",
+      "text": "Which vector option adds similarity search to PostgreSQL?",
+      "relevant": ["pgvector"]
+    },
+    {
+      "id": "how-connect-embedding",
+      "text": "What API shape should a local embedding server expose to connect to Unstract?",
+      "relevant": ["openai-compatible"]
+    },
+    {
+      "id": "how-handle-qwen-query",
+      "text": "How should a Qwen3 retrieval query be formatted?",
+      "relevant": ["qwen3"]
+    },
+    {
+      "id": "model-switch",
+      "text": "What must happen when the embedding model or vector dimension changes?",
+      "relevant": ["vector-dimension"]
+    },
+    {
+      "id": "compare-hardware",
+      "text": "What should be compared between CPU and GPU embedding runs?",
+      "relevant": ["cpu", "gpu", "benchmark"]
+    }
+  ]
+}

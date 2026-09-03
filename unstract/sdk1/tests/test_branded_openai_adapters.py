@@ -447,6 +447,8 @@ def test_compatible_embedding_schema_loadable() -> None:
     assert schema["title"] == "OpenAI Compatible Embedding"
     assert "api_base" in schema["required"]
     assert "model" in schema["required"]
+    assert "query_prefix" in schema["properties"]
+    assert "passage_prefix" in schema["properties"]
 
 
 @pytest.mark.parametrize(
@@ -536,3 +538,40 @@ def test_compatible_embedding_omits_input_type(
     )
     assert "input_type" not in captured
     assert captured["model"] == "openai/BAAI/bge-m3"
+
+
+def test_compatible_embedding_applies_query_and_passage_prefixes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import unstract.sdk1.embedding as emb_mod
+
+    calls: list[list[str]] = []
+    provider_kwargs: list[dict[str, object]] = []
+
+    def fake_embedding(model: str, input: list[str], **kwargs: object) -> dict:  # noqa: A002
+        del model
+        provider_kwargs.append(kwargs)
+        calls.append(input)
+        return {"data": [{"embedding": [0.0, 1.0]}] * len(input)}
+
+    monkeypatch.setattr(emb_mod.litellm, "embedding", fake_embedding)
+    emb = emb_mod.Embedding(
+        adapter_id=OpenAICompatibleEmbeddingAdapter.get_id(),
+        adapter_metadata={
+            "model": "qwen3-embedding-06b",
+            "api_base": "http://qwen3-embedding-06b-cpu:80/v1",
+            "api_key": "",
+            "query_prefix": "Q: ",
+            "passage_prefix": "P: ",
+        },
+    )
+
+    # The constructor's connection test uses the query path.
+    assert calls[0] == ["Q: Hello, I am Unstract"]
+    emb.get_embedding("question")
+    emb.get_embeddings(["document 1", "document 2"], input_type="passage")
+
+    assert calls[1] == ["Q: question"]
+    assert calls[2] == ["P: document 1", "P: document 2"]
+    assert all("query_prefix" not in kwargs for kwargs in provider_kwargs)
+    assert all("passage_prefix" not in kwargs for kwargs in provider_kwargs)
