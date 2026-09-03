@@ -402,6 +402,27 @@ def _add_reasoning_conditions(
         )
 
 
+def _remove_empty_reasoning_placeholder(all_of: list[dict[str, Any]]) -> None:
+    """Remove the pre-auth reasoning rule before adding live model rules."""
+    all_of[:] = [
+        condition
+        for condition in all_of
+        if not (
+            isinstance(condition, Mapping)
+            and isinstance(condition.get("then"), Mapping)
+            and isinstance(condition["then"].get("properties"), Mapping)
+            and isinstance(
+                condition["then"]["properties"].get("reasoning_effort"),
+                Mapping,
+            )
+            and condition["then"]["properties"]["reasoning_effort"].get(
+                "enum"
+            )
+            == []
+        )
+    ]
+
+
 def build_openai_oauth_json_schema(
     model_catalog: Sequence[Mapping[str, Any]],
     *,
@@ -442,6 +463,10 @@ def build_openai_oauth_json_schema(
         all_of = []
         schema["allOf"] = all_of
 
+    # The static adapter schema keeps an empty reasoning field so RJSF can
+    # render the form before login. Once the account catalog is available,
+    # that placeholder must not remain as an additional empty constraint.
+    _remove_empty_reasoning_placeholder(all_of)
     _add_reasoning_conditions(all_of, models)
 
     schema["x-openai-oauth-model-source"] = "chatgpt-account"

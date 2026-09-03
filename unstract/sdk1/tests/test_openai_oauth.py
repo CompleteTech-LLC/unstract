@@ -150,7 +150,7 @@ def test_openai_oauth_dynamic_schema_uses_model_specific_reasoning_levels() -> N
     assert model["enum"] == ["account-model-a", "account-model-b"]
     assert model["enumNames"] == ["Model A", "Model B"]
     assert model["default"] == "account-model-b"
-    model_conditions = schema["allOf"][2:]
+    model_conditions = schema["allOf"][1:]
     assert model_conditions[0]["if"]["properties"]["model"] == {
         "const": "account-model-a"
     }
