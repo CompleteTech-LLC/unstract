@@ -17,6 +17,11 @@
         "service": "qwen3-embedding-06b-gpu",
         "base_url": "http://127.0.0.1:8201/v1",
         "internal_base_url": "http://qwen3-embedding-06b-gpu:80/v1"
+      },
+      "xpu": {
+        "service": "qwen3-embedding-06b-xpu",
+        "base_url": "http://127.0.0.1:8301/v1",
+        "internal_base_url": "http://qwen3-embedding-06b-xpu:80/v1"
       }
     },
     {
@@ -33,6 +38,11 @@
         "service": "qwen3-embedding-4b-gpu",
         "base_url": "http://127.0.0.1:8202/v1",
         "internal_base_url": "http://qwen3-embedding-4b-gpu:80/v1"
+      },
+      "xpu": {
+        "service": "qwen3-embedding-4b-xpu",
+        "base_url": "http://127.0.0.1:8302/v1",
+        "internal_base_url": "http://qwen3-embedding-4b-xpu:80/v1"
       }
     },
     {
@@ -49,6 +59,11 @@
         "service": "qwen3-embedding-8b-gpu",
         "base_url": "http://127.0.0.1:8203/v1",
         "internal_base_url": "http://qwen3-embedding-8b-gpu:80/v1"
+      },
+      "xpu": {
+        "service": "qwen3-embedding-8b-xpu",
+        "base_url": "http://127.0.0.1:8303/v1",
+        "internal_base_url": "http://qwen3-embedding-8b-xpu:80/v1"
       }
     }
   ]

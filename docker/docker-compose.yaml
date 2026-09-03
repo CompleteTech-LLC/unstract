@@ -3,6 +3,7 @@ include:
   - docker-compose-dev-essentials.yaml
   - docker-compose-local-embeddings.yaml
   - docker-compose-local-embeddings-gpu.yaml
+  - docker-compose-local-embeddings-xpu.yaml
 
 # Reusable host-gateway mapping so containers can reach services on the host
 # (e.g. host-installed Ollama at http://host.docker.internal:11434).

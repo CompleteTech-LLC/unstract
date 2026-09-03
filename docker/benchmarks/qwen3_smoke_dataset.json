@@ -34,7 +34,7 @@
     },
     {
       "id": "gpu",
-      "text": "GPU inference requires an NVIDIA driver, the NVIDIA Container Toolkit, and enough device memory for the model and its inference batches."
+      "text": "Accelerated inference requires a compatible device runtime, container device access, and enough device memory for the model and its inference batches."
     },
     {
       "id": "benchmark",

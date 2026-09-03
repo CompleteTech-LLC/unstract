@@ -77,25 +77,26 @@ intentional.
 
 ## Local Qwen3 embeddings
 
-The Compose stack includes six optional Hugging Face Text Embeddings
-Inference (TEI) services for the three selected Qwen3 embedding models. The
-CPU and GPU services are separate so they can be benchmarked against the same
-model and workload. Model files are cached in persistent, model-specific
-volumes.
+The Compose stack includes nine optional Hugging Face Text Embeddings
+Inference (TEI) services for the three selected Qwen3 embedding models. CPU,
+NVIDIA GPU, and Intel XPU services are separate so each runtime can be
+benchmarked against the same model and workload. Model files are cached in
+persistent, model-specific volumes.
 
 The CPU services are defined in `docker-compose-local-embeddings.yaml`; the
-GPU services are defined in the separately included
-`docker-compose-local-embeddings-gpu.yaml`. This keeps the GPU runtime setup
-isolated while the root Compose file still exposes one consistent service
-matrix.
+NVIDIA services are defined in the separately included
+`docker-compose-local-embeddings-gpu.yaml`; Intel services are defined in
+`docker-compose-local-embeddings-xpu.yaml`. This keeps each accelerator
+runtime isolated while the root Compose file still exposes one consistent
+service matrix.
 
-| Model | Vector dimensions | CPU service / host port | GPU service / host port |
-|-------|-------------------:|-------------------------|-------------------------|
-| Qwen3-Embedding-0.6B | 1024 | qwen3-embedding-06b-cpu / 8101 | qwen3-embedding-06b-gpu / 8201 |
-| Qwen3-Embedding-4B | 2560 | qwen3-embedding-4b-cpu / 8102 | qwen3-embedding-4b-gpu / 8202 |
-| Qwen3-Embedding-8B | 4096 | qwen3-embedding-8b-cpu / 8103 | qwen3-embedding-8b-gpu / 8203 |
+| Model | Vector dimensions | CPU service / host port | NVIDIA GPU service / host port | Intel XPU service / host port |
+|-------|-------------------:|-------------------------|--------------------------------|------------------------------|
+| Qwen3-Embedding-0.6B | 1024 | qwen3-embedding-06b-cpu / 8101 | qwen3-embedding-06b-gpu / 8201 | qwen3-embedding-06b-xpu / 8301 |
+| Qwen3-Embedding-4B | 2560 | qwen3-embedding-4b-cpu / 8102 | qwen3-embedding-4b-gpu / 8202 | qwen3-embedding-4b-xpu / 8302 |
+| Qwen3-Embedding-8B | 4096 | qwen3-embedding-8b-cpu / 8103 | qwen3-embedding-8b-gpu / 8203 | qwen3-embedding-8b-xpu / 8303 |
 
-Start the CPU, GPU, or complete comparison matrix from the docker directory:
+Start the CPU, NVIDIA GPU, or Intel XPU profile from the docker directory:
 
 ```bash
 cd docker
@@ -108,33 +109,40 @@ VERSION=dev docker compose -f docker-compose.yaml --profile embeddings-cpu up -d
 VERSION=dev docker compose -f docker-compose.yaml --profile embeddings-gpu up -d \
   qwen3-embedding-06b-gpu qwen3-embedding-4b-gpu qwen3-embedding-8b-gpu
 
-# All six services
+# Intel XPU services
+VERSION=dev docker compose -f docker-compose.yaml --profile embeddings-xpu up -d \
+  qwen3-embedding-06b-xpu qwen3-embedding-4b-xpu qwen3-embedding-8b-xpu
+
+# CPU and NVIDIA GPU comparison matrix
 VERSION=dev docker compose -f docker-compose.yaml --profile embeddings-both up -d \
   qwen3-embedding-06b-cpu qwen3-embedding-4b-cpu qwen3-embedding-8b-cpu \
   qwen3-embedding-06b-gpu qwen3-embedding-4b-gpu qwen3-embedding-8b-gpu
 ```
 
-Before starting either GPU profile, verify that the host can see an NVIDIA
-device and driver:
+Before starting an accelerator profile, verify that the host can see a
+supported device:
 
 ```bash
-python3 docker/benchmarks/gpu_preflight.py --json
+python3 docker/benchmarks/gpu_preflight.py --backend auto --json
 ```
 
-GPU services require the NVIDIA Container Toolkit and a compatible NVIDIA
-driver. The default CUDA image targets the TEI CUDA 1.9 runtime; set
-QWEN3_TEI_GPU_IMAGE when an architecture-specific image is needed.
+NVIDIA services require the NVIDIA Container Toolkit and a compatible NVIDIA
+driver. The default NVIDIA image targets the TEI CUDA 1.9 runtime; set
+`QWEN3_TEI_GPU_IMAGE` when an architecture-specific image is needed. Intel
+XPU services use the `xpu-ipex-latest` TEI image by default and pass through
+`/dev/dri`; set `QWEN3_TEI_XPU_IMAGE` to use a different Intel-compatible
+image. Use `--backend intel` to require Intel telemetry explicitly.
 The default CPU image targets x86_64; set QWEN3_TEI_CPU_IMAGE to the TEI
-cpu-arm64-1.9 image on ARM64 hosts. The embeddings-both profile starts every
-service in the matrix and may exceed available GPU memory if all six are
-launched together. For a fair comparison, start one profile at a time or
-benchmark endpoints sequentially.
+cpu-arm64-1.9 image on ARM64 hosts. Accelerator profiles may exceed available
+device memory when another model is already using the GPU. For a fair
+comparison, start one profile at a time or benchmark endpoints sequentially.
 
-GPU services have independent tuning variables so a GPU run does not change
-the CPU run's request limits: `QWEN3_GPU_MAX_BATCH_TOKENS` (default `8192`),
-`QWEN3_GPU_MAX_CLIENT_BATCH_SIZE` (default `32`),
-`QWEN3_GPU_MAX_CONCURRENT_REQUESTS` (default `4`), and
-`QWEN3_GPU_TOKENIZATION_WORKERS` (default `4`).
+Accelerator services have independent tuning variables so an accelerator run
+does not change the CPU run's request limits. NVIDIA uses
+`QWEN3_GPU_MAX_*`; Intel XPU uses `QWEN3_XPU_MAX_BATCH_TOKENS` (default
+`1024`), `QWEN3_XPU_MAX_CLIENT_BATCH_SIZE` (default `16`),
+`QWEN3_XPU_MAX_CONCURRENT_REQUESTS` (default `4`), and
+`QWEN3_XPU_TOKENIZATION_WORKERS` (default `4`).
 
 Each service exposes an OpenAI-compatible endpoint. From an Unstract
 container, use the internal URL; from the host, use the localhost URL:
@@ -143,10 +151,13 @@ container, use the internal URL; from the host, use the localhost URL:
 |----------------|-------------------|---------------|
 | 0.6B CPU | http://qwen3-embedding-06b-cpu/v1 | http://localhost:8101/v1 |
 | 0.6B GPU | http://qwen3-embedding-06b-gpu/v1 | http://localhost:8201/v1 |
+| 0.6B Intel XPU | http://qwen3-embedding-06b-xpu/v1 | http://localhost:8301/v1 |
 | 4B CPU | http://qwen3-embedding-4b-cpu/v1 | http://localhost:8102/v1 |
 | 4B GPU | http://qwen3-embedding-4b-gpu/v1 | http://localhost:8202/v1 |
+| 4B Intel XPU | http://qwen3-embedding-4b-xpu/v1 | http://localhost:8302/v1 |
 | 8B CPU | http://qwen3-embedding-8b-cpu/v1 | http://localhost:8103/v1 |
 | 8B GPU | http://qwen3-embedding-8b-gpu/v1 | http://localhost:8203/v1 |
+| 8B Intel XPU | http://qwen3-embedding-8b-xpu/v1 | http://localhost:8303/v1 |
 
 For the OpenAI Compatible Embedding adapter, set Model to the matching
 served-model alias, API Base to the appropriate URL above, and API Key to the
@@ -172,6 +183,8 @@ python3 docker/benchmarks/embedding_benchmark.py --mode cpu \
   --output /tmp/qwen3-cpu.json --strict
 python3 docker/benchmarks/embedding_benchmark.py --mode gpu \
   --output /tmp/qwen3-gpu.json --strict
+python3 docker/benchmarks/embedding_benchmark.py --mode xpu \
+  --output /tmp/qwen3-xpu.json --strict
 python3 docker/benchmarks/embedding_benchmark.py --mode both \
   --output /tmp/qwen3-both.json --strict
 ```
@@ -184,7 +197,7 @@ labeled queries before using quality scores to select a production model.
 When `--mode both` is used, the JSON report also contains one comparison per
 model with GPU speedups and GPU-minus-CPU retrieval-quality deltas. This makes
 the combined profile suitable for choosing a deployment target from one run.
-This change intentionally retains all six variants; unselected services can
+This change intentionally retains all nine variants; unselected services can
 be removed in a follow-up after the benchmark review.
 
 ## Overriding a service's config
