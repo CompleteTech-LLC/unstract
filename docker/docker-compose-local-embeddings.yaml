@@ -158,13 +158,13 @@ services:
       - --pooling
       - last-token
       - --max-batch-tokens
-      - ${QWEN3_MAX_BATCH_TOKENS:-8192}
+      - ${QWEN3_GPU_MAX_BATCH_TOKENS:-8192}
       - --max-client-batch-size
-      - ${QWEN3_MAX_CLIENT_BATCH_SIZE:-32}
+      - ${QWEN3_GPU_MAX_CLIENT_BATCH_SIZE:-32}
       - --max-concurrent-requests
-      - ${QWEN3_MAX_CONCURRENT_REQUESTS:-4}
+      - ${QWEN3_GPU_MAX_CONCURRENT_REQUESTS:-4}
       - --tokenization-workers
-      - ${QWEN3_TOKENIZATION_WORKERS:-4}
+      - ${QWEN3_GPU_TOKENIZATION_WORKERS:-4}
 
   qwen3-embedding-4b-gpu:
     <<: *qwen3_common
@@ -197,13 +197,13 @@ services:
       - --pooling
       - last-token
       - --max-batch-tokens
-      - ${QWEN3_MAX_BATCH_TOKENS:-8192}
+      - ${QWEN3_GPU_MAX_BATCH_TOKENS:-8192}
       - --max-client-batch-size
-      - ${QWEN3_MAX_CLIENT_BATCH_SIZE:-32}
+      - ${QWEN3_GPU_MAX_CLIENT_BATCH_SIZE:-32}
       - --max-concurrent-requests
-      - ${QWEN3_MAX_CONCURRENT_REQUESTS:-4}
+      - ${QWEN3_GPU_MAX_CONCURRENT_REQUESTS:-4}
       - --tokenization-workers
-      - ${QWEN3_TOKENIZATION_WORKERS:-4}
+      - ${QWEN3_GPU_TOKENIZATION_WORKERS:-4}
 
   qwen3-embedding-8b-gpu:
     <<: *qwen3_common
@@ -236,13 +236,13 @@ services:
       - --pooling
       - last-token
       - --max-batch-tokens
-      - ${QWEN3_MAX_BATCH_TOKENS:-8192}
+      - ${QWEN3_GPU_MAX_BATCH_TOKENS:-8192}
       - --max-client-batch-size
-      - ${QWEN3_MAX_CLIENT_BATCH_SIZE:-32}
+      - ${QWEN3_GPU_MAX_CLIENT_BATCH_SIZE:-32}
       - --max-concurrent-requests
-      - ${QWEN3_MAX_CONCURRENT_REQUESTS:-4}
+      - ${QWEN3_GPU_MAX_CONCURRENT_REQUESTS:-4}
       - --tokenization-workers
-      - ${QWEN3_TOKENIZATION_WORKERS:-4}
+      - ${QWEN3_GPU_TOKENIZATION_WORKERS:-4}
 
 volumes:
   qwen3_embedding_06b_cpu_cache:
