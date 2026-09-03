@@ -15,36 +15,7 @@
     "model": {
       "type": "string",
       "title": "Model",
-      "enum": [
-        "gpt-6-astra",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.6",
-        "gpt-5.3-codex-spark",
-        "gpt-5.5",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5.2",
-        "gpt-5.3-codex",
-        "gpt-5-codex"
-      ],
-      "enumNames": [
-        "GPT-6 Astra (preview)",
-        "GPT-5.6 Sol (flagship)",
-        "GPT-5.6 Terra (balanced)",
-        "GPT-5.6 Luna (efficient)",
-        "GPT-5.6 (default alias)",
-        "GPT-5.3 Codex Spark (preview)",
-        "GPT-5.5 (legacy)",
-        "GPT-5.4 (legacy)",
-        "GPT-5.4 Mini (legacy)",
-        "GPT-5.2 (deprecated)",
-        "GPT-5.3 Codex",
-        "GPT-5 Codex (legacy)"
-      ],
-      "default": "gpt-5.6",
-      "description": "Choose a model available to your ChatGPT/Codex account. Availability varies by account, plan, and rollout."
+      "description": "Sign in with OpenAI to load the models available to this ChatGPT/Codex account."
     },
     "max_tokens": {
       "type": "number",
@@ -90,25 +61,8 @@
         "properties": {
           "reasoning_effort": {
             "type": "string",
-            "enum": [
-              "none",
-              "low",
-              "medium",
-              "high",
-              "xhigh",
-              "max"
-            ],
-            "enumNames": [
-              "None",
-              "Low",
-              "Medium",
-              "High",
-              "Extra high",
-              "Maximum"
-            ],
-            "default": "medium",
             "title": "Reasoning Effort",
-            "description": "Sets the reasoning strength when reasoning is enabled. Use None to minimize reasoning overhead."
+            "description": "Sign in with OpenAI to load reasoning levels supported by the selected model."
           }
         },
         "required": [

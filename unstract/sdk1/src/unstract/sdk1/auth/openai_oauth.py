@@ -11,7 +11,7 @@ import base64
 import json
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import httpx
@@ -25,6 +25,10 @@ OPENAI_OAUTH_CLIENT_ID = os.environ.get(
     "OPENAI_OAUTH_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann"
 )
 OPENAI_OAUTH_CHATGPT_API_BASE = "https://chatgpt.com/backend-api/codex"
+OPENAI_OAUTH_MODELS_URL = f"{OPENAI_OAUTH_CHATGPT_API_BASE}/models"
+OPENAI_OAUTH_CODEX_CLIENT_VERSION = os.environ.get(
+    "OPENAI_OAUTH_CODEX_CLIENT_VERSION", "0.149.0"
+)
 OPENAI_OAUTH_DEVICE_USERCODE_URL = (
     f"{OPENAI_OAUTH_AUTH_BASE}/api/accounts/deviceauth/usercode"
 )
@@ -61,6 +65,10 @@ class OpenAIOAuthError(RuntimeError):
 
 class OpenAIOAuthRefreshError(OpenAIOAuthError):
     """Raised when an expired access token cannot be refreshed."""
+
+
+class OpenAIOAuthModelCatalogError(OpenAIOAuthError):
+    """Raised when the account-specific Codex model catalog cannot be read."""
 
 
 def is_openai_oauth_adapter(adapter_id: str | None) -> bool:
@@ -144,6 +152,300 @@ def _response_error(response: httpx.Response, operation: str) -> OpenAIOAuthRefr
     return OpenAIOAuthRefreshError(
         f"OpenAI OAuth {operation} failed with status {response.status_code}"
     )
+
+
+def _reasoning_levels(value: object) -> list[dict[str, str]]:
+    """Normalize the reasoning options returned by the Codex catalog."""
+    if not isinstance(value, list):
+        return []
+
+    levels: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        effort = item.get("effort") or item.get("reasoning_effort")
+        if not isinstance(effort, str) or not effort.strip():
+            continue
+        effort = effort.strip()
+        if effort in seen:
+            continue
+        description = item.get("description")
+        if not isinstance(description, str) or not description.strip():
+            description = effort.replace("_", " ").replace("-", " ").title()
+        levels.append({"effort": effort, "description": description.strip()})
+        seen.add(effort)
+    return levels
+
+
+def _normalize_catalog_model(
+    item: Mapping[str, Any], index: int
+) -> dict[str, Any] | None:
+    slug = item.get("slug")
+    if not isinstance(slug, str) or not slug.strip():
+        return None
+    slug = slug.strip()
+
+    visibility = item.get("visibility")
+    if isinstance(visibility, str) and visibility.lower() in {
+        "hidden",
+        "none",
+        "unlisted",
+    }:
+        return None
+    if item.get("supported_in_api") is False:
+        return None
+
+    display_name = item.get("display_name")
+    if not isinstance(display_name, str) or not display_name.strip():
+        display_name = slug
+    description = item.get("description")
+    if not isinstance(description, str):
+        description = ""
+    priority = item.get("priority")
+    try:
+        normalized_priority = int(priority)
+    except (TypeError, ValueError):
+        normalized_priority = 2**31 - 1
+
+    return {
+        "slug": slug,
+        "display_name": display_name.strip(),
+        "description": description.strip(),
+        "default_reasoning_level": item.get("default_reasoning_level"),
+        "supported_reasoning_levels": _reasoning_levels(
+            item.get("supported_reasoning_levels")
+        ),
+        "priority": normalized_priority,
+        "_catalog_index": index,
+        "is_deprecated": bool(item.get("upgrade")),
+    }
+
+
+def _normalize_catalog_models(raw_models: list[object]) -> list[dict[str, Any]]:
+    models: list[dict[str, Any]] = []
+    seen_slugs: set[str] = set()
+    for index, item in enumerate(raw_models):
+        if not isinstance(item, Mapping):
+            continue
+        model = _normalize_catalog_model(item, index)
+        if model is None or model["slug"] in seen_slugs:
+            continue
+        models.append(model)
+        seen_slugs.add(model["slug"])
+
+    models.sort(key=lambda item: (item["priority"], item["_catalog_index"]))
+    for item in models:
+        item.pop("_catalog_index", None)
+    return models
+
+
+def _catalog_models_from_response(response: httpx.Response) -> list[object]:
+    if not 200 <= response.status_code < 300:
+        raise OpenAIOAuthModelCatalogError(
+            f"OpenAI OAuth model discovery failed with status {response.status_code}"
+        )
+
+    try:
+        payload = response.json()
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise OpenAIOAuthModelCatalogError(
+            "OpenAI OAuth model discovery returned an invalid response"
+        ) from exc
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("models"), list):
+        raise OpenAIOAuthModelCatalogError(
+            "OpenAI OAuth model discovery returned no model catalog"
+        )
+    return payload["models"]
+
+
+def fetch_openai_oauth_model_catalog(
+    metadata: Mapping[str, Any],
+    *,
+    client_version: str | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch the visible model catalog for one authenticated ChatGPT account.
+
+    The Codex endpoint is account- and plan-aware.  No model ids or reasoning
+    levels are defined here; the response is normalized only enough for the
+    configuration UI to consume it safely.
+    """
+    access_token = metadata.get("oauth_access_token")
+    account_id = metadata.get("oauth_account_id")
+    if not isinstance(access_token, str) or not access_token.strip():
+        raise OpenAIOAuthModelCatalogError(
+            "OpenAI OAuth model discovery requires an access token"
+        )
+    if not isinstance(account_id, str) or not account_id.strip():
+        raise OpenAIOAuthModelCatalogError(
+            "OpenAI OAuth model discovery requires a ChatGPT account"
+        )
+
+    try:
+        response = httpx.get(
+            OPENAI_OAUTH_MODELS_URL,
+            params={
+                "client_version": client_version or OPENAI_OAUTH_CODEX_CLIENT_VERSION
+            },
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "ChatGPT-Account-ID": account_id,
+                "Accept": "application/json",
+                # Keep the catalog aligned with the originator used for model
+                # requests by the Unstract adapter.
+                "originator": "unstract",
+            },
+            timeout=15.0,
+        )
+    except httpx.HTTPError as exc:
+        raise OpenAIOAuthModelCatalogError(
+            "OpenAI OAuth model discovery could not reach ChatGPT"
+        ) from exc
+
+    models = _normalize_catalog_models(_catalog_models_from_response(response))
+
+    if not models:
+        raise OpenAIOAuthModelCatalogError(
+            "OpenAI OAuth model discovery returned no available models"
+        )
+    return models
+
+
+def _valid_catalog_models(
+    model_catalog: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        dict(item)
+        for item in model_catalog
+        if isinstance(item, Mapping)
+        and isinstance(item.get("slug"), str)
+        and item["slug"].strip()
+    ]
+
+
+def _model_labels(models: Sequence[Mapping[str, Any]]) -> list[str]:
+    labels: list[str] = []
+    for model in models:
+        slug = str(model["slug"]).strip()
+        label = str(model.get("display_name") or slug).strip()
+        if model.get("is_deprecated") and "deprecated" not in label.lower():
+            label = f"{label} (deprecated)"
+        labels.append(label)
+    return labels
+
+
+def _selected_catalog_model(slugs: Sequence[str], current_model: str | None) -> str:
+    selected_model = current_model.strip() if isinstance(current_model, str) else ""
+    for prefix in ("openai/", "chatgpt/"):
+        if selected_model.startswith(prefix):
+            selected_model = selected_model[len(prefix) :]
+            break
+    return selected_model if selected_model in slugs else slugs[0]
+
+
+def _reasoning_schema_for_model(
+    model: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    levels_value = model.get("supported_reasoning_levels")
+    if not isinstance(levels_value, list):
+        return None
+    levels = [
+        dict(level)
+        for level in levels_value
+        if isinstance(level, Mapping)
+        and isinstance(level.get("effort"), str)
+        and level["effort"].strip()
+    ]
+    if not levels:
+        return None
+
+    efforts = [str(level["effort"]).strip() for level in levels]
+    effort_labels = [
+        str(level.get("description") or effort).strip()
+        for level, effort in zip(levels, efforts, strict=True)
+    ]
+    default_effort = model.get("default_reasoning_level")
+    if default_effort not in efforts:
+        default_effort = efforts[0]
+    return {
+        "type": "string",
+        "enum": efforts,
+        "enumNames": effort_labels,
+        "default": default_effort,
+        "title": "Reasoning Effort",
+        "description": "Reasoning levels reported for this model by ChatGPT.",
+    }
+
+
+def _add_reasoning_conditions(
+    all_of: list[dict[str, Any]], models: Sequence[Mapping[str, Any]]
+) -> None:
+    for model in models:
+        slug = str(model["slug"]).strip()
+        reasoning_schema = _reasoning_schema_for_model(model)
+        if reasoning_schema is None:
+            continue
+        all_of.append(
+            {
+                "if": {
+                    "required": ["enable_reasoning", "model"],
+                    "properties": {
+                        "enable_reasoning": {"const": True},
+                        "model": {"const": slug},
+                    },
+                },
+                "then": {
+                    "properties": {"reasoning_effort": reasoning_schema},
+                    "required": ["reasoning_effort"],
+                },
+            }
+        )
+
+
+def build_openai_oauth_json_schema(
+    model_catalog: Sequence[Mapping[str, Any]],
+    *,
+    current_model: str | None = None,
+    base_schema: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a form schema from one account's live Codex model catalog.
+
+    ``base_schema`` is injectable for tests.  In production the adapter's
+    schema is loaded lazily to avoid an import cycle with this auth module.
+    """
+    if base_schema is None:
+        from unstract.sdk1.adapters.llm1.openai_oauth import OpenAIOAuthLLMAdapter
+
+        base_schema = json.loads(OpenAIOAuthLLMAdapter.get_json_schema())
+
+    schema = json.loads(json.dumps(base_schema))
+    models = _valid_catalog_models(model_catalog)
+    if not models:
+        raise OpenAIOAuthModelCatalogError(
+            "Cannot build an OpenAI OAuth form without available models"
+        )
+
+    model_property = schema.setdefault("properties", {}).setdefault("model", {})
+    slugs = [str(item["slug"]).strip() for item in models]
+    labels = _model_labels(models)
+    selected_model = _selected_catalog_model(slugs, current_model)
+
+    model_property["enum"] = slugs
+    model_property["enumNames"] = labels
+    model_property["default"] = selected_model
+    model_property["description"] = (
+        "Models reported as available by this ChatGPT/Codex account."
+    )
+
+    all_of = schema.setdefault("allOf", [])
+    if not isinstance(all_of, list):
+        all_of = []
+        schema["allOf"] = all_of
+
+    _add_reasoning_conditions(all_of, models)
+
+    schema["x-openai-oauth-model-source"] = "chatgpt-account"
+    return schema
 
 
 def refresh_openai_oauth_metadata(

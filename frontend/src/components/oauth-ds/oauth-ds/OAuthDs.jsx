@@ -17,6 +17,8 @@ function OAuthDs({
   setStatus,
   selectedSourceId,
   isExistingConnector,
+  adapterInstanceId,
+  onModelsLoaded,
   disabled = false,
 }) {
   const axiosPrivate = useAxiosPrivate();
@@ -60,12 +62,37 @@ function OAuthDs({
       return null;
     }
   });
+  const [activeLoginCacheKey, setActiveLoginCacheKey] = useState(null);
 
   const updateOAuthStatus = useCallback((newStatus) => {
     setOAuthStatus(newStatus);
     setStatus(newStatus);
     localStorage.setItem(oauthStatusKey, newStatus);
   }, [oauthStatusKey, setStatus]);
+
+  const loadOpenAIModelSchema = useCallback(
+    async (oauthKey = "") => {
+      const params = new URLSearchParams();
+      if (oauthKey) {
+        params.set("oauth-key", oauthKey);
+      } else if (adapterInstanceId) {
+        params.set("adapter-instance-id", adapterInstanceId);
+      } else {
+        return;
+      }
+
+      const response = await axiosPrivate({
+        method: "GET",
+        url: `/api/v1/oauth/openai/models/?${params.toString()}`,
+      });
+      const dynamicSchema = response?.data?.json_schema;
+      if (!dynamicSchema) {
+        throw new Error("OpenAI OAuth returned no model schema");
+      }
+      onModelsLoaded?.(dynamicSchema);
+    },
+    [adapterInstanceId, axiosPrivate, onModelsLoaded],
+  );
 
   useEffect(() => {
     const handleStorageChange = () => {
@@ -111,6 +138,50 @@ function OAuthDs({
       // Don't clear localStorage on unmount to persist across tab switches
     };
   }, [selectedSourceId, oauthCacheKey, oauthStatusKey, setCacheKey, setStatus]);
+
+  useEffect(() => {
+    if (oAuthProvider !== O_AUTH_PROVIDERS.OPENAI || !onModelsLoaded) {
+      return undefined;
+    }
+
+    // Existing adapters use their server-side encrypted credentials. A new
+    // OAuth login takes precedence only after that login has completed, so a
+    // stale localStorage cache key cannot select another account by accident.
+    const sessionKey =
+      oauthStatus === "success"
+        ? activeLoginCacheKey || (!adapterInstanceId ? loginCacheKey : "")
+        : "";
+    const source = sessionKey || (adapterInstanceId ? adapterInstanceId : "");
+    if (!source) {
+      return undefined;
+    }
+
+    let isActive = true;
+    loadOpenAIModelSchema(sessionKey)
+      .catch((err) => {
+        if (!isActive) {
+          return;
+        }
+        const message =
+          err?.response?.data?.message ||
+          "Could not load models available to this OpenAI account";
+        setAlertDetails(handleException(err, message));
+      });
+
+    return () => {
+      isActive = false;
+    };
+  }, [
+    activeLoginCacheKey,
+    adapterInstanceId,
+    handleException,
+    loadOpenAIModelSchema,
+    loginCacheKey,
+    oauthStatus,
+    oAuthProvider,
+    onModelsLoaded,
+    setAlertDetails,
+  ]);
 
   useEffect(() => {
     if (
@@ -192,6 +263,7 @@ function OAuthDs({
           throw new Error("OpenAI OAuth did not return a login session");
         }
         setLoginCacheKey(newCacheKey);
+        setActiveLoginCacheKey(newCacheKey);
         setCacheKey(newCacheKey);
         localStorage.setItem(oauthCacheKey, newCacheKey);
         setDeviceLogin(loginDetails);
@@ -283,6 +355,8 @@ OAuthDs.propTypes = {
   setStatus: PropTypes.func,
   selectedSourceId: PropTypes.string.isRequired,
   isExistingConnector: PropTypes.bool,
+  adapterInstanceId: PropTypes.string,
+  onModelsLoaded: PropTypes.func,
   disabled: PropTypes.bool,
 };
 

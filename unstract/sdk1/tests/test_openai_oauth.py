@@ -17,9 +17,13 @@ from unstract.sdk1.adapters.llm1.openai_oauth import (
 )
 from unstract.sdk1.auth.openai_oauth import (
     OPENAI_OAUTH_CHATGPT_API_BASE,
+    OPENAI_OAUTH_CODEX_CLIENT_VERSION,
+    OPENAI_OAUTH_MODELS_URL,
     OPENAI_OAUTH_TOKEN_URL,
+    build_openai_oauth_json_schema,
     extract_account_id,
     extract_email,
+    fetch_openai_oauth_model_catalog,
     refresh_openai_oauth_metadata,
 )
 from unstract.sdk1.llm import LLM
@@ -54,31 +58,105 @@ def test_openai_oauth_adapter_is_registered_with_auth_metadata() -> None:
         "python_social_auth_backend": "openai-oauth",
     }
     schema = json.loads(OpenAIOAuthLLMAdapter.get_json_schema())
-    assert schema["properties"]["model"]["default"] == "gpt-5.6"
-    assert schema["properties"]["model"]["enum"] == [
-        "gpt-6-astra",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.6",
-        "gpt-5.3-codex-spark",
-        "gpt-5.5",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5.2",
-        "gpt-5.3-codex",
-        "gpt-5-codex",
+    assert "enum" not in schema["properties"]["model"]
+    assert "enum" not in schema["allOf"][0]["then"]["properties"]["reasoning_effort"]
+
+
+def test_openai_oauth_model_catalog_is_normalized_per_account() -> None:
+    response = MagicMock(status_code=200)
+    response.json.return_value = {
+        "models": [
+            {
+                "slug": "hidden-model",
+                "display_name": "Hidden",
+                "visibility": "hidden",
+            },
+            {
+                "slug": "gpt-account-fast",
+                "display_name": "Account Fast",
+                "description": "Fast account model",
+                "priority": 2,
+                "default_reasoning_level": "low",
+                "supported_reasoning_levels": [
+                    {"effort": "low", "description": "Light"},
+                    {"effort": "high", "description": "Deep"},
+                ],
+            },
+            {
+                "slug": "gpt-account-best",
+                "display_name": "Account Best",
+                "priority": 1,
+                "supported_in_api": True,
+                "supported_reasoning_levels": [{"effort": "max"}],
+            },
+            {"slug": "not-supported", "supported_in_api": False},
+        ]
+    }
+    metadata = _metadata("account-token", "workspace-123")
+
+    with patch("unstract.sdk1.auth.openai_oauth.httpx.get", return_value=response) as get:
+        catalog = fetch_openai_oauth_model_catalog(metadata)
+
+    assert [model["slug"] for model in catalog] == [
+        "gpt-account-best",
+        "gpt-account-fast",
     ]
-    assert len(schema["properties"]["model"]["enum"]) == len(
-        schema["properties"]["model"]["enumNames"]
+    assert catalog[1]["supported_reasoning_levels"] == [
+        {"effort": "low", "description": "Light"},
+        {"effort": "high", "description": "Deep"},
+    ]
+    get.assert_called_once_with(
+        OPENAI_OAUTH_MODELS_URL,
+        params={"client_version": OPENAI_OAUTH_CODEX_CLIENT_VERSION},
+        headers={
+            "Authorization": "Bearer account-token",
+            "ChatGPT-Account-ID": "workspace-123",
+            "Accept": "application/json",
+            "originator": "unstract",
+        },
+        timeout=15.0,
     )
-    assert schema["allOf"][0]["then"]["properties"]["reasoning_effort"]["enum"] == [
-        "none",
+
+
+def test_openai_oauth_dynamic_schema_uses_model_specific_reasoning_levels() -> None:
+    base_schema = json.loads(OpenAIOAuthLLMAdapter.get_json_schema())
+    schema = build_openai_oauth_json_schema(
+        [
+            {
+                "slug": "account-model-a",
+                "display_name": "Model A",
+                "default_reasoning_level": "high",
+                "supported_reasoning_levels": [
+                    {"effort": "low", "description": "Low"},
+                    {"effort": "high", "description": "High"},
+                ],
+            },
+            {
+                "slug": "account-model-b",
+                "display_name": "Model B",
+                "supported_reasoning_levels": [
+                    {"effort": "max", "description": "Maximum"},
+                ],
+            },
+        ],
+        current_model="account-model-b",
+        base_schema=base_schema,
+    )
+
+    model = schema["properties"]["model"]
+    assert model["enum"] == ["account-model-a", "account-model-b"]
+    assert model["enumNames"] == ["Model A", "Model B"]
+    assert model["default"] == "account-model-b"
+    model_conditions = schema["allOf"][2:]
+    assert model_conditions[0]["if"]["properties"]["model"] == {
+        "const": "account-model-a"
+    }
+    assert model_conditions[0]["then"]["properties"]["reasoning_effort"]["enum"] == [
         "low",
-        "medium",
         "high",
-        "xhigh",
-        "max",
+    ]
+    assert model_conditions[1]["then"]["properties"]["reasoning_effort"]["enum"] == [
+        "max"
     ]
 
 

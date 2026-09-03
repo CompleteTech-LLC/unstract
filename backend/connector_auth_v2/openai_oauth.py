@@ -23,8 +23,10 @@ from unstract.sdk1.auth.openai_oauth import (
     OPENAI_OAUTH_PRIVATE_FIELDS,
     OPENAI_OAUTH_TOKEN_URL,
     OpenAIOAuthError,
+    build_openai_oauth_json_schema,
     extract_account_id,
     extract_email,
+    fetch_openai_oauth_model_catalog,
     refresh_openai_oauth_metadata,
 )
 from utils.user_session import UserSessionUtils
@@ -323,6 +325,19 @@ class OpenAIOAuthService:
             state["credentials"] = cls._encrypt(refreshed)
             cls._save_state(cache_key, state)
         return refreshed
+
+    @staticmethod
+    def dynamic_model_schema(
+        credentials: dict[str, Any], *, current_model: str | None = None
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Return a live account-specific form schema and refreshed credentials."""
+        refreshed = refresh_openai_oauth_metadata(credentials)
+        catalog = fetch_openai_oauth_model_catalog(refreshed)
+        schema = build_openai_oauth_json_schema(
+            catalog,
+            current_model=current_model,
+        )
+        return schema, refreshed
 
     @classmethod
     def consume(cls, cache_key: str, request: Request) -> None:
