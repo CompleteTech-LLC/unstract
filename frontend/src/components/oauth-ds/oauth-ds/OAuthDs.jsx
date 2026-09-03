@@ -1,5 +1,6 @@
 import PropTypes from "prop-types";
 import { useCallback, useEffect, useState } from "react";
+import Cookies from "js-cookie";
 import { Typography } from "@/components/ui/shims/antd-typography";
 
 import { getBaseUrl, O_AUTH_PROVIDERS } from "../../../helpers/GetStaticData";
@@ -172,6 +173,9 @@ function OAuthDs({
         const response = await axiosPrivate({
           method: "POST",
           url: "/api/v1/oauth/openai/start/",
+          headers: {
+            "X-CSRFToken": Cookies.get("csrftoken"),
+          },
         });
         const loginDetails = response?.data || {};
         const newCacheKey = loginDetails.cache_key;
