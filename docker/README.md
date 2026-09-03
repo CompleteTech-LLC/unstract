@@ -181,6 +181,9 @@ and batch latency/throughput, checks the expected dimensions, and reports
 fixture retrieval metrics. Replace
 docker/benchmarks/qwen3_smoke_dataset.json with a representative corpus and
 labeled queries before using quality scores to select a production model.
+When `--mode both` is used, the JSON report also contains one comparison per
+model with GPU speedups and GPU-minus-CPU retrieval-quality deltas. This makes
+the combined profile suitable for choosing a deployment target from one run.
 This change intentionally retains all six variants; unselected services can
 be removed in a follow-up after the benchmark review.
 

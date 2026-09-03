@@ -217,6 +217,84 @@ def validate_vectors(vectors: list[list[float]], expected_dimension: int) -> Non
         )
 
 
+def nested_float(result: dict[str, Any], *keys: str) -> float | None:
+    """Read a numeric value from a nested benchmark result."""
+    value: Any = result
+    for key in keys:
+        if not isinstance(value, dict) or key not in value:
+            return None
+        value = value[key]
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def rounded_ratio(numerator: float | None, denominator: float | None) -> float | None:
+    """Return a rounded ratio, or ``None`` when the denominator is unavailable."""
+    if numerator is None or denominator is None or denominator == 0:
+        return None
+    return round(numerator / denominator, 3)
+
+
+def compare_modes(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compare CPU and GPU results for each model in a completed matrix."""
+    by_model: dict[str, dict[str, dict[str, Any]]] = {}
+    for result in results:
+        if result.get("status", "ok") != "ok":
+            continue
+        model = str(result["model"])
+        mode = str(result["mode"])
+        if mode in MODES:
+            by_model.setdefault(model, {})[mode] = result
+
+    comparisons: list[dict[str, Any]] = []
+    for model in sorted(by_model):
+        pair = by_model[model]
+        if not all(mode in pair for mode in MODES):
+            continue
+        cpu = pair["cpu"]
+        gpu = pair["gpu"]
+        comparison: dict[str, Any] = {
+            "model": model,
+            "cpu_service": cpu["service"],
+            "gpu_service": gpu["service"],
+            "single_latency_speedup": rounded_ratio(
+                nested_float(cpu, "single_latency_ms", "p50"),
+                nested_float(gpu, "single_latency_ms", "p50"),
+            ),
+            "batch_throughput_speedup": rounded_ratio(
+                nested_float(gpu, "batch_throughput_items_per_second"),
+                nested_float(cpu, "batch_throughput_items_per_second"),
+            ),
+        }
+        cpu_mrr = nested_float(cpu, "quality", "mrr")
+        gpu_mrr = nested_float(gpu, "quality", "mrr")
+        cpu_ndcg = nested_float(cpu, "quality", "ndcg_at_5")
+        gpu_ndcg = nested_float(gpu, "quality", "ndcg_at_5")
+        if cpu_mrr is not None and gpu_mrr is not None:
+            comparison["mrr_delta"] = round(gpu_mrr - cpu_mrr, 6)
+        if cpu_ndcg is not None and gpu_ndcg is not None:
+            comparison["ndcg_at_5_delta"] = round(gpu_ndcg - cpu_ndcg, 6)
+        comparisons.append(comparison)
+    return comparisons
+
+
+def print_comparisons(comparisons: list[dict[str, Any]]) -> None:
+    """Print CPU/GPU comparison rows for a completed matrix."""
+    if not comparisons:
+        return
+    print("\nCPU/GPU comparison")
+    print(
+        "model single_latency_speedup batch_throughput_speedup mrr_delta ndcg_at_5_delta"
+    )
+    for comparison in comparisons:
+        print(
+            f"{comparison['model']} "
+            f"{comparison['single_latency_speedup']} "
+            f"{comparison['batch_throughput_speedup']} "
+            f"{comparison.get('mrr_delta', '-')} "
+            f"{comparison.get('ndcg_at_5_delta', '-')}"
+        )
+
+
 def benchmark_endpoint(
     model: dict[str, Any],
     mode: str,
@@ -408,6 +486,8 @@ def main() -> int:
         },
         "results": results,
     }
+    comparisons = compare_modes(results) if args.mode == "both" else []
+    report["comparisons"] = comparisons
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
@@ -425,6 +505,7 @@ def main() -> int:
             f"{result.get('batch_throughput_items_per_second', '-')} "
             f"{quality.get('mrr', '-')}"
         )
+    print_comparisons(comparisons)
 
     has_errors = any(result.get("status") == "error" for result in results)
     return 1 if args.strict and has_errors else 0
