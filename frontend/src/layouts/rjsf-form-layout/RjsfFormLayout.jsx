@@ -276,6 +276,14 @@ function RjsfFormLayout({
         };
   }, [formSchema]);
 
+  // An OAuth schema arrives after the form has already mounted. Include the
+  // materialized reasoning field in the key so RJSF does not retain the
+  // pre-auth resolved allOf branch when reasoning was already enabled.
+  const formInstanceKey =
+    schema?.["x-openai-oauth-model-source"] === "chatgpt-account"
+      ? `openai-oauth-${Boolean(schema?.properties?.reasoning_effort)}`
+      : undefined;
+
   return (
     <>
       {isLoading ? (
@@ -289,6 +297,7 @@ function RjsfFormLayout({
             />
           )}
           <Form
+            key={formInstanceKey}
             ref={formRef}
             schema={removeBlankDefault(formSchema)}
             uiSchema={uiSchema}

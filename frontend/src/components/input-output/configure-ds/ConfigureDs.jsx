@@ -1,6 +1,6 @@
 import { Info } from "lucide-react";
 import PropTypes from "prop-types";
-import { createRef, useCallback, useEffect, useState } from "react";
+import { createRef, useCallback, useEffect, useMemo, useState } from "react";
 import { Col, Row } from "@/components/ui/shims/antd-layout";
 import { Popover } from "@/components/ui/shims/antd-overlays";
 
@@ -13,6 +13,10 @@ import { useAlertStore } from "../../../store/alert-store";
 import { useSessionStore } from "../../../store/session-store";
 import { OAuthDs } from "../../oauth-ds/oauth-ds/OAuthDs.jsx";
 import { CustomButton } from "../../widgets/custom-button/CustomButton.jsx";
+import {
+  getReasoningSchemaForModel,
+  materializeReasoningProperty,
+} from "./openai-oauth-form-schema.js";
 import "./ConfigureDs.css";
 
 function ConfigureDs({
@@ -57,18 +61,6 @@ function ConfigureDs({
   const oauthStatusKey = `oauth-status-${oauthStateScope}`;
   const oauthDeviceKey = `oauth-device-${oauthStateScope}`;
 
-  const findReasoningSchema = useCallback((schema, model) => {
-    if (!schema || !model || !Array.isArray(schema.allOf)) {
-      return undefined;
-    }
-    const condition = schema.allOf.find(
-      (candidate) =>
-        candidate?.if?.properties?.enable_reasoning?.const === true &&
-        candidate?.if?.properties?.model?.const === model,
-    );
-    return condition?.then?.properties?.reasoning_effort;
-  }, []);
-
   const handleOpenAIModelSchema = useCallback(
     (dynamicSchema) => {
       const modelSchema = dynamicSchema?.properties?.model;
@@ -85,7 +77,10 @@ function ConfigureDs({
         }
 
         if (next.enable_reasoning) {
-          const reasoningSchema = findReasoningSchema(dynamicSchema, next.model);
+          const reasoningSchema = getReasoningSchemaForModel(
+            dynamicSchema,
+            next.model,
+          );
           if (
             Array.isArray(reasoningSchema?.enum) &&
             reasoningSchema.enum.length > 0 &&
@@ -98,7 +93,17 @@ function ConfigureDs({
         return next;
       });
     },
-    [findReasoningSchema, setFormData],
+    [setFormData],
+  );
+
+  const renderSchema = useMemo(
+    () =>
+      materializeReasoningProperty(
+        oauthSpec || spec,
+        formData?.model,
+        formData?.enable_reasoning,
+      ),
+    [formData?.enable_reasoning, formData?.model, oauthSpec, spec],
   );
 
   useEffect(() => {
@@ -109,7 +114,10 @@ function ConfigureDs({
     if (!oauthSpec || !formData?.enable_reasoning || !formData?.model) {
       return;
     }
-    const reasoningSchema = findReasoningSchema(oauthSpec, formData.model);
+    const reasoningSchema = getReasoningSchemaForModel(
+      oauthSpec,
+      formData.model,
+    );
     if (
       !Array.isArray(reasoningSchema?.enum) ||
       reasoningSchema.enum.length === 0 ||
@@ -121,7 +129,7 @@ function ConfigureDs({
       ...(currentFormData || {}),
       reasoning_effort: reasoningSchema.default || reasoningSchema.enum[0],
     }));
-  }, [findReasoningSchema, formData, oauthSpec, setFormData]);
+  }, [formData, oauthSpec, setFormData]);
 
   // Determine if this is a new or existing connector
   const hasOAuthCredentials =
@@ -474,7 +482,7 @@ function ConfigureDs({
         </div>
       )}
       <RjsfFormLayout
-        schema={oauthSpec || spec}
+        schema={renderSchema}
         formData={formData}
         setFormData={setFormData}
         isLoading={isLoading}
