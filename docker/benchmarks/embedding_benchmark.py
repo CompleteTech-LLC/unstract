@@ -394,13 +394,16 @@ def benchmark_endpoint(
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Benchmark the local Qwen3 CPU/GPU embedding matrix."
+        description="Benchmark the local Qwen3 CPU/GPU/Intel-XPU embedding matrix."
     )
     parser.add_argument(
         "--mode",
-        choices=("cpu", "gpu", "both"),
+        choices=("cpu", "gpu", "xpu", "both"),
         default="both",
-        help="Endpoint variation to test; both tests CPU and GPU endpoints.",
+        help=(
+            "Endpoint variation to test; both tests CPU and NVIDIA GPU endpoints. "
+            "Use xpu for Intel XPU endpoints."
+        ),
     )
     parser.add_argument(
         "--config",

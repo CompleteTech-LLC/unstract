@@ -1,0 +1,141 @@
+# Optional local Qwen3 Intel XPU embedding services.
+#
+# Hugging Face's Intel TEI image uses Intel Extension for PyTorch and Level
+# Zero. The /dev/dri mappings are intentionally kept in this separate,
+# profile-gated file so the default CPU and NVIDIA profiles are unchanged.
+
+x-qwen3-xpu-healthcheck: &qwen3_xpu_healthcheck
+  test:
+    - CMD-SHELL
+    - >-
+      curl --fail --silent http://localhost:80/health >/dev/null ||
+      exit 1
+  interval: 15s
+  timeout: 10s
+  retries: 40
+  start_period: 10m
+
+x-qwen3-xpu-common: &qwen3_xpu_common
+  restart: unless-stopped
+  shm_size: 1gb
+  expose:
+    - "80"
+  environment:
+    HF_HOME: /data
+    HF_HUB_DISABLE_TELEMETRY: "1"
+    DO_NOT_TRACK: "1"
+    HF_TOKEN: ${HF_TOKEN:-}
+    TOKENIZERS_PARALLELISM: "false"
+    # Allow Level Zero to use large allocations on Intel XPU devices.
+    UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS: "1"
+  labels:
+    traefik.enable: "false"
+  stop_grace_period: 30s
+  healthcheck:
+    <<: *qwen3_xpu_healthcheck
+  devices:
+    - /dev/dri:/dev/dri
+  volumes:
+    - /dev/dri/by-path:/dev/dri/by-path:ro
+
+x-qwen3-xpu-image: &qwen3_xpu_image
+  ${QWEN3_TEI_XPU_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:xpu-ipex-latest}
+
+services:
+  qwen3-embedding-06b-xpu:
+    <<: *qwen3_xpu_common
+    image: *qwen3_xpu_image
+    container_name: unstract-qwen3-embedding-06b-xpu
+    profiles:
+      - embeddings-xpu
+    ports:
+      - "127.0.0.1:${QWEN3_06B_XPU_PORT:-8301}:80"
+    volumes:
+      - /dev/dri/by-path:/dev/dri/by-path:ro
+      - qwen3_embedding_06b_xpu_cache:/data
+    command:
+      - --model-id
+      - Qwen/Qwen3-Embedding-0.6B
+      - --revision
+      - ${QWEN3_06B_REVISION:-97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3}
+      - --served-model-name
+      - qwen3-embedding-06b
+      - --dtype
+      - float16
+      - --pooling
+      - last-token
+      - --max-batch-tokens
+      - ${QWEN3_XPU_MAX_BATCH_TOKENS:-1024}
+      - --max-client-batch-size
+      - ${QWEN3_XPU_MAX_CLIENT_BATCH_SIZE:-16}
+      - --max-concurrent-requests
+      - ${QWEN3_XPU_MAX_CONCURRENT_REQUESTS:-4}
+      - --tokenization-workers
+      - ${QWEN3_XPU_TOKENIZATION_WORKERS:-4}
+
+  qwen3-embedding-4b-xpu:
+    <<: *qwen3_xpu_common
+    image: *qwen3_xpu_image
+    container_name: unstract-qwen3-embedding-4b-xpu
+    profiles:
+      - embeddings-xpu
+    ports:
+      - "127.0.0.1:${QWEN3_4B_XPU_PORT:-8302}:80"
+    volumes:
+      - /dev/dri/by-path:/dev/dri/by-path:ro
+      - qwen3_embedding_4b_xpu_cache:/data
+    command:
+      - --model-id
+      - Qwen/Qwen3-Embedding-4B
+      - --revision
+      - ${QWEN3_4B_REVISION:-5cf2132abc99cad020ac570b19d031efec650f2b}
+      - --served-model-name
+      - qwen3-embedding-4b
+      - --dtype
+      - float16
+      - --pooling
+      - last-token
+      - --max-batch-tokens
+      - ${QWEN3_XPU_MAX_BATCH_TOKENS:-1024}
+      - --max-client-batch-size
+      - ${QWEN3_XPU_MAX_CLIENT_BATCH_SIZE:-16}
+      - --max-concurrent-requests
+      - ${QWEN3_XPU_MAX_CONCURRENT_REQUESTS:-4}
+      - --tokenization-workers
+      - ${QWEN3_XPU_TOKENIZATION_WORKERS:-4}
+
+  qwen3-embedding-8b-xpu:
+    <<: *qwen3_xpu_common
+    image: *qwen3_xpu_image
+    container_name: unstract-qwen3-embedding-8b-xpu
+    profiles:
+      - embeddings-xpu
+    ports:
+      - "127.0.0.1:${QWEN3_8B_XPU_PORT:-8303}:80"
+    volumes:
+      - /dev/dri/by-path:/dev/dri/by-path:ro
+      - qwen3_embedding_8b_xpu_cache:/data
+    command:
+      - --model-id
+      - Qwen/Qwen3-Embedding-8B
+      - --revision
+      - ${QWEN3_8B_REVISION:-1d8ad4ca9b3dd8059ad90a75d4983776a23d44af}
+      - --served-model-name
+      - qwen3-embedding-8b
+      - --dtype
+      - float16
+      - --pooling
+      - last-token
+      - --max-batch-tokens
+      - ${QWEN3_XPU_MAX_BATCH_TOKENS:-1024}
+      - --max-client-batch-size
+      - ${QWEN3_XPU_MAX_CLIENT_BATCH_SIZE:-16}
+      - --max-concurrent-requests
+      - ${QWEN3_XPU_MAX_CONCURRENT_REQUESTS:-4}
+      - --tokenization-workers
+      - ${QWEN3_XPU_TOKENIZATION_WORKERS:-4}
+
+volumes:
+  qwen3_embedding_06b_xpu_cache:
+  qwen3_embedding_4b_xpu_cache:
+  qwen3_embedding_8b_xpu_cache:
