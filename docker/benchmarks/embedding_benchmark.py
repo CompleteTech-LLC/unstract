@@ -125,6 +125,22 @@ def embed(
     return vectors
 
 
+def embed_in_batches(
+    base_url: str,
+    model_id: str,
+    texts: list[str],
+    batch_size: int,
+    timeout: float,
+) -> list[list[float]]:
+    """Generate embeddings in bounded requests for backends with batch caps."""
+    vectors: list[list[float]] = []
+    for start in range(0, len(texts), batch_size):
+        vectors.extend(
+            embed(base_url, model_id, texts[start : start + batch_size], timeout)
+        )
+    return vectors
+
+
 def prefixed(text: str, prefix: str) -> str:
     """Apply a configured query/document prefix."""
     return f"{prefix}{text}" if prefix else text
@@ -274,16 +290,18 @@ def benchmark_endpoint(
     }
 
     if not skip_quality:
-        document_vectors = embed(
+        document_vectors = embed_in_batches(
             base_url,
             model_id,
             [prefixed(str(document["text"]), passage_prefix) for document in documents],
+            batch_size,
             timeout,
         )
-        query_vectors = embed(
+        query_vectors = embed_in_batches(
             base_url,
             model_id,
             [prefixed(str(query["text"]), query_prefix) for query in queries],
+            batch_size,
             timeout,
         )
         validate_vectors(document_vectors, expected_dimension)
