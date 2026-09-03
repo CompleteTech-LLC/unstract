@@ -58,8 +58,11 @@ def test_openai_oauth_adapter_is_registered_with_auth_metadata() -> None:
         "python_social_auth_backend": "openai-oauth",
     }
     schema = json.loads(OpenAIOAuthLLMAdapter.get_json_schema())
-    assert "enum" not in schema["properties"]["model"]
-    assert "enum" not in schema["allOf"][0]["then"]["properties"]["reasoning_effort"]
+    assert schema["properties"]["model"]["enum"] == []
+    assert (
+        schema["allOf"][0]["then"]["properties"]["reasoning_effort"]["enum"]
+        == []
+    )
 
 
 def test_openai_oauth_model_catalog_is_normalized_per_account() -> None:

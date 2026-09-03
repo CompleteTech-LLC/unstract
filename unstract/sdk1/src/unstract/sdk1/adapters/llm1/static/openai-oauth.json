@@ -15,6 +15,8 @@
     "model": {
       "type": "string",
       "title": "Model",
+      "enum": [],
+      "enumNames": [],
       "description": "Sign in with OpenAI to load the models available to this ChatGPT/Codex account."
     },
     "max_tokens": {
@@ -62,6 +64,8 @@
           "reasoning_effort": {
             "type": "string",
             "title": "Reasoning Effort",
+            "enum": [],
+            "enumNames": [],
             "description": "Sign in with OpenAI to load reasoning levels supported by the selected model."
           }
         },
