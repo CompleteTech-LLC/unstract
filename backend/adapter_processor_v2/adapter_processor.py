@@ -8,6 +8,13 @@ from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
 from platform_settings_v2.platform_auth_service import PlatformAuthenticationService
 from tenant_account_v2.organization_member_service import OrganizationMemberService
+from unstract.sdk1.adapters.adapterkit import Adapterkit
+from unstract.sdk1.adapters.base import Adapter
+from unstract.sdk1.adapters.x2text.constants import X2TextConstants
+from unstract.sdk1.constants import AdapterTypes
+from unstract.sdk1.embedding import EmbeddingCompat
+from unstract.sdk1.exceptions import SdkError
+from unstract.sdk1.llm import LLM
 
 from adapter_processor_v2.constants import AdapterKeys, AllowedDomains
 from adapter_processor_v2.exceptions import (
@@ -16,13 +23,6 @@ from adapter_processor_v2.exceptions import (
     InValidAdapterId,
     TestAdapterError,
 )
-from unstract.sdk1.adapters.adapterkit import Adapterkit
-from unstract.sdk1.adapters.base import Adapter
-from unstract.sdk1.adapters.x2text.constants import X2TextConstants
-from unstract.sdk1.constants import AdapterTypes
-from unstract.sdk1.embedding import EmbeddingCompat
-from unstract.sdk1.exceptions import SdkError
-from unstract.sdk1.llm import LLM
 
 from .models import AdapterInstance, UserDefaultAdapter
 
@@ -46,6 +46,9 @@ class AdapterProcessor:
             schema_details[AdapterKeys.JSON_SCHEMA] = json.loads(
                 updated_adapters[0].get(AdapterKeys.JSON_SCHEMA)
             )
+            for key in ("oauth", "oauth_provider", "python_social_auth_backend"):
+                if key in updated_adapters[0]:
+                    schema_details[key] = updated_adapters[0][key]
         else:
             logger.error(f"Invalid adapter Id : {adapter_id} while fetching JSON Schema")
             raise InValidAdapterId()
@@ -68,8 +71,7 @@ class AdapterProcessor:
             if not is_special_user and adapter_id.startswith("noOp"):
                 continue
 
-            supported_adapters.append(
-                {
+            adapter_details = {
                     AdapterKeys.ID: adapter_id,
                     AdapterKeys.NAME: each_adapter.get(AdapterKeys.NAME),
                     AdapterKeys.DESCRIPTION: each_adapter.get(AdapterKeys.DESCRIPTION),
@@ -77,7 +79,10 @@ class AdapterProcessor:
                     AdapterKeys.ADAPTER_TYPE: each_adapter.get(AdapterKeys.ADAPTER_TYPE),
                     AdapterKeys.DOC_URL: each_adapter.get(AdapterKeys.DOC_URL, ""),
                 }
-            )
+            for key in ("oauth", "oauth_provider", "python_social_auth_backend"):
+                if key in each_adapter:
+                    adapter_details[key] = each_adapter[key]
+            supported_adapters.append(adapter_details)
         return supported_adapters
 
     @staticmethod

@@ -7,7 +7,6 @@ from typing import Any
 from cryptography.fernet import Fernet, InvalidToken
 from flask import Blueprint, Request, jsonify, make_response, request
 from flask import current_app as app
-
 from unstract.core.flask import PluginManager
 from unstract.core.flask.exceptions import APIError
 from unstract.platform_service.constants import DBTable
@@ -17,6 +16,11 @@ from unstract.platform_service.helper.adapter_instance import (
     AdapterInstanceRequestHelper,
 )
 from unstract.platform_service.helper.prompt_studio import PromptStudioRequestHelper
+from unstract.sdk1.auth.openai_oauth import (
+    OpenAIOAuthRefreshError,
+    is_openai_oauth_adapter,
+    refresh_openai_oauth_metadata,
+)
 
 platform_bp = Blueprint("platform", __name__)
 
@@ -374,9 +378,55 @@ def adapter_instance() -> Any:
 
         f: Fernet = Fernet(Env.ENCRYPTION_KEY.encode("utf-8"))
 
-        data_dict["adapter_metadata"] = json.loads(
+        adapter_metadata = json.loads(
             f.decrypt(bytes(data_dict.pop("adapter_metadata_b")).decode("utf-8"))
         )
+
+        if is_openai_oauth_adapter(data_dict.get("adapter_id")):
+            try:
+                refreshed_metadata = refresh_openai_oauth_metadata(adapter_metadata)
+            except OpenAIOAuthRefreshError as exc:
+                app.logger.warning(
+                    "OpenAI OAuth credentials could not be refreshed for adapter "
+                    "%s: %s",
+                    adapter_instance_id,
+                    exc,
+                )
+                raise APIError(
+                    message=(
+                        "OpenAI OAuth credentials have expired. Reauthenticate "
+                        "this adapter in the platform settings."
+                    ),
+                    code=401,
+                ) from exc
+
+            if refreshed_metadata != adapter_metadata:
+                refreshed_ciphertext = f.encrypt(
+                    json.dumps(refreshed_metadata).encode("utf-8")
+                )
+                try:
+                    update_query = (
+                        f'UPDATE "{Env.DB_SCHEMA}".{DBTable.ADAPTER_INSTANCE} '
+                        "SET adapter_metadata_b=%s "
+                        "WHERE id=%s AND organization_id=%s"
+                    )
+                    with safe_cursor(
+                        update_query,
+                        (refreshed_ciphertext, adapter_instance_id, organization_uid),
+                    ):
+                        pass
+                except Exception:
+                    # The current workflow can use the refreshed copy. A later
+                    # request may refresh again if the durable write lost a race.
+                    app.logger.warning(
+                        "Could not persist refreshed OpenAI OAuth credentials for "
+                        "adapter %s",
+                        adapter_instance_id,
+                        exc_info=True,
+                    )
+            adapter_metadata = refreshed_metadata
+
+        data_dict["adapter_metadata"] = adapter_metadata
 
         return jsonify(data_dict)
     except InvalidToken:

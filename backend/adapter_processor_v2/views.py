@@ -3,6 +3,7 @@ import uuid
 from typing import Any
 
 from account_v2.models import User
+from connector_auth_v2.openai_oauth import OpenAIOAuthService
 from django.db import IntegrityError
 from django.db.models import ProtectedError, QuerySet
 from django.http import HttpRequest
@@ -19,7 +20,7 @@ from permissions.roles import ResourceRole
 from plugins import get_plugin
 from rest_framework import status
 from rest_framework.decorators import action
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.serializers import ModelSerializer
@@ -27,6 +28,11 @@ from rest_framework.versioning import URLPathVersioning
 from rest_framework.viewsets import GenericViewSet, ModelViewSet
 from tenant_account_v2.organization_member_service import OrganizationMemberService
 from tool_instance_v2.models import ToolInstance
+from unstract.sdk1.auth.openai_oauth import (
+    OPENAI_OAUTH_PRIVATE_FIELDS,
+    OpenAIOAuthError,
+    is_openai_oauth_adapter,
+)
 from utils.filtering import FilterHelper
 from utils.pagination import OptionalPagination
 from utils.user_context import UserContext
@@ -58,6 +64,63 @@ if notification_plugin:
     from plugins.notification.constants import ResourceType
 
 logger = logging.getLogger(__name__)
+
+
+def _prepare_openai_oauth_payload(
+    request: Request,
+    payload: Any,
+    existing_metadata: dict[str, Any] | None = None,
+) -> tuple[Any, str | None]:
+    """Inject credentials from one owned OAuth login into an adapter payload."""
+    adapter_id = payload.get(AdapterKeys.ADAPTER_ID)
+    if not is_openai_oauth_adapter(adapter_id):
+        return payload, None
+
+    submitted_metadata = payload.get(AdapterKeys.ADAPTER_METADATA)
+    if submitted_metadata is None and existing_metadata is not None:
+        adapter_metadata = dict(existing_metadata)
+    elif isinstance(submitted_metadata, dict):
+        adapter_metadata = dict(submitted_metadata)
+    else:
+        adapter_metadata = {}
+
+    # Tokens/account identity are always sourced from the server-side login
+    # session or the already-encrypted row. Never trust values sent in JSON.
+    for key in OPENAI_OAUTH_PRIVATE_FIELDS:
+        adapter_metadata.pop(key, None)
+    adapter_metadata.pop("oauth_authenticated", None)
+    adapter_metadata.pop("oauth_account_label", None)
+
+    oauth_key = request.query_params.get("oauth-key")
+    if oauth_key:
+        try:
+            credentials = OpenAIOAuthService.credentials_for_request(oauth_key, request)
+        except OpenAIOAuthError as exc:
+            raise ValidationError({"oauth-key": str(exc)}) from exc
+        adapter_metadata.update(credentials)
+    elif existing_metadata is not None:
+        for key in OPENAI_OAUTH_PRIVATE_FIELDS:
+            if key in existing_metadata:
+                adapter_metadata[key] = existing_metadata[key]
+    else:
+        raise ValidationError(
+            {"oauth-key": "OpenAI OAuth authentication is required for this adapter."}
+        )
+
+    payload[AdapterKeys.ADAPTER_METADATA] = adapter_metadata
+    return payload, oauth_key
+
+
+def _consume_openai_oauth_key(cache_key: str | None, request: Request) -> None:
+    """Best-effort cleanup after credentials are durably stored."""
+    if not cache_key:
+        return
+    try:
+        OpenAIOAuthService.consume(cache_key, request)
+    except OpenAIOAuthError:
+        # The adapter row is already the durable credential store. A cache
+        # expiry/race must not turn a successful create/update into a 500.
+        logger.warning("Could not consume OpenAI OAuth hand-off session")
 
 
 class DefaultAdapterViewSet(ModelViewSet):
@@ -127,10 +190,13 @@ class AdapterViewSet(GenericViewSet):
 
     def test(self, request: Request) -> Response:
         """Tests the connector against the credentials passed."""
-        serializer: AdapterInstanceSerializer = self.get_serializer(data=request.data)
+        payload = request.data.copy()
+        payload, _ = _prepare_openai_oauth_payload(request, payload)
+        serializer: AdapterInstanceSerializer = self.get_serializer(data=payload)
         serializer.is_valid(raise_exception=True)
         adapter_id = serializer.validated_data.get(AdapterKeys.ADAPTER_ID)
         adapter_metadata = serializer.validated_data.get(AdapterKeys.ADAPTER_METADATA)
+        adapter_metadata = dict(adapter_metadata or {})
         adapter_metadata[AdapterKeys.ADAPTER_TYPE] = serializer.validated_data.get(
             AdapterKeys.ADAPTER_TYPE
         )
@@ -237,10 +303,12 @@ class AdapterInstanceViewSet(
             )
 
     def create(self, request: Any) -> Response:
-        serializer = self.get_serializer(data=request.data)
+        payload = request.data.copy()
+        payload, oauth_key = _prepare_openai_oauth_payload(request, payload)
+        serializer = self.get_serializer(data=payload)
 
         use_platform_unstract_key = False
-        adapter_metadata = request.data.get(AdapterKeys.ADAPTER_METADATA)
+        adapter_metadata = payload.get(AdapterKeys.ADAPTER_METADATA)
         if adapter_metadata and adapter_metadata.get(
             AdapterKeys.PLATFORM_PROVIDED_UNSTRACT_KEY, False
         ):
@@ -311,6 +379,9 @@ class AdapterInstanceViewSet(
             user_default_adapter.organization_member = organization_member
 
             user_default_adapter.save()
+
+            # The encrypted adapter row is now the durable credential store.
+            _consume_openai_oauth_key(oauth_key, request)
 
         except IntegrityError:
             raise DuplicateAdapterNameError(
@@ -410,7 +481,10 @@ class AdapterInstanceViewSet(
         adapter = self.get_object()
         before = self.snapshot_share_axes(adapter)
 
-        response = super().partial_update(request, *args, **kwargs)
+        if is_openai_oauth_adapter(adapter.adapter_id):
+            response = self._update_openai_oauth(request, adapter, partial=True)
+        else:
+            response = super().partial_update(request, *args, **kwargs)
         if response.status_code == 200 and notification_plugin:
             self._notify_shared_users(adapter, before, request.data, request.user)
         return response
@@ -555,6 +629,13 @@ class AdapterInstanceViewSet(
     def update(
         self, request: Request, *args: tuple[Any], **kwargs: dict[str, Any]
     ) -> Response:
+        # OAuth adapters carry their credentials in the encrypted metadata row;
+        # inject a newly completed login or preserve the existing account when
+        # a metadata-only edit does not include a new login session.
+        adapter = self.get_object()
+        if is_openai_oauth_adapter(adapter.adapter_id):
+            return self._update_openai_oauth(request, adapter, partial=False)
+
         # Check if adapter metadata is being updated and contains the platform key flag
         use_platform_unstract_key = False
         adapter_metadata = request.data.get(AdapterKeys.ADAPTER_METADATA)
@@ -564,9 +645,6 @@ class AdapterInstanceViewSet(
         ):
             use_platform_unstract_key = True
             logger.error(f"Platform key flag detected: {use_platform_unstract_key}")
-
-        # Get the adapter instance for update
-        adapter = self.get_object()
 
         if use_platform_unstract_key:
             logger.error("Processing adapter with platform key")
@@ -596,6 +674,19 @@ class AdapterInstanceViewSet(
 
         # For non-platform-key cases, use the default update behavior
         return super().update(request, *args, **kwargs)
+
+    def _update_openai_oauth(
+        self, request: Request, adapter: AdapterInstance, *, partial: bool
+    ) -> Response:
+        payload = request.data.copy()
+        payload, oauth_key = _prepare_openai_oauth_payload(
+            request, payload, existing_metadata=adapter.metadata
+        )
+        serializer = self.get_serializer(adapter, data=payload, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        _consume_openai_oauth_key(oauth_key, request)
+        return Response(serializer.data)
 
     @action(detail=True, methods=["get"])
     def adapter_info(self, request: HttpRequest, pk: uuid) -> Response:

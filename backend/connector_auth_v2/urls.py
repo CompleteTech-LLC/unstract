@@ -8,6 +8,8 @@ connector_auth_cache = ConnectorAuthViewSet.as_view(
         "get": "cache_key",
     }
 )
+openai_oauth_start = ConnectorAuthViewSet.as_view({"post": "openai_start"})
+openai_oauth_poll = ConnectorAuthViewSet.as_view({"get": "openai_poll"})
 
 urlpatterns = format_suffix_patterns(
     [
@@ -17,5 +19,7 @@ urlpatterns = format_suffix_patterns(
             connector_auth_cache,
             name="connector-cache",
         ),
+        path("oauth/openai/start/", openai_oauth_start, name="openai-oauth-start"),
+        path("oauth/openai/poll/", openai_oauth_poll, name="openai-oauth-poll"),
     ]
 )

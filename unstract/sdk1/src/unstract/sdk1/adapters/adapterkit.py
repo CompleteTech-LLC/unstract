@@ -5,6 +5,7 @@ if TYPE_CHECKING:
     from typing import Any
 
 from singleton_decorator import singleton
+
 from unstract.sdk1.adapters import AdapterDict
 from unstract.sdk1.adapters.base import Adapter
 from unstract.sdk1.adapters.constants import Common
@@ -71,6 +72,8 @@ class Adapterkit:
             json_schema = m.get_json_schema()
             desc = m.get_description()
             icon = m.get_icon()
+            get_auth_metadata = getattr(m, "get_auth_metadata", None)
+            auth_metadata = get_auth_metadata() if get_auth_metadata else {}
             adapters.append(
                 {
                     "id": _id,
@@ -81,6 +84,7 @@ class Adapterkit:
                     "adapter_type": adapter_type,
                     "json_schema": json_schema,
                     "doc_url": m.get_doc_url(),
+                    **auth_metadata,
                 }
             )
         return adapters

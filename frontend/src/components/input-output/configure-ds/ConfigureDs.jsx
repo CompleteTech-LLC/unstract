@@ -56,7 +56,10 @@ function ConfigureDs({
 
   // Determine if this is a new or existing connector
   const hasOAuthCredentials =
-    metadata && (metadata.access_token || (metadata.provider && metadata.uid));
+    metadata &&
+    (metadata.access_token ||
+      (metadata.provider && metadata.uid) ||
+      metadata.oauth_authenticated);
   const isExistingConnector = Boolean(editItemId || hasOAuthCredentials);
 
   // Determine if OAuth authentication method is selected
@@ -176,7 +179,11 @@ function ConfigureDs({
       (status !== "success" || !cacheKey?.length)
     ) {
       const providerName =
-        oAuthProvider === "google-oauth2" ? "Google" : "OAuth provider";
+        oAuthProvider === "google-oauth2"
+          ? "Google"
+          : oAuthProvider === "openai-oauth"
+            ? "OpenAI"
+            : "OAuth provider";
       setAlertDetails({
         type: "error",
         content: `OAuth authentication required. Please sign in with ${providerName} first.`,
@@ -211,10 +218,14 @@ function ConfigureDs({
     }
 
     if (oAuthProvider?.length > 0 && isOAuthMethodSelected()) {
-      body["connector_metadata"] = {
-        ...body["connector_metadata"],
-        ...{ "oauth-key": cacheKey },
-      };
+      if (isConnector) {
+        body["connector_metadata"] = {
+          ...body["connector_metadata"],
+          ...{ "oauth-key": cacheKey },
+        };
+      } else {
+        url = `${url}?oauth-key=${encodeURIComponent(cacheKey)}`;
+      }
     }
 
     const requestOptions = {
@@ -311,7 +322,11 @@ function ConfigureDs({
       url = `${url}${editItemId}/`;
     }
 
-    if (oAuthProvider?.length > 0 && isOAuthMethodSelected()) {
+    if (
+      oAuthProvider?.length > 0 &&
+      isOAuthMethodSelected() &&
+      cacheKey?.length
+    ) {
       const encodedCacheKey = encodeURIComponent(cacheKey);
       url = url + `?oauth-key=${encodedCacheKey}`;
     }
@@ -342,6 +357,7 @@ function ConfigureDs({
         if (oAuthProvider?.length > 0 && isOAuthMethodSelected()) {
           localStorage.removeItem(oauthCacheKey);
           localStorage.removeItem(oauthStatusKey);
+          localStorage.removeItem(`oauth-device-${selectedSourceId}`);
         }
 
         setOpen(false);
