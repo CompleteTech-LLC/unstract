@@ -83,6 +83,12 @@ CPU and GPU services are separate so they can be benchmarked against the same
 model and workload. Model files are cached in persistent, model-specific
 volumes.
 
+The CPU services are defined in `docker-compose-local-embeddings.yaml`; the
+GPU services are defined in the separately included
+`docker-compose-local-embeddings-gpu.yaml`. This keeps the GPU runtime setup
+isolated while the root Compose file still exposes one consistent service
+matrix.
+
 | Model | Vector dimensions | CPU service / host port | GPU service / host port |
 |-------|-------------------:|-------------------------|-------------------------|
 | Qwen3-Embedding-0.6B | 1024 | qwen3-embedding-06b-cpu / 8101 | qwen3-embedding-06b-gpu / 8201 |
@@ -108,6 +114,13 @@ VERSION=dev docker compose -f docker-compose.yaml --profile embeddings-both up -
   qwen3-embedding-06b-gpu qwen3-embedding-4b-gpu qwen3-embedding-8b-gpu
 ```
 
+Before starting either GPU profile, verify that the host can see an NVIDIA
+device and driver:
+
+```bash
+python3 docker/benchmarks/gpu_preflight.py --json
+```
+
 GPU services require the NVIDIA Container Toolkit and a compatible NVIDIA
 driver. The default CUDA image targets the TEI CUDA 1.9 runtime; set
 QWEN3_TEI_GPU_IMAGE when an architecture-specific image is needed.
@@ -116,6 +129,12 @@ cpu-arm64-1.9 image on ARM64 hosts. The embeddings-both profile starts every
 service in the matrix and may exceed available GPU memory if all six are
 launched together. For a fair comparison, start one profile at a time or
 benchmark endpoints sequentially.
+
+GPU services have independent tuning variables so a GPU run does not change
+the CPU run's request limits: `QWEN3_GPU_MAX_BATCH_TOKENS` (default `8192`),
+`QWEN3_GPU_MAX_CLIENT_BATCH_SIZE` (default `32`),
+`QWEN3_GPU_MAX_CONCURRENT_REQUESTS` (default `4`), and
+`QWEN3_GPU_TOKENIZATION_WORKERS` (default `4`).
 
 Each service exposes an OpenAI-compatible endpoint. From an Unstract
 container, use the internal URL; from the host, use the localhost URL:

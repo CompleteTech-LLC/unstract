@@ -2,6 +2,7 @@ name: ${COMPOSE_PROJECT_NAME:-docker}
 include:
   - docker-compose-dev-essentials.yaml
   - docker-compose-local-embeddings.yaml
+  - docker-compose-local-embeddings-gpu.yaml
 
 # Reusable host-gateway mapping so containers can reach services on the host
 # (e.g. host-installed Ollama at http://host.docker.internal:11434).
