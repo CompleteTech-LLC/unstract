@@ -49,7 +49,7 @@
     "enable_ssl": {
       "type": "boolean",
       "title": "Enable SSL",
-      "description": "On selecting the checkbox, data encryption using SSL is enabled",
+      "description": "Disabled for the bundled local PostgreSQL service; enable only when the server is configured for SSL.",
       "default": false
     }
   }
