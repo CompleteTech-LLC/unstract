@@ -132,6 +132,29 @@
   vertical-align: middle;
 }
 
+.configured-status,
+.unconfigured-status {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.configured-status {
+  color: var(--success);
+  font-weight: 600;
+}
+
+.configured-status .configured-text {
+  margin-left: 0;
+}
+
+.not-configured-text {
+  color: #6b7280;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
 @media screen and (max-height: 900px) {
   .ant-space .ant-space-item .ant-card {
     padding: 6px;

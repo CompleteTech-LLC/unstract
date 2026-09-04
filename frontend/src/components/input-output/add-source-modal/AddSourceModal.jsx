@@ -1,6 +1,6 @@
 import { ArrowLeft } from "lucide-react";
 import PropTypes from "prop-types";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/shims/antd-button";
 import { Modal } from "@/components/ui/shims/antd-overlays";
 
@@ -28,12 +28,28 @@ function AddSourceModal({
   const [titles, setTitles] = useState({});
   const [selectedSourceName, setSelectedSourceName] = useState("");
   const [selectedDocUrl, setSelectedDocUrl] = useState("");
+  const [draftsBySourceId, setDraftsBySourceId] = useState({});
   const { setAlertDetails } = useAlertStore();
   const axiosPrivate = useAxiosPrivate();
   const handleException = useExceptionHandler();
   const { getUrl } = useRequestUrl();
   const [isLoading, setIsLoading] = useState(false);
   const [sourcesList, setSourcesList] = useState([]);
+
+  const updateSourceDraft = useCallback((sourceId, draft) => {
+    setDraftsBySourceId((currentDrafts) => ({
+      ...currentDrafts,
+      [sourceId]: draft,
+    }));
+  }, []);
+
+  const clearSourceDraft = useCallback((sourceId) => {
+    setDraftsBySourceId((currentDrafts) => {
+      const nextDrafts = { ...currentDrafts };
+      delete nextDrafts[sourceId];
+      return nextDrafts;
+    });
+  }, []);
 
   const disabledIdsByType = {
     EMBEDDING: ["huggingface|90ec9ec2-1768-4d69-8fb1-c88b95de5e5a"],
@@ -58,13 +74,16 @@ function AddSourceModal({
 
   useEffect(() => {
     if (!open) {
-      setTimeout(() => {
+      const resetTimeout = setTimeout(() => {
         // A delay added in order to avoid glitch in the UI when the modal is closed.
         setSelectedSourceId(null);
         setEditItemId(null);
         // Clear metadata to prevent stale data when adding a new connector
         setMetadata({});
+        setDraftsBySourceId({});
       }, 500);
+
+      return () => clearTimeout(resetTimeout);
     }
 
     getListOfSources();
@@ -185,6 +204,7 @@ function AddSourceModal({
       onCancel={() => {
         setOpen(false);
         setMetadata(null);
+        setDraftsBySourceId({});
       }}
       maskClosable={false}
       title={modalTitle}
@@ -197,6 +217,7 @@ function AddSourceModal({
     >
       {selectedSourceId ? (
         <AddSource
+          key={selectedSourceId}
           selectedSourceId={selectedSourceId}
           selectedSourceName={selectedSourceName}
           setOpen={setOpen}
@@ -206,6 +227,9 @@ function AddSourceModal({
           editItemId={editItemId}
           metadata={metadata}
           selectedDocUrl={selectedDocUrl}
+          draftFormData={draftsBySourceId[selectedSourceId]}
+          onDraftFormDataChange={updateSourceDraft}
+          onClearDraft={clearSourceDraft}
         />
       ) : isLoading ? (
         <SpinnerLoader />

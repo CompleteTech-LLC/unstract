@@ -1,7 +1,7 @@
 import { getDefaultFormState } from "@rjsf/utils";
 import validator from "@rjsf/validator-ajv8";
 import PropTypes from "prop-types";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Typography } from "@/components/ui/shims/antd-typography";
 
 import { useAxiosPrivate } from "../../../hooks/useAxiosPrivate";
@@ -36,6 +36,24 @@ try {
   // Ignore if not available
 }
 
+const OPENAI_OAUTH_SOURCE_PREFIX = "openai-oauth|";
+const OPENAI_OAUTH_DRAFT_FIELDS = new Set([
+  "adapter_name",
+  "model",
+  "max_tokens",
+  "max_retries",
+  "timeout",
+  "enable_reasoning",
+  "reasoning_effort",
+]);
+
+const getOpenAIOAuthDraft = (formData) =>
+  Object.fromEntries(
+    Object.entries(formData || {}).filter(([fieldName]) =>
+      OPENAI_OAUTH_DRAFT_FIELDS.has(fieldName),
+    ),
+  );
+
 function AddSource({
   selectedSourceId,
   selectedSourceName,
@@ -46,9 +64,17 @@ function AddSource({
   editItemId,
   metadata,
   selectedDocUrl,
+  draftFormData,
+  onDraftFormDataChange,
+  onClearDraft,
 }) {
   const [spec, setSpec] = useState({});
   const [formData, setFormData] = useState({});
+  const initialDraftFormData = useRef(
+    selectedSourceId.startsWith(OPENAI_OAUTH_SOURCE_PREFIX)
+      ? getOpenAIOAuthDraft(draftFormData)
+      : undefined,
+  );
   const [isLoading, setIsLoading] = useState(false);
   const [oAuthProvider, setOAuthProvider] = useState("");
   const { setAlertDetails } = useAlertStore();
@@ -131,6 +157,11 @@ function AddSource({
 
         if (metadata && Object.keys(metadata).length > 0) {
           setFormData(metadata);
+        } else if (
+          initialDraftFormData.current &&
+          Object.keys(initialDraftFormData.current).length > 0
+        ) {
+          setFormData(initialDraftFormData.current);
         } else {
           const defaults = getDefaultFormState(
             validator,
@@ -162,6 +193,25 @@ function AddSource({
     }
   }, [metadata]);
 
+  useEffect(() => {
+    if (
+      !selectedSourceId.startsWith(OPENAI_OAUTH_SOURCE_PREFIX) ||
+      editItemId?.length ||
+      (metadata && Object.keys(metadata).length > 0)
+    ) {
+      return;
+    }
+
+    onDraftFormDataChange?.(selectedSourceId, getOpenAIOAuthDraft(formData));
+  }, [editItemId, formData, metadata, onDraftFormDataChange, selectedSourceId]);
+
+  const handleAddNewItem = (row, isEdit) => {
+    if (!isEdit) {
+      onClearDraft?.(selectedSourceId);
+    }
+    addNewItem?.(row, isEdit);
+  };
+
   if (selectedSourceId.includes("pcs|")) {
     return (
       <Typography.Text>
@@ -183,7 +233,7 @@ function AddSource({
       oAuthProvider={oAuthProvider}
       selectedSourceId={selectedSourceId}
       isLoading={isLoading}
-      addNewItem={addNewItem}
+      addNewItem={handleAddNewItem}
       type={type}
       editItemId={editItemId}
       isConnector={isConnector}
@@ -204,6 +254,9 @@ AddSource.propTypes = {
   editItemId: PropTypes.string,
   metadata: PropTypes.object,
   selectedDocUrl: PropTypes.string,
+  draftFormData: PropTypes.object,
+  onDraftFormDataChange: PropTypes.func,
+  onClearDraft: PropTypes.func,
 };
 
 export { AddSource };

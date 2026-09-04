@@ -202,11 +202,9 @@ function ConfigureDs({
   }, [formData]);
 
   useEffect(() => {
-    if (!metadata) {
-      setFormData({});
-      return;
+    if (metadata && Object.keys(metadata).length > 0) {
+      setFormData(metadata);
     }
-    setFormData(metadata);
   }, [selectedSourceId, metadata, setFormData]);
 
   // Clear OAuth state when switching to a different connector
@@ -449,11 +447,13 @@ function ConfigureDs({
 
   const updateSession = (type) => {
     const adapterType = type.toLowerCase();
-    const adaptersList = sessionDetails?.adapters;
-    if (adaptersList && !adaptersList.includes(adapterType)) {
-      adaptersList.push(adapterType);
-      const adaptersListInSession = { adapters: adaptersList };
-      updateSessionDetails(adaptersListInSession);
+    const adaptersList = Array.isArray(sessionDetails?.adapters)
+      ? sessionDetails.adapters
+      : [];
+    if (!adaptersList.includes(adapterType)) {
+      updateSessionDetails({
+        adapters: [...adaptersList, adapterType],
+      });
     }
   };
 
@@ -502,6 +502,11 @@ function ConfigureDs({
             adapterInstanceId={editItemId}
             onModelsLoaded={handleOpenAIModelSchema}
           />
+        )}
+        {isTcSuccessful && (
+          <div className="config-submit-hint" role="status">
+            Connection tested successfully. Click Submit to save this adapter.
+          </div>
         )}
         <Row className="config-row">
           <Col span={12} className="config-col1">
