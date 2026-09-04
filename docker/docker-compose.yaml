@@ -13,12 +13,40 @@ x-host-gateway: &host_gateway
   extra_hosts:
     - "host.docker.internal:host-gateway"
 
+# PG workers expose poll-loop freshness (including prefork children), not just
+# a listening socket. The existing per-worker stale thresholds cover long tasks.
+x-pg-health: &pg_health
+  test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5)"]
+  interval: 30s
+  timeout: 10s
+  start_period: 90s
+  retries: 3
+
 services:
   # Backend service
   backend:
     <<: *host_gateway
     image: unstract/backend:${VERSION}
     container_name: unstract-backend
+    # This protected route returns 401 without credentials: HTTP liveness only.
+    # Database readiness is checked on db below.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.request, urllib.error
+          try:
+              response = urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=5)
+              assert response.status == 200
+          except urllib.error.HTTPError as error:
+              if error.code != 401:
+                  raise
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
     restart: unless-stopped
     command: --migrate
     ports:
@@ -27,7 +55,7 @@ services:
       - ../backend/.env
     depends_on:
       db:
-        condition: service_started
+        condition: service_healthy
       redis:
         condition: service_started
       rabbitmq:
@@ -99,6 +127,13 @@ services:
   frontend:
     image: unstract/frontend:${VERSION}
     container_name: unstract-frontend
+    healthcheck:
+      # Rootless deployments that remap Nginx must set its internal health port.
+      test: ["CMD-SHELL", "curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:$${FRONTEND_HEALTH_PORT:-80}/"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
     restart: unless-stopped
     ports:
       - "3000:80"
@@ -118,27 +153,36 @@ services:
   platform-service:
     image: unstract/platform-service:${VERSION}
     container_name: unstract-platform-service
+    healthcheck:
+      <<: *pg_health
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3001/health', timeout=5)"]
     restart: unless-stopped
     ports:
       - "3001:3001"
     env_file:
       - ../platform-service/.env
     depends_on:
-      - redis
-      - db
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
     labels:
       - traefik.enable=false
 
   x2text-service:
     image: unstract/x2text-service:${VERSION}
     container_name: unstract-x2text-service
+    healthcheck:
+      <<: *pg_health
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3004/api/v1/x2text/health', timeout=5)"]
     restart: unless-stopped
     ports:
       - "3004:3004"
     env_file:
       - ../x2text-service/.env
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     labels:
       - traefik.enable=false
 
@@ -146,6 +190,9 @@ services:
     <<: *host_gateway
     image: unstract/runner:${VERSION}
     container_name: unstract-runner
+    healthcheck:
+      <<: *pg_health
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5002/v1/api/health', timeout=5)"]
     restart: unless-stopped
     ports:
       - 5002:5002
@@ -170,6 +217,9 @@ services:
     <<: *host_gateway
     image: unstract/worker-unified:${VERSION}
     container_name: unstract-worker-log-history-scheduler-v2
+    healthcheck:
+      <<: *pg_health
+      test: ["CMD", "/app/.venv/bin/python", "-m", "log_consumer.heartbeat", "check", "scheduler"]
     restart: unless-stopped
     entrypoint: ["/bin/bash"]
     command: ["/app/log_consumer/scheduler.sh"]
@@ -194,6 +244,7 @@ services:
   worker-pg-orchestrator-api:
     image: unstract/worker-unified:${VERSION}
     container_name: unstract-worker-pg-orchestrator-api
+    healthcheck: *pg_health
     restart: unless-stopped
     command: ["pg-queue-consumer"]
     ports:
@@ -230,6 +281,7 @@ services:
   worker-pg-orchestrator-general:
     image: unstract/worker-unified:${VERSION}
     container_name: unstract-worker-pg-orchestrator-general
+    healthcheck: *pg_health
     restart: unless-stopped
     command: ["pg-queue-consumer"]
     ports:
@@ -263,6 +315,7 @@ services:
   worker-pg-fileproc:
     image: unstract/worker-unified:${VERSION}
     container_name: unstract-worker-pg-fileproc
+    healthcheck: *pg_health
     restart: unless-stopped
     command: ["pg-queue-consumer"]
     ports:
@@ -304,6 +357,7 @@ services:
   worker-pg-callback:
     image: unstract/worker-unified:${VERSION}
     container_name: unstract-worker-pg-callback
+    healthcheck: *pg_health
     restart: unless-stopped
     command: ["pg-queue-consumer"]
     ports:
@@ -343,6 +397,7 @@ services:
   worker-pg-scheduler:
     image: unstract/worker-unified:${VERSION}
     container_name: unstract-worker-pg-scheduler
+    healthcheck: *pg_health
     restart: unless-stopped
     command: ["pg-queue-consumer"]
     ports:
@@ -391,6 +446,7 @@ services:
   worker-pg-metrics:
     image: unstract/worker-unified:${VERSION}
     container_name: unstract-worker-pg-metrics
+    healthcheck: *pg_health
     restart: unless-stopped
     # The GENERIC consumer command, with identity carried by the env below — the
     # container entrypoint (run-worker-docker.sh) is env-driven and its `pg-*`
@@ -442,6 +498,9 @@ services:
   worker-log-stream-consumer:
     image: unstract/worker-unified:${VERSION}
     container_name: unstract-worker-log-stream-consumer
+    healthcheck:
+      <<: *pg_health
+      test: ["CMD", "/app/.venv/bin/python", "-m", "log_consumer.heartbeat", "check", "log-stream"]
     restart: unless-stopped
     command: ["log-stream-consumer"]
     env_file:
@@ -471,6 +530,7 @@ services:
   worker-pg-executor:
     image: unstract/worker-unified:${VERSION}
     container_name: unstract-worker-pg-executor
+    healthcheck: *pg_health
     restart: unless-stopped
     command: ["pg-queue-consumer"]
     ports:
@@ -523,6 +583,7 @@ services:
   worker-pg-ide-callback:
     image: unstract/worker-unified:${VERSION}
     container_name: unstract-worker-pg-ide-callback
+    healthcheck: *pg_health
     restart: unless-stopped
     command: ["pg-queue-consumer"]
     ports:
@@ -564,6 +625,7 @@ services:
   worker-pg-notification:
     image: unstract/worker-unified:${VERSION}
     container_name: unstract-worker-pg-notification
+    healthcheck: *pg_health
     restart: unless-stopped
     command: ["pg-queue-consumer"]
     ports:
@@ -604,6 +666,9 @@ services:
   worker-pg-reaper:
     image: unstract/worker-unified:${VERSION}
     container_name: unstract-worker-pg-reaper
+    healthcheck:
+      <<: *pg_health
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8086/health', timeout=5)"]
     restart: unless-stopped
     command: ["pg-queue-reaper"]
     ports:
