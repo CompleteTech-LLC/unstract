@@ -210,6 +210,22 @@ def test_openai_oauth_parameters_normalize_model_and_fix_endpoint() -> None:
     assert metadata["model"] == "openai/gpt-5-codex"
 
 
+def test_openai_oauth_does_not_forward_unsupported_output_token_parameters() -> None:
+    llm = LLM(
+        adapter_id=OpenAIOAuthLLMAdapter.get_id(),
+        adapter_metadata=_metadata("access", "account"),
+    )
+
+    request = llm._build_openai_oauth_responses_kwargs(
+        [],
+        {**_metadata("access", "account"), "max_tokens": 4096},
+        stream=True,
+    )
+
+    assert "max_tokens" not in request
+    assert "max_output_tokens" not in request
+
+
 @pytest.mark.parametrize(
     "field",
     ["oauth_access_token", "oauth_refresh_token", "oauth_account_id"],
@@ -297,6 +313,8 @@ def test_llm_sends_each_account_token_and_workspace_header() -> None:
     assert first_request["api_base"] == OPENAI_OAUTH_CHATGPT_API_BASE
     assert first_request["stream"] is True
     assert second_request["stream"] is True
+    assert "max_tokens" not in first_request
+    assert "max_output_tokens" not in first_request
 
 
 def test_llm_streams_responses_text_and_records_completion_usage() -> None:

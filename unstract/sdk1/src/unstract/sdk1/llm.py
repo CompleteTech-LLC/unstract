@@ -629,7 +629,11 @@ class LLM:
 
         model = str(values.pop("model"))
         api_base = str(values.pop("api_base", OPENAI_OAUTH_CHATGPT_API_BASE))
-        max_tokens = values.pop("max_tokens", None)
+        # The ChatGPT/Codex subscription endpoint rejects both the legacy
+        # max_tokens option and the Responses API max_output_tokens option.
+        # Keep the schema value for adapter compatibility, but do not put it
+        # on the provider request.
+        values.pop("max_tokens", None)
         values.pop("temperature", None)
         values.pop("n", None)
         values.pop("api_version", None)
@@ -639,8 +643,6 @@ class LLM:
         values.pop("cost_model", None)
         values.pop("context_window", None)
 
-        if max_tokens is not None:
-            values["max_output_tokens"] = max_tokens
         reasoning_effort = values.pop("reasoning_effort", None)
         # The ChatGPT Codex endpoint expects this field on Responses requests
         # so encrypted reasoning can be returned and reused by the account.

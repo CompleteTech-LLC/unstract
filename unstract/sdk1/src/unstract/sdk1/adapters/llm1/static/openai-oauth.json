@@ -25,7 +25,7 @@
       "multipleOf": 1,
       "title": "Maximum Output Tokens",
       "default": 4096,
-      "description": "Maximum number of output tokens to request."
+      "description": "Compatibility setting retained by Unstract; the ChatGPT/Codex subscription endpoint uses its provider-managed output budget."
     },
     "max_retries": {
       "type": "number",
