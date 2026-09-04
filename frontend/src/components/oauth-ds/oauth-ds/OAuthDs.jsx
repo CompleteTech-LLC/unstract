@@ -290,6 +290,17 @@ function OAuthDs({
       return undefined;
     }
 
+    // A new adapter may have a stale success/cache key in localStorage. Wait
+    // for the server-side restore request before trying that disposable key;
+    // otherwise an expired model request can cancel the restore race.
+    if (
+      !adapterInstanceId &&
+      !activeLoginCacheKey &&
+      (isRestoring || restoreScopeRef.current === oauthStateScope)
+    ) {
+      return undefined;
+    }
+
     // Existing adapters use their server-side encrypted credentials. A new
     // OAuth login takes precedence only after that login has completed, so a
     // stale localStorage cache key cannot select another account by accident.
@@ -336,11 +347,13 @@ function OAuthDs({
     adapterInstanceId,
     handleException,
     clearOAuthHandoff,
+    isRestoring,
     loadOpenAIModelSchema,
     loginCacheKey,
     oauthStatus,
     oAuthProvider,
     onModelsLoaded,
+    oauthStateScope,
     setAlertDetails,
     setCacheKey,
     setStatus,
