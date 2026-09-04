@@ -1,7 +1,6 @@
 import json
 from pathlib import Path
 
-
 SCHEMA_ROOT = (
     Path(__file__).parents[1]
     / "src"
@@ -24,7 +23,7 @@ EXPECTED_DEFAULTS = {
         "port": 5432,
         "user": "unstract_dev",
         "password": "unstract_pass",
-        "enable_ssl": False,
+        "enable_ssl": True,
     },
     "weaviate": {
         "adapter_name": "weaviate-local",
@@ -47,4 +46,3 @@ def test_local_vector_db_schemas_prefill_compose_connection_values() -> None:
 
         for field_name, expected_value in expected_defaults.items():
             assert properties[field_name]["default"] == expected_value
-

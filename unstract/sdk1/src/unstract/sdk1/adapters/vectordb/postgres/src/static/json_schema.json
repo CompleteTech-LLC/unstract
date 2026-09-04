@@ -49,8 +49,8 @@
     "enable_ssl": {
       "type": "boolean",
       "title": "Enable SSL",
-      "description": "Disabled for the bundled local PostgreSQL service; enable only when the server is configured for SSL.",
-      "default": false
+      "description": "TLS is enabled for the bundled local PostgreSQL service; disable only when connecting to a server without SSL.",
+      "default": true
     }
   }
 }

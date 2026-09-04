@@ -52,14 +52,17 @@ so use the internal addresses below when creating an adapter in the UI:
 | Adapter | UI fields | Address from Unstract containers | Host address | Local credentials |
 |---------|-----------|----------------------------------|--------------|-------------------|
 | Qdrant | URL, API Key | `http://qdrant:6333` | `http://localhost:6333` | Leave API Key empty |
-| Postgres | Database, Host, Port, User, Password, Enable SSL | Host `postgres-vector`, port `5432` | Host `localhost`, port `5433` | Values from `docker/essentials.env`; set Enable SSL to `false` |
+| Postgres | Database, Host, Port, User, Password, Enable SSL | Host `postgres-vector`, port `5432` | Host `localhost`, port `5433` | Values from `docker/essentials.env`; SSL is enabled by default |
 | Weaviate | URL, API Key | `http://weaviate:8080` | `http://localhost:8084` | Leave API Key empty |
 | Milvus | URI, Token | `http://milvus:19530` | `http://localhost:19530` | Leave Token empty |
 
 When the adapter schema is served by the local development stack, these
 internal values are pre-filled in the form, including the sample PostgreSQL
-credentials from `docker/essentials.env` and SSL disabled for the local
-connection. If `essentials.env` has customized the PostgreSQL credentials,
+credentials from `docker/essentials.env` and SSL enabled for the local
+connection. The bundled `postgres-vector` service generates a self-signed
+certificate and starts PostgreSQL with TLS enabled. The adapter uses
+`sslmode=require` without certificate verification for this local-only
+certificate. If `essentials.env` has customized the PostgreSQL credentials,
 replace the pre-filled values with the customized values before testing the
 connection. Keep the container DNS names (`qdrant`, `postgres-vector`,
 `weaviate`, and `milvus`) when the adapter is used by Unstract workers; use the

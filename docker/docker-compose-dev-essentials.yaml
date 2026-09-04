@@ -138,11 +138,17 @@ services:
     container_name: unstract-postgres-vector
     restart: unless-stopped
     shm_size: 128mb
+    # Generate a local self-signed certificate before the official Postgres
+    # entrypoint initializes or starts the server.
+    entrypoint: ["/usr/local/bin/postgres-vector-entrypoint.sh"]
+    command: ["postgres"]
     ports:
       - "127.0.0.1:5433:5432"
     volumes:
       - postgres_vector_data:/var/lib/postgresql/data/
+      - postgres_vector_ssl:/var/lib/postgresql/ssl/
       - ./scripts/db-setup/vector_db_setup.sh:/docker-entrypoint-initdb.d/vector_db_setup.sh:ro
+      - ./scripts/db-setup/postgres-vector-entrypoint.sh:/usr/local/bin/postgres-vector-entrypoint.sh:ro
     env_file:
       # Reuse the local platform database credentials from essentials.env while
       # retaining a separate data directory and container.
@@ -281,6 +287,7 @@ volumes:
   minio_data:
   postgres_data:
   postgres_vector_data:
+  postgres_vector_ssl:
   qdrant_data:
   redis_data:
   prompt_studio_data:
