@@ -11,6 +11,7 @@ from unstract.sdk1.adapters.llm1.nvidia_build import NvidiaBuildLLMAdapter
 from unstract.sdk1.adapters.llm1.ollama import OllamaLLMAdapter
 from unstract.sdk1.adapters.llm1.openai import OpenAILLMAdapter
 from unstract.sdk1.adapters.llm1.openai_compatible import OpenAICompatibleLLMAdapter
+from unstract.sdk1.adapters.llm1.openai_oauth import OpenAIOAuthLLMAdapter
 from unstract.sdk1.adapters.llm1.openrouter import OpenRouterLLMAdapter
 from unstract.sdk1.adapters.llm1.vertexai import VertexAILLMAdapter
 
@@ -29,6 +30,7 @@ __all__ = [
     "OllamaLLMAdapter",
     "OpenAILLMAdapter",
     "OpenAICompatibleLLMAdapter",
+    "OpenAIOAuthLLMAdapter",
     "OpenRouterLLMAdapter",
     "VertexAILLMAdapter",
 ]

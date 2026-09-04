@@ -1,6 +1,6 @@
 import { Info } from "lucide-react";
 import PropTypes from "prop-types";
-import { createRef, useEffect, useState } from "react";
+import { createRef, useCallback, useEffect, useMemo, useState } from "react";
 import { Col, Row } from "@/components/ui/shims/antd-layout";
 import { Popover } from "@/components/ui/shims/antd-overlays";
 
@@ -13,6 +13,10 @@ import { useAlertStore } from "../../../store/alert-store";
 import { useSessionStore } from "../../../store/session-store";
 import { OAuthDs } from "../../oauth-ds/oauth-ds/OAuthDs.jsx";
 import { CustomButton } from "../../widgets/custom-button/CustomButton.jsx";
+import {
+  getReasoningSchemaForModel,
+  materializeReasoningProperty,
+} from "./openai-oauth-form-schema.js";
 import "./ConfigureDs.css";
 
 function ConfigureDs({
@@ -36,6 +40,7 @@ function ConfigureDs({
   const [isTcSuccessful, setIsTcSuccessful] = useState(false);
   const [isTcLoading, setIsTcLoading] = useState(false);
   const [isSubmitApiLoading, setIsSubmitApiLoading] = useState(false);
+  const [oauthSpec, setOAuthSpec] = useState(null);
 
   const [cacheKey, setCacheKey] = useState("");
   const [status, setStatus] = useState("");
@@ -51,13 +56,91 @@ function ConfigureDs({
   } = usePostHogEvents();
   const { getUrl } = useRequestUrl();
 
-  const oauthCacheKey = `oauth-cachekey-${selectedSourceId}`;
-  const oauthStatusKey = `oauth-status-${selectedSourceId}`;
+  const oauthStateScope = editItemId || selectedSourceId;
+  const oauthCacheKey = `oauth-cachekey-${oauthStateScope}`;
+  const oauthStatusKey = `oauth-status-${oauthStateScope}`;
+  const oauthDeviceKey = `oauth-device-${oauthStateScope}`;
+
+  const handleOpenAIModelSchema = useCallback(
+    (dynamicSchema) => {
+      const modelSchema = dynamicSchema?.properties?.model;
+      if (!Array.isArray(modelSchema?.enum) || modelSchema.enum.length === 0) {
+        return;
+      }
+
+      setOAuthSpec(dynamicSchema);
+      setFormData((currentFormData) => {
+        const current = currentFormData || {};
+        const next = { ...current };
+        if (!modelSchema.enum.includes(next.model)) {
+          next.model = modelSchema.default || modelSchema.enum[0];
+        }
+
+        if (next.enable_reasoning) {
+          const reasoningSchema = getReasoningSchemaForModel(
+            dynamicSchema,
+            next.model,
+          );
+          if (
+            Array.isArray(reasoningSchema?.enum) &&
+            reasoningSchema.enum.length > 0 &&
+            !reasoningSchema.enum.includes(next.reasoning_effort)
+          ) {
+            next.reasoning_effort =
+              reasoningSchema.default || reasoningSchema.enum[0];
+          }
+        }
+        return next;
+      });
+    },
+    [setFormData],
+  );
+
+  const renderSchema = useMemo(
+    () =>
+      materializeReasoningProperty(
+        oauthSpec || spec,
+        formData?.model,
+        formData?.enable_reasoning,
+      ),
+    [formData?.enable_reasoning, formData?.model, oauthSpec, spec],
+  );
+
+  useEffect(() => {
+    setOAuthSpec(null);
+  }, [spec]);
+
+  useEffect(() => {
+    if (!oauthSpec || !formData?.enable_reasoning || !formData?.model) {
+      return;
+    }
+    const reasoningSchema = getReasoningSchemaForModel(
+      oauthSpec,
+      formData.model,
+    );
+    if (
+      !Array.isArray(reasoningSchema?.enum) ||
+      reasoningSchema.enum.length === 0 ||
+      reasoningSchema.enum.includes(formData.reasoning_effort)
+    ) {
+      return;
+    }
+    setFormData((currentFormData) => ({
+      ...(currentFormData || {}),
+      reasoning_effort: reasoningSchema.default || reasoningSchema.enum[0],
+    }));
+  }, [formData, oauthSpec, setFormData]);
 
   // Determine if this is a new or existing connector
   const hasOAuthCredentials =
-    metadata && (metadata.access_token || (metadata.provider && metadata.uid));
+    metadata &&
+    (metadata.access_token ||
+      (metadata.provider && metadata.uid) ||
+      metadata.oauth_authenticated);
   const isExistingConnector = Boolean(editItemId || hasOAuthCredentials);
+  const hasPersistedOAuthCredentials = Boolean(
+    !isConnector && isExistingConnector && hasOAuthCredentials,
+  );
 
   // Determine if OAuth authentication method is selected
   const isOAuthMethodSelected = () => {
@@ -119,11 +202,9 @@ function ConfigureDs({
   }, [formData]);
 
   useEffect(() => {
-    if (!metadata) {
-      setFormData({});
-      return;
+    if (metadata && Object.keys(metadata).length > 0) {
+      setFormData(metadata);
     }
-    setFormData(metadata);
   }, [selectedSourceId, metadata, setFormData]);
 
   // Clear OAuth state when switching to a different connector
@@ -157,14 +238,6 @@ function ConfigureDs({
     }
   }, [selectedSourceId, oAuthProvider, oauthStatusKey, oauthCacheKey]);
 
-  // Cleanup OAuth localStorage when component unmounts (modal close)
-  useEffect(() => {
-    return () => {
-      localStorage.removeItem(oauthCacheKey);
-      localStorage.removeItem(oauthStatusKey);
-    };
-  }, [oauthCacheKey, oauthStatusKey]);
-
   const handleTestConnection = (updatedFormData) => {
     // Check if there any error in form proceed to test connection only there is no error.
     if (formRef && !formRef.current?.validateForm()) {
@@ -173,10 +246,17 @@ function ConfigureDs({
     if (
       oAuthProvider?.length &&
       isOAuthMethodSelected() &&
-      (status !== "success" || !cacheKey?.length)
+      !(
+        (status === "success" && cacheKey?.length) ||
+        hasPersistedOAuthCredentials
+      )
     ) {
       const providerName =
-        oAuthProvider === "google-oauth2" ? "Google" : "OAuth provider";
+        oAuthProvider === "google-oauth2"
+          ? "Google"
+          : oAuthProvider === "openai-oauth"
+            ? "OpenAI"
+            : "OAuth provider";
       setAlertDetails({
         type: "error",
         content: `OAuth authentication required. Please sign in with ${providerName} first.`,
@@ -211,10 +291,16 @@ function ConfigureDs({
     }
 
     if (oAuthProvider?.length > 0 && isOAuthMethodSelected()) {
-      body["connector_metadata"] = {
-        ...body["connector_metadata"],
-        ...{ "oauth-key": cacheKey },
-      };
+      if (isConnector) {
+        body["connector_metadata"] = {
+          ...body["connector_metadata"],
+          ...{ "oauth-key": cacheKey },
+        };
+      } else if (cacheKey?.length) {
+        url = `${url}?oauth-key=${encodeURIComponent(cacheKey)}`;
+      } else if (editItemId && hasPersistedOAuthCredentials) {
+        url = `${url}?adapter-instance-id=${encodeURIComponent(editItemId)}`;
+      }
     }
 
     const requestOptions = {
@@ -311,7 +397,11 @@ function ConfigureDs({
       url = `${url}${editItemId}/`;
     }
 
-    if (oAuthProvider?.length > 0 && isOAuthMethodSelected()) {
+    if (
+      oAuthProvider?.length > 0 &&
+      isOAuthMethodSelected() &&
+      cacheKey?.length
+    ) {
       const encodedCacheKey = encodeURIComponent(cacheKey);
       url = url + `?oauth-key=${encodedCacheKey}`;
     }
@@ -342,6 +432,7 @@ function ConfigureDs({
         if (oAuthProvider?.length > 0 && isOAuthMethodSelected()) {
           localStorage.removeItem(oauthCacheKey);
           localStorage.removeItem(oauthStatusKey);
+          localStorage.removeItem(oauthDeviceKey);
         }
 
         setOpen(false);
@@ -356,11 +447,13 @@ function ConfigureDs({
 
   const updateSession = (type) => {
     const adapterType = type.toLowerCase();
-    const adaptersList = sessionDetails?.adapters;
-    if (adaptersList && !adaptersList.includes(adapterType)) {
-      adaptersList.push(adapterType);
-      const adaptersListInSession = { adapters: adaptersList };
-      updateSessionDetails(adaptersListInSession);
+    const adaptersList = Array.isArray(sessionDetails?.adapters)
+      ? sessionDetails.adapters
+      : [];
+    if (!adaptersList.includes(adapterType)) {
+      updateSessionDetails({
+        adapters: [...adaptersList, adapterType],
+      });
     }
   };
 
@@ -389,7 +482,7 @@ function ConfigureDs({
         </div>
       )}
       <RjsfFormLayout
-        schema={spec}
+        schema={renderSchema}
         formData={formData}
         setFormData={setFormData}
         isLoading={isLoading}
@@ -404,7 +497,16 @@ function ConfigureDs({
             setStatus={handleSetStatus}
             selectedSourceId={selectedSourceId}
             isExistingConnector={isExistingConnector}
+            hasOAuthCredentials={hasPersistedOAuthCredentials}
+            oauthAccountLabel={metadata?.oauth_account_label}
+            adapterInstanceId={editItemId}
+            onModelsLoaded={handleOpenAIModelSchema}
           />
+        )}
+        {isTcSuccessful && (
+          <div className="config-submit-hint" role="status">
+            Connection tested successfully. Click Submit to save this adapter.
+          </div>
         )}
         <Row className="config-row">
           <Col span={12} className="config-col1">

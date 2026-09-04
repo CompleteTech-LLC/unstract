@@ -36,3 +36,10 @@
   color: var(--primary);
   cursor: pointer;
 }
+
+.config-submit-hint {
+  color: var(--success);
+  font-size: 12px;
+  margin-top: 10px;
+  text-align: center;
+}

@@ -3,6 +3,7 @@ import uuid
 from typing import Any
 
 from account_v2.models import User
+from backend.constants import FieldLengthConstants as FieldLength
 from django.db import models
 from django.db.models.query import QuerySet
 from rest_framework.request import Request
@@ -157,3 +158,43 @@ class ConnectorAuth(AbstractUserSocialAuth):
 
 class ConnectorDjangoStorage(DjangoStorage):
     user = ConnectorAuth
+
+
+class OpenAIOAuthCredential(models.Model):
+    """Encrypted OpenAI OAuth credentials retained for the signed-in user.
+
+    The browser hand-off in Redis is intentionally short-lived. This model is
+    the durable server-side account record that lets a user reopen the OAuth
+    form without repeating device login. Secrets are encrypted with the same
+    Fernet key used for adapter metadata and are never serialized to clients.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        User,
+        related_name="openai_oauth_credentials",
+        on_delete=models.CASCADE,
+    )
+    organization_id = models.CharField(max_length=FieldLength.ORG_NAME_SIZE)
+    account_id = models.CharField(max_length=255)
+    account_label = models.CharField(max_length=255, blank=True, default="")
+    encrypted_credentials = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    modified_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "openai_oauth_credential"
+        verbose_name = "OpenAI OAuth credential"
+        verbose_name_plural = "OpenAI OAuth credentials"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "organization_id", "account_id"],
+                name="unique_openai_oauth_user_org_account",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["user", "organization_id", "-modified_at"],
+                name="openai_oauth_user_org_mod_idx",
+            ),
+        ]

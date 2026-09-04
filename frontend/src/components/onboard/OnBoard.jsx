@@ -18,6 +18,11 @@ import "./onBoard.css";
 
 const { Content } = Layout;
 
+const normalizeAdapterTypes = (adapterTypes) =>
+  (Array.isArray(adapterTypes) ? adapterTypes : [])
+    .filter((adapterType) => typeof adapterType === "string")
+    .map((adapterType) => adapterType.toLowerCase());
+
 function OnBoard() {
   const navigate = useNavigate();
   const { sessionDetails } = useSessionStore();
@@ -26,12 +31,19 @@ function OnBoard() {
   const [editItemId, setEditItemId] = useState(null);
   const [type, setType] = useState(null);
   const homePageUrl = `/${orgName}/${homePagePath}`;
-  const [adaptersList, setAdaptersList] = useState(adapters || []);
+  const [adaptersList, setAdaptersList] = useState(() =>
+    normalizeAdapterTypes(adapters),
+  );
+
+  useEffect(() => {
+    setAdaptersList(normalizeAdapterTypes(adapters));
+  }, [adapters]);
+
   useEffect(() => {
     if (onboardCompleted(adaptersList)) {
       navigate(homePageUrl);
     }
-  }, [adaptersList]);
+  }, [adaptersList, homePageUrl, navigate]);
 
   const steps = [
     {
@@ -73,9 +85,17 @@ function OnBoard() {
     setOpenAddSourcesModal(true);
   };
 
-  const addNewItem = (row, isEdit) => {
-    const newAdapter = row?.adapter_type.toLowerCase();
-    setAdaptersList([...adaptersList, newAdapter]);
+  const addNewItem = (row) => {
+    const newAdapter = row?.adapter_type?.toLowerCase();
+    if (!newAdapter) {
+      return;
+    }
+
+    setAdaptersList((currentAdapters) =>
+      currentAdapters.includes(newAdapter)
+        ? currentAdapters
+        : [...currentAdapters, newAdapter],
+    );
   };
 
   return (
@@ -114,17 +134,22 @@ function OnBoard() {
                   </Col>
                   <Col span={4} align="center" justify="center">
                     {adaptersList?.includes(step.type) ? (
-                      <div>
+                      <div className="configured-status" role="status">
                         <CircleCheck className="configured-icon" />
                         <span className="configured-text">Configured</span>
                       </div>
                     ) : (
-                      <Button
-                        className="button-style"
-                        onClick={() => showOpenAddSourcesModal(step.type)}
-                      >
-                        Connect
-                      </Button>
+                      <div className="unconfigured-status">
+                        <span className="not-configured-text">
+                          Not configured
+                        </span>
+                        <Button
+                          className="button-style"
+                          onClick={() => showOpenAddSourcesModal(step.type)}
+                        >
+                          Connect
+                        </Button>
+                      </div>
                     )}
                   </Col>
                 </Row>

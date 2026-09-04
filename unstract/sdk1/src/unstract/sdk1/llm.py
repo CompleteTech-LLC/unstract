@@ -1,6 +1,8 @@
+import json
 import logging
 import os
 import re
+import uuid
 from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
@@ -11,8 +13,13 @@ import litellm
 
 # from litellm import get_supported_openai_params
 from litellm import get_max_tokens
+
 from unstract.sdk1.adapters.constants import Common
 from unstract.sdk1.adapters.llm1 import adapters
+from unstract.sdk1.auth.openai_oauth import (
+    OPENAI_OAUTH_CHATGPT_API_BASE,
+    is_openai_oauth_adapter,
+)
 from unstract.sdk1.constants import Common as SdkCommon
 from unstract.sdk1.constants import ToolEnv
 from unstract.sdk1.exceptions import LLMError, SdkError, strip_litellm_prefix
@@ -496,6 +503,372 @@ class LLM:
             {"role": "user", "content": user_content},
         ]
 
+    def _uses_openai_oauth(self) -> bool:
+        """Whether this LLM uses the per-account ChatGPT OAuth adapter."""
+        return is_openai_oauth_adapter(self._adapter_id)
+
+    @staticmethod
+    def _response_value(
+        response: object, key: str, default: object | None = None
+    ) -> object | None:
+        """Read a field from a LiteLLM dict, model, or response event."""
+        if isinstance(response, Mapping):
+            return response.get(key, default)
+        try:
+            value = response[key]  # type: ignore[index]
+        except (KeyError, TypeError, AttributeError, IndexError):
+            value = getattr(response, key, default)
+        return value if value is not None else default
+
+    @staticmethod
+    def _responses_block(block: object) -> dict[str, object]:
+        """Convert one chat content block to a Responses input block."""
+        if not isinstance(block, Mapping):
+            return {"type": "input_text", "text": str(block)}
+        block_type = block.get("type")
+        if block_type in ("text", "input_text"):
+            return {"type": "input_text", "text": block.get("text", "")}
+        if block_type == "image_url":
+            image_url = block.get("image_url")
+            detail = None
+            if isinstance(image_url, Mapping):
+                detail = image_url.get("detail")
+                image_url = image_url.get("url")
+            image_block: dict[str, object] = {
+                "type": "input_image",
+                "image_url": image_url,
+            }
+            if detail:
+                image_block["detail"] = detail
+            return image_block
+        if isinstance(block_type, str) and block_type.startswith("input_"):
+            # Preserve already-converted Responses blocks for callers that use
+            # complete_vision() directly.
+            return dict(block)
+        return {"type": "input_text", "text": json.dumps(dict(block))}
+
+    @classmethod
+    def _responses_content(cls, content: object) -> list[dict[str, object]]:
+        """Convert OpenAI chat content blocks to Responses input blocks."""
+        if isinstance(content, str):
+            return [{"type": "input_text", "text": content}]
+        if not isinstance(content, list):
+            if content is None:
+                return []
+            return [{"type": "input_text", "text": str(content)}]
+        return [cls._responses_block(block) for block in content]
+
+    @classmethod
+    def _responses_input(
+        cls, messages: list[dict[str, object]]
+    ) -> tuple[str, list[dict[str, object]]]:
+        instructions: list[str] = []
+        response_input: list[dict[str, object]] = []
+        for message in messages:
+            role = str(message.get("role", "user"))
+            content = message.get("content")
+            if role == "system":
+                text_blocks = cls._responses_content(content)
+                instructions.extend(
+                    str(block.get("text", ""))
+                    for block in text_blocks
+                    if block.get("type") == "input_text"
+                )
+                continue
+            if role not in {"user", "assistant"}:
+                role = "user"
+            response_input.append(
+                {
+                    "type": "message",
+                    "role": role,
+                    "content": cls._responses_content(content),
+                }
+            )
+        return "\n".join(text for text in instructions if text), response_input
+
+    @staticmethod
+    def _responses_tools(tools: object) -> object:
+        """Translate chat function tools to the Responses tool shape."""
+        if not isinstance(tools, list):
+            return tools
+        converted: list[object] = []
+        for tool in tools:
+            if not isinstance(tool, Mapping) or tool.get("type") != "function":
+                converted.append(tool)
+                continue
+            function = tool.get("function")
+            if not isinstance(function, Mapping):
+                converted.append(tool)
+                continue
+            converted.append(
+                {
+                    "type": "function",
+                    "name": function.get("name"),
+                    "description": function.get("description"),
+                    "parameters": function.get("parameters"),
+                }
+            )
+        return converted
+
+    def _build_openai_oauth_responses_kwargs(
+        self,
+        messages: list[dict[str, object]],
+        completion_kwargs: dict[str, object],
+        *,
+        stream: bool,
+    ) -> dict[str, object]:
+        """Build a Responses API call with credentials for one adapter only."""
+        values = dict(completion_kwargs)
+        access_token = str(values.pop("oauth_access_token"))
+        account_id = str(values.pop("oauth_account_id"))
+        values.pop("oauth_refresh_token", None)
+        values.pop("oauth_id_token", None)
+        values.pop("oauth_account_email", None)
+        values.pop("oauth_expires_at", None)
+        values.pop("oauth_authenticated", None)
+
+        model = str(values.pop("model"))
+        api_base = str(values.pop("api_base", OPENAI_OAUTH_CHATGPT_API_BASE))
+        # The ChatGPT/Codex subscription endpoint rejects both the legacy
+        # max_tokens option and the Responses API max_output_tokens option.
+        # Keep the schema value for adapter compatibility, but do not put it
+        # on the provider request.
+        values.pop("max_tokens", None)
+        values.pop("temperature", None)
+        values.pop("n", None)
+        values.pop("api_version", None)
+        values.pop("enable_reasoning", None)
+        values.pop("max_retries", None)
+        values.pop("num_retries", None)
+        values.pop("cost_model", None)
+        values.pop("context_window", None)
+
+        reasoning_effort = values.pop("reasoning_effort", None)
+        # The ChatGPT Codex endpoint expects this field on Responses requests
+        # so encrypted reasoning can be returned and reused by the account.
+        values["include"] = ["reasoning.encrypted_content"]
+        if reasoning_effort:
+            values["reasoning"] = {"effort": reasoning_effort}
+        if "tools" in values:
+            values["tools"] = self._responses_tools(values["tools"])
+
+        instructions, response_input = self._responses_input(messages)
+        values.update(
+            {
+                "model": model,
+                "input": response_input,
+                "custom_llm_provider": "openai",
+                # LiteLLM's OpenAI handler uses this key to select its client;
+                # the explicit Authorization header below is account-specific.
+                "api_key": access_token,
+                "api_base": api_base,
+                "stream": stream,
+                "store": False,
+            }
+        )
+        if instructions:
+            values["instructions"] = instructions
+
+        headers = dict(values.pop("extra_headers", {}) or {})
+        headers.update(
+            {
+                "Authorization": f"Bearer {access_token}",
+                "ChatGPT-Account-Id": account_id,
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream" if stream else "application/json",
+                "originator": "unstract",
+                "session-id": str(uuid.uuid4()),
+            }
+        )
+        values["extra_headers"] = headers
+        return values
+
+    @classmethod
+    def _responses_output_text(cls, response: object) -> str | None:
+        output_text = cls._response_value(response, "output_text")
+        if isinstance(output_text, str):
+            return output_text
+        output = cls._response_value(response, "output")
+        if not isinstance(output, list):
+            return None
+        text_parts: list[str] = []
+        for item in output:
+            if cls._response_value(item, "type") != "message":
+                continue
+            content = cls._response_value(item, "content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if cls._response_value(block, "type") in {
+                    "output_text",
+                    "text",
+                }:
+                    text = cls._response_value(block, "text")
+                    if isinstance(text, str):
+                        text_parts.append(text)
+        return "".join(text_parts) or None
+
+    @classmethod
+    def _responses_usage(cls, usage: object) -> dict[str, int]:
+        if usage is None:
+            return {}
+
+        def integer(key: str, fallback: str) -> int:
+            value = cls._response_value(usage, key)
+            if value is None:
+                value = cls._response_value(usage, fallback, 0)
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        return {
+            "prompt_tokens": integer("input_tokens", "prompt_tokens"),
+            "completion_tokens": integer("output_tokens", "completion_tokens"),
+            "total_tokens": integer("total_tokens", "total_tokens"),
+        }
+
+    def _collect_openai_oauth_response(
+        self,
+        messages: list[dict[str, object]],
+        completion_kwargs: dict[str, object],
+        max_retries: int,
+    ) -> tuple[str | None, object | None, dict[str, int]]:
+        """Consume a streaming-only Responses API call as one completion.
+
+        The ChatGPT/Codex endpoint rejects ``stream=False``.  Keep the public
+        ``complete()`` contract by consuming the stream internally and
+        returning the assembled text, completed response, and usage.
+        """
+        response_kwargs = self._build_openai_oauth_responses_kwargs(
+            messages, completion_kwargs, stream=True
+        )
+        text_parts: list[str] = []
+        completed_response: object | None = None
+        last_event: object | None = None
+
+        for event in iter_with_retry(
+            lambda: litellm.responses(**response_kwargs),
+            max_retries=max_retries,
+            retry_predicate=is_retryable_litellm_error,
+            description=self._get_adapter_info(),
+        ):
+            last_event = event
+            event_type = self._response_value(event, "type")
+            if event_type == "response.output_text.delta":
+                text = self._response_value(event, "delta", "")
+                if isinstance(text, str):
+                    text_parts.append(text)
+            elif event_type == "response.completed":
+                response = self._response_value(event, "response")
+                if response is not None:
+                    completed_response = response
+
+        response = (
+            completed_response if completed_response is not None else last_event
+        )
+        response_text = "".join(text_parts) or self._responses_output_text(response)
+        usage_source = (
+            completed_response if completed_response is not None else response
+        )
+        usage = self._responses_usage(self._response_value(usage_source, "usage"))
+        return response_text, response, usage
+
+    async def _acollect_openai_oauth_response(
+        self,
+        messages: list[dict[str, object]],
+        completion_kwargs: dict[str, object],
+        max_retries: int,
+    ) -> tuple[str | None, object | None, dict[str, int]]:
+        """Async counterpart to :meth:`_collect_openai_oauth_response`."""
+        response_kwargs = self._build_openai_oauth_responses_kwargs(
+            messages, completion_kwargs, stream=True
+        )
+
+        async def consume_stream() -> tuple[
+            str | None, object | None, dict[str, int]
+        ]:
+            text_parts: list[str] = []
+            completed_response: object | None = None
+            last_event: object | None = None
+            stream = await litellm.aresponses(**response_kwargs)
+
+            async for event in stream:
+                last_event = event
+                event_type = self._response_value(event, "type")
+                if event_type == "response.output_text.delta":
+                    text = self._response_value(event, "delta", "")
+                    if isinstance(text, str):
+                        text_parts.append(text)
+                elif event_type == "response.completed":
+                    response = self._response_value(event, "response")
+                    if response is not None:
+                        completed_response = response
+
+            response = (
+                completed_response if completed_response is not None else last_event
+            )
+            response_text = "".join(text_parts) or self._responses_output_text(
+                response
+            )
+            usage_source = (
+                completed_response if completed_response is not None else response
+            )
+            usage = self._responses_usage(
+                self._response_value(usage_source, "usage")
+            )
+            return response_text, response, usage
+
+        return await acall_with_retry(
+            consume_stream,
+            max_retries=max_retries,
+            retry_predicate=is_retryable_litellm_error,
+            description=self._get_adapter_info(),
+        )
+
+    def _stream_openai_oauth(
+        self,
+        messages: list[dict[str, object]],
+        completion_kwargs: dict[str, object],
+        callback_manager: object | None,
+        max_retries: int,
+    ) -> Generator[LLMResponseCompat, None, None]:
+        """Yield text events from one account's Responses API stream."""
+        response_kwargs = self._build_openai_oauth_responses_kwargs(
+            messages, completion_kwargs, stream=True
+        )
+        for event in iter_with_retry(
+            lambda: litellm.responses(**response_kwargs),
+            max_retries=max_retries,
+            retry_predicate=is_retryable_litellm_error,
+            description=self._get_adapter_info(),
+        ):
+            event_type = self._response_value(event, "type")
+            if event_type == "response.completed":
+                completed_response = self._response_value(event, "response")
+                usage = self._responses_usage(
+                    self._response_value(completed_response, "usage")
+                )
+                if usage:
+                    self._record_usage(
+                        self._cost_model or self.kwargs["model"],
+                        messages,
+                        usage,
+                        "stream_complete",
+                        response=completed_response,
+                    )
+                continue
+            if event_type != "response.output_text.delta":
+                continue
+            text = self._response_value(event, "delta", "")
+            if not isinstance(text, str) or not text:
+                continue
+            if callback_manager and hasattr(callback_manager, "on_stream"):
+                callback_manager.on_stream(text)
+            stream_response = LLMResponseCompat(text)
+            stream_response.delta = text
+            yield stream_response
+
     @capture_metrics
     def complete(
         self,
@@ -541,20 +914,28 @@ class LLM:
             max_retries = pop_litellm_retry_kwargs(
                 completion_kwargs, self._get_adapter_info()
             )
-            response: dict[str, object] = call_with_retry(
-                lambda: litellm.completion(messages=messages, **completion_kwargs),
-                max_retries=max_retries,
-                retry_predicate=is_retryable_litellm_error,
-                description=self._get_adapter_info(),
-            )
-
-            response_text = response["choices"][0]["message"]["content"]
-            finish_reason = response["choices"][0].get("finish_reason")
+            if self._uses_openai_oauth():
+                response_text, response, usage = self._collect_openai_oauth_response(
+                    messages,
+                    completion_kwargs,
+                    max_retries,
+                )
+                finish_reason = None
+            else:
+                response = call_with_retry(
+                    lambda: litellm.completion(messages=messages, **completion_kwargs),
+                    max_retries=max_retries,
+                    retry_predicate=is_retryable_litellm_error,
+                    description=self._get_adapter_info(),
+                )
+                response_text = response["choices"][0]["message"]["content"]
+                finish_reason = response["choices"][0].get("finish_reason")
+                usage = response.get("usage")
 
             self._record_usage(
                 self._cost_model or self.kwargs["model"],
                 messages,
-                response.get("usage"),
+                usage,
                 "complete",
                 response=response,
             )
@@ -658,18 +1039,29 @@ class LLM:
             completion_kwargs.pop("enable_prompt_caching", None)
             completion_kwargs.pop("context_window", None)
 
-            response: dict[str, object] = litellm.completion(
-                messages=messages,
-                **completion_kwargs,
-            )
-
-            response_text = response["choices"][0]["message"]["content"]
-            finish_reason = response["choices"][0].get("finish_reason")
+            if self._uses_openai_oauth():
+                max_retries = pop_litellm_retry_kwargs(
+                    completion_kwargs, self._get_adapter_info()
+                )
+                response_text, response, usage = self._collect_openai_oauth_response(
+                    messages,
+                    completion_kwargs,
+                    max_retries,
+                )
+                finish_reason = None
+            else:
+                response = litellm.completion(
+                    messages=messages,
+                    **completion_kwargs,
+                )
+                response_text = response["choices"][0]["message"]["content"]
+                finish_reason = response["choices"][0].get("finish_reason")
+                usage = response.get("usage")
 
             self._record_usage(
                 self._cost_model or self.kwargs["model"],
                 messages,
-                response.get("usage"),
+                usage,
                 "complete_vision",
                 response=response,
             )
@@ -732,32 +1124,37 @@ class LLM:
                 completion_kwargs, self._get_adapter_info()
             )
             has_yielded_content = False
-            for chunk in iter_with_retry(
-                lambda: litellm.completion(
-                    messages=messages,
-                    stream=True,
-                    stream_options={"include_usage": True},
-                    **completion_kwargs,
-                ),
-                max_retries=max_retries,
-                retry_predicate=is_retryable_litellm_error,
-                description=self._get_adapter_info(),
-            ):
-                if chunk.get("usage"):
-                    self._record_usage(
-                        self._cost_model or self.kwargs["model"],
-                        messages,
-                        chunk.get("usage"),
-                        "stream_complete",
-                        response=chunk,
-                    )
-
-                response = self._process_stream_chunk(
-                    chunk, callback_manager, has_yielded_content
+            if self._uses_openai_oauth():
+                yield from self._stream_openai_oauth(
+                    messages, completion_kwargs, callback_manager, max_retries
                 )
-                if response is not None:
-                    has_yielded_content = True
-                    yield response
+            else:
+                for chunk in iter_with_retry(
+                    lambda: litellm.completion(
+                        messages=messages,
+                        stream=True,
+                        stream_options={"include_usage": True},
+                        **completion_kwargs,
+                    ),
+                    max_retries=max_retries,
+                    retry_predicate=is_retryable_litellm_error,
+                    description=self._get_adapter_info(),
+                ):
+                    if chunk.get("usage"):
+                        self._record_usage(
+                            self._cost_model or self.kwargs["model"],
+                            messages,
+                            chunk.get("usage"),
+                            "stream_complete",
+                            response=chunk,
+                        )
+
+                    response = self._process_stream_chunk(
+                        chunk, callback_manager, has_yielded_content
+                    )
+                    if response is not None:
+                        has_yielded_content = True
+                        yield response
 
         except LLMError:
             # Already wrapped LLMError, re-raise as is
@@ -812,19 +1209,30 @@ class LLM:
             max_retries = pop_litellm_retry_kwargs(
                 completion_kwargs, self._get_adapter_info()
             )
-            response = await acall_with_retry(
-                lambda: litellm.acompletion(messages=messages, **completion_kwargs),
-                max_retries=max_retries,
-                retry_predicate=is_retryable_litellm_error,
-                description=self._get_adapter_info(),
-            )
-            response_text = response["choices"][0]["message"]["content"]
-            finish_reason = response["choices"][0].get("finish_reason")
+            if self._uses_openai_oauth():
+                response_text, response, usage = await (
+                    self._acollect_openai_oauth_response(
+                        messages,
+                        completion_kwargs,
+                        max_retries,
+                    )
+                )
+                finish_reason = None
+            else:
+                response = await acall_with_retry(
+                    lambda: litellm.acompletion(messages=messages, **completion_kwargs),
+                    max_retries=max_retries,
+                    retry_predicate=is_retryable_litellm_error,
+                    description=self._get_adapter_info(),
+                )
+                response_text = response["choices"][0]["message"]["content"]
+                finish_reason = response["choices"][0].get("finish_reason")
+                usage = response.get("usage")
 
             self._record_usage(
                 self._cost_model or self.kwargs["model"],
                 messages,
-                response.get("usage"),
+                usage,
                 "acomplete",
                 response=response,
             )
