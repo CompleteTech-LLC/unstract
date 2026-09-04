@@ -124,13 +124,150 @@ services:
     container_name: unstract-vector-db
     restart: unless-stopped
     ports:
-      - "6333:6333"
+      - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_data:/var/lib/qdrant/data/
     labels:
       - traefik.enable=false
+
+  # Separate pgvector instance for the Postgres adapter. The platform's `db`
+  # service is also pgvector-enabled, but keeping this volume/container
+  # independent prevents adapter connection tests from sharing platform data.
+  postgres-vector:
+    image: "pgvector/pgvector:pg15"
+    container_name: unstract-postgres-vector
+    restart: unless-stopped
+    shm_size: 128mb
+    # Generate a local self-signed certificate before the official Postgres
+    # entrypoint initializes or starts the server.
+    entrypoint: ["/usr/local/bin/postgres-vector-entrypoint.sh"]
+    command: ["postgres"]
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - postgres_vector_data:/var/lib/postgresql/data/
+      - postgres_vector_ssl:/var/lib/postgresql/ssl/
+      - ./scripts/db-setup/vector_db_setup.sh:/docker-entrypoint-initdb.d/vector_db_setup.sh:ro
+      - ./scripts/db-setup/postgres-vector-entrypoint.sh:/usr/local/bin/postgres-vector-entrypoint.sh:ro
     env_file:
+      # Reuse the local platform database credentials from essentials.env while
+      # retaining a separate data directory and container.
       - ./essentials.env
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels:
+      - traefik.enable=false
+
+  # Weaviate uses anonymous access for this loopback-only development service.
+  # The adapter uses the local connector for this HTTP endpoint; no cloud
+  # account or API key is required.
+  weaviate:
+    image: "docker.io/semitechnologies/weaviate:1.39.2"
+    container_name: unstract-weaviate
+    restart: unless-stopped
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --scheme
+      - http
+    ports:
+      - "127.0.0.1:8084:8080"
+      - "127.0.0.1:50051:50051"
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    environment:
+      QUERY_DEFAULTS_LIMIT: "25"
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+      DEFAULT_VECTORIZER_MODULE: "none"
+      CLUSTER_HOSTNAME: "node1"
+    labels:
+      - traefik.enable=false
+
+  # Milvus standalone needs etcd for metadata and MinIO for object storage.
+  # Keep those dependencies private to this Compose network; only Milvus's
+  # client and WebUI ports are published for local development.
+  milvus-etcd:
+    image: "quay.io/coreos/etcd:v3.5.18"
+    container_name: unstract-milvus-etcd
+    restart: unless-stopped
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    volumes:
+      - milvus_etcd_data:/etcd
+    command: >-
+      etcd -advertise-client-urls=http://milvus-etcd:2379
+      -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    labels:
+      - traefik.enable=false
+
+  milvus-minio:
+    image: "minio/minio:RELEASE.2024-05-28T17-19-04Z"
+    container_name: unstract-milvus-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      # Keep the legacy names aligned with the credentials expected by the
+      # Milvus 2.5 standalone configuration.
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - milvus_minio_data:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    labels:
+      - traefik.enable=false
+
+  milvus:
+    # Keep this aligned with the pymilvus 2.5.x dependency used by sdk1.
+    image: "milvusdb/milvus:v2.5.17"
+    container_name: unstract-milvus
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      MINIO_REGION: us-east-1
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      MINIO_ADDRESS: milvus-minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - milvus_data:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    ports:
+      - "127.0.0.1:19530:19530"
+      - "127.0.0.1:9091:9091"
+    depends_on:
+      milvus-etcd:
+        condition: service_healthy
+      milvus-minio:
+        condition: service_healthy
+    labels:
+      - traefik.enable=false
 
   rabbitmq:
     image: rabbitmq:4.1.0-management
@@ -149,7 +286,13 @@ volumes:
   flipt_data:
   minio_data:
   postgres_data:
+  postgres_vector_data:
+  postgres_vector_ssl:
   qdrant_data:
   redis_data:
   prompt_studio_data:
   rabbitmq_data:
+  weaviate_data:
+  milvus_etcd_data:
+  milvus_minio_data:
+  milvus_data:

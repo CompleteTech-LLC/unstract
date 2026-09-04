@@ -30,6 +30,63 @@ VERSION=dev docker compose -f docker-compose.yaml --profile optional up -d
 
 Now access frontend at http://frontend.unstract.localhost
 
+## Local vector databases
+
+The default development Compose stack starts the open-source vector database
+backends supported by Unstract:
+
+- Qdrant
+- PostgreSQL with the `pgvector` extension
+- Weaviate
+- Milvus Standalone (with private etcd and MinIO dependencies)
+
+Pinecone is supported as a hosted provider and is intentionally not included
+in the local stack because it is not a self-hosted open-source service.
+
+The services use persistent named volumes and are bound to loopback on the host.
+Qdrant and Weaviate use anonymous access because this is a local development
+stack; do not expose these ports beyond the local machine without adding
+authentication and TLS. The Unstract workers connect over the Compose network,
+so use the internal addresses below when creating an adapter in the UI:
+
+| Adapter | UI fields | Address from Unstract containers | Host address | Local credentials |
+|---------|-----------|----------------------------------|--------------|-------------------|
+| Qdrant | URL, API Key | `http://qdrant:6333` | `http://localhost:6333` | Leave API Key empty |
+| Postgres | Database, Host, Port, User, Password, Enable SSL | Host `postgres-vector`, port `5432` | Host `localhost`, port `5433` | Values from `docker/essentials.env`; SSL is enabled by default |
+| Weaviate | URL, API Key | `http://weaviate:8080` | `http://localhost:8084` | Leave API Key empty |
+| Milvus | URI, Token | `http://milvus:19530` | `http://localhost:19530` | Leave Token empty |
+
+When the adapter schema is served by the local development stack, these
+internal values are pre-filled in the form, including the sample PostgreSQL
+credentials from `docker/essentials.env` and SSL enabled for the local
+connection. The bundled `postgres-vector` service generates a self-signed
+certificate and starts PostgreSQL with TLS enabled. The adapter uses
+`sslmode=require` without certificate verification for this local-only
+certificate. If `essentials.env` has customized the PostgreSQL credentials,
+replace the pre-filled values with the customized values before testing the
+connection. Keep the container DNS names (`qdrant`, `postgres-vector`,
+`weaviate`, and `milvus`) when the adapter is used by Unstract workers; use the
+host addresses only for clients running outside the Compose network.
+
+For the Postgres adapter, use the `POSTGRES_USER`, `POSTGRES_PASSWORD`, and
+`POSTGRES_DB` values in `docker/essentials.env`; the vector database has its own
+container and volume even though it reuses the platform's local development
+credentials. The initialization script enables `vector` and creates the
+`POSTGRES_SCHEMA` schema on first boot.
+
+The default `run-platform.sh` flow creates `docker/.env` and
+`docker/essentials.env` before starting Compose. To start only the vector
+services during development, run:
+
+```bash
+cd docker
+VERSION=dev docker compose -f docker-compose.yaml up -d \
+  qdrant postgres-vector weaviate milvus
+```
+
+Do not use `docker compose down -v` unless deleting local vector data is
+intentional.
+
 ## Overriding a service's config
 
 By making use of the [merge compose files](https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/) feature its possible to override some configuration that's used by the services.
