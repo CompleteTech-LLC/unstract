@@ -174,6 +174,9 @@ def test_openai_oauth_dynamic_schema_uses_model_specific_reasoning_levels() -> N
         "low",
         "high",
     ]
+    assert model_conditions[0]["then"]["properties"]["reasoning_effort"][
+        "enumNames"
+    ] == ["low", "high"]
     assert model_conditions[1]["then"]["properties"]["reasoning_effort"]["enum"] == [
         "max"
     ]
@@ -192,6 +195,7 @@ def test_openai_oauth_dynamic_schema_accepts_string_reasoning_levels() -> None:
 
     reasoning = schema["allOf"][1]["then"]["properties"]["reasoning_effort"]
     assert reasoning["enum"] == ["low", "medium", "high"]
+    assert reasoning["enumNames"] == ["low", "medium", "high"]
 
 
 def test_openai_oauth_parameters_normalize_model_and_fix_endpoint() -> None:

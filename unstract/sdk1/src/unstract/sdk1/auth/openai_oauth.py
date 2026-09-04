@@ -355,14 +355,16 @@ def _reasoning_schema_for_model(
         return None
 
     efforts = [level["effort"] for level in levels]
-    effort_labels = [level["description"] for level in levels]
     default_effort = model.get("default_reasoning_level")
     if default_effort not in efforts:
         default_effort = efforts[0]
     return {
         "type": "string",
         "enum": efforts,
-        "enumNames": effort_labels,
+        # RJSF renders enumNames in the select. Keep the stable effort names
+        # visible; the catalog descriptions are explanatory metadata, not the
+        # value users need to choose or persist.
+        "enumNames": efforts,
         "default": default_effort,
         "title": "Reasoning Effort",
         "description": "Reasoning levels reported for this model by ChatGPT.",
