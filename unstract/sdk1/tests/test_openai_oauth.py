@@ -46,6 +46,22 @@ def _metadata(access_token: str, account_id: str) -> dict[str, object]:
     }
 
 
+def _response_events(text: str) -> object:
+    return iter(
+        [
+            {"type": "response.output_text.delta", "delta": text},
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": f"response-{text}",
+                    "output_text": text,
+                    "usage": {},
+                },
+            },
+        ]
+    )
+
+
 def test_openai_oauth_adapter_is_registered_with_auth_metadata() -> None:
     adapter_id = OpenAIOAuthLLMAdapter.get_id()
     assert adapters[adapter_id][Common.MODULE] is OpenAIOAuthLLMAdapter
@@ -253,8 +269,8 @@ def test_llm_sends_each_account_token_and_workspace_header() -> None:
         patch(
             "unstract.sdk1.llm.litellm.responses",
             side_effect=[
-                {"output_text": "first", "usage": {}},
-                {"output_text": "second", "usage": {}},
+                _response_events("first"),
+                _response_events("second"),
             ],
         ) as responses,
         patch.object(first, "_record_usage"),
@@ -275,6 +291,8 @@ def test_llm_sends_each_account_token_and_workspace_header() -> None:
     assert first_request["include"] == ["reasoning.encrypted_content"]
     assert "oauth_refresh_token" not in first_request
     assert first_request["api_base"] == OPENAI_OAUTH_CHATGPT_API_BASE
+    assert first_request["stream"] is True
+    assert second_request["stream"] is True
 
 
 def test_llm_streams_responses_text_and_records_completion_usage() -> None:
@@ -315,12 +333,23 @@ def test_llm_async_completion_uses_responses_api() -> None:
         adapter_id=OpenAIOAuthLLMAdapter.get_id(),
         adapter_metadata=_metadata("token", "account"),
     )
-    response = {"output_text": "async response", "usage": {}}
+    async def response_events():
+        yield {
+            "type": "response.output_text.delta",
+            "delta": "async response",
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "output_text": "async response",
+                "usage": {},
+            },
+        }
 
     with (
         patch(
             "unstract.sdk1.llm.litellm.aresponses",
-            new=AsyncMock(return_value=response),
+            new=AsyncMock(return_value=response_events()),
         ) as responses,
         patch.object(llm, "_record_usage"),
     ):
@@ -328,3 +357,4 @@ def test_llm_async_completion_uses_responses_api() -> None:
 
     assert result["response"].text == "async response"
     assert responses.await_args.kwargs["extra_headers"]["ChatGPT-Account-Id"] == "account"
+    assert responses.await_args.kwargs["stream"] is True
