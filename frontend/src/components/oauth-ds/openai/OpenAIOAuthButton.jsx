@@ -13,9 +13,12 @@ const OpenAIOAuthButton = ({
   userCode,
   accountLabel,
   isStarting = false,
+  isRestoring = false,
 }) => {
   const isPending = status === "pending";
-  const buttonLabel = isStarting
+  const buttonLabel = isRestoring
+    ? "Restoring OpenAI authentication"
+    : isStarting
     ? "Starting OpenAI sign-in"
     : status === "success"
       ? "Authenticated"
@@ -30,8 +33,8 @@ const OpenAIOAuthButton = ({
       <Button
         type="primary"
         onClick={handleOAuth}
-        disabled={disabled || isStarting}
-        loading={isStarting}
+        disabled={disabled || isStarting || isRestoring}
+        loading={isStarting || isRestoring}
       >
         {buttonLabel}
       </Button>
@@ -63,6 +66,7 @@ OpenAIOAuthButton.propTypes = {
   userCode: PropTypes.string,
   accountLabel: PropTypes.string,
   isStarting: PropTypes.bool,
+  isRestoring: PropTypes.bool,
 };
 
 export default OpenAIOAuthButton;

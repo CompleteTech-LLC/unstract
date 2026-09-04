@@ -1,5 +1,5 @@
 import PropTypes from "prop-types";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Cookies from "js-cookie";
 import { Typography } from "@/components/ui/shims/antd-typography";
 
@@ -79,12 +79,32 @@ function OAuthDs({
   });
   const [activeLoginCacheKey, setActiveLoginCacheKey] = useState(null);
   const [isStarting, setIsStarting] = useState(false);
+  const [isRestoring, setIsRestoring] = useState(false);
+  const restoreScopeRef = useRef(null);
 
   const updateOAuthStatus = useCallback((newStatus) => {
     setOAuthStatus(newStatus);
     setStatus(newStatus);
     localStorage.setItem(oauthStatusKey, newStatus);
   }, [oauthStatusKey, setStatus]);
+
+  const clearOAuthHandoff = useCallback(() => {
+    setLoginCacheKey(null);
+    setActiveLoginCacheKey(null);
+    setDeviceLogin(null);
+    setCacheKey("");
+    setStatus("");
+    setOAuthStatus("");
+    localStorage.removeItem(oauthCacheKey);
+    localStorage.removeItem(oauthStatusKey);
+    localStorage.removeItem(oauthDeviceKey);
+  }, [
+    oauthCacheKey,
+    oauthDeviceKey,
+    oauthStatusKey,
+    setCacheKey,
+    setStatus,
+  ]);
 
   const loadOpenAIModelSchema = useCallback(
     async (oauthKey = "") => {
@@ -161,6 +181,87 @@ function OAuthDs({
   ]);
 
   useEffect(() => {
+    if (
+      oAuthProvider !== O_AUTH_PROVIDERS.OPENAI ||
+      adapterInstanceId ||
+      hasOAuthCredentials ||
+      oauthStatus === "pending" ||
+      activeLoginCacheKey ||
+      restoreScopeRef.current === oauthStateScope
+    ) {
+      return undefined;
+    }
+
+    restoreScopeRef.current = oauthStateScope;
+    let isActive = true;
+    setIsRestoring(true);
+
+    axiosPrivate({
+      method: "GET",
+      url: "/api/v1/oauth/openai/restore/",
+    })
+      .then((response) => {
+        if (!isActive) {
+          return;
+        }
+        const result = response?.data || {};
+        if (result.status !== "success" || !result.cache_key) {
+          clearOAuthHandoff();
+          return;
+        }
+
+        const restoredCacheKey = result.cache_key;
+        const restoredLogin = {
+          ...result,
+          status: "success",
+        };
+        setLoginCacheKey(restoredCacheKey);
+        setActiveLoginCacheKey(restoredCacheKey);
+        setCacheKey(restoredCacheKey);
+        setDeviceLogin(restoredLogin);
+        localStorage.setItem(oauthCacheKey, restoredCacheKey);
+        localStorage.setItem(oauthDeviceKey, JSON.stringify(restoredLogin));
+        updateOAuthStatus("success");
+      })
+      .catch((err) => {
+        if (!isActive) {
+          return;
+        }
+        clearOAuthHandoff();
+        setAlertDetails(
+          handleException(
+            err,
+            "Could not restore your saved OpenAI authentication",
+          ),
+        );
+      })
+      .finally(() => {
+        if (isActive) {
+          setIsRestoring(false);
+        }
+      });
+
+    return () => {
+      isActive = false;
+    };
+  }, [
+    activeLoginCacheKey,
+    adapterInstanceId,
+    axiosPrivate,
+    clearOAuthHandoff,
+    handleException,
+    hasOAuthCredentials,
+    oauthCacheKey,
+    oauthDeviceKey,
+    oauthStatus,
+    oAuthProvider,
+    oauthStateScope,
+    setAlertDetails,
+    setCacheKey,
+    updateOAuthStatus,
+  ]);
+
+  useEffect(() => {
     // Do not let an old pending browser state mask credentials already saved
     // on an existing adapter. A live reauthentication session is allowed to
     // remain pending and can still replace those credentials after testing.
@@ -221,15 +322,8 @@ function OAuthDs({
           typeof message === "string" &&
           message.toLowerCase().includes("openai oauth login session");
         if (isExpiredLoginSession) {
-          setLoginCacheKey(null);
-          setActiveLoginCacheKey(null);
-          setDeviceLogin(null);
-          setCacheKey("");
-          setStatus("");
-          setOAuthStatus("");
-          localStorage.removeItem(oauthCacheKey);
-          localStorage.removeItem(oauthStatusKey);
-          localStorage.removeItem(oauthDeviceKey);
+          clearOAuthHandoff();
+          return;
         }
         setAlertDetails(handleException(err, message));
       });
@@ -241,6 +335,7 @@ function OAuthDs({
     activeLoginCacheKey,
     adapterInstanceId,
     handleException,
+    clearOAuthHandoff,
     loadOpenAIModelSchema,
     loginCacheKey,
     oauthStatus,
@@ -284,6 +379,15 @@ function OAuthDs({
         }
         const message =
           err?.response?.data?.message || "OpenAI authentication failed";
+        const isExpiredLoginSession =
+          typeof message === "string" &&
+          message.toLowerCase().includes("openai oauth login session");
+        if (isExpiredLoginSession) {
+          // A Redis hand-off is disposable. Clear the stale browser key so a
+          // durable server-side account can be restored on the next render.
+          clearOAuthHandoff();
+          return;
+        }
         updateOAuthStatus("error");
         setAlertDetails(handleException(err, message));
       }
@@ -298,6 +402,7 @@ function OAuthDs({
     };
   }, [
     axiosPrivate,
+    clearOAuthHandoff,
     handleException,
     loginCacheKey,
     oauthStatus,
@@ -441,6 +546,7 @@ function OAuthDs({
         userCode={deviceLogin?.user_code}
         accountLabel={deviceLogin?.account_label || oauthAccountLabel}
         isStarting={isStarting}
+        isRestoring={isRestoring}
       />
     );
   }

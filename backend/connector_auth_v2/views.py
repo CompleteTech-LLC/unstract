@@ -71,16 +71,12 @@ class ConnectorAuthViewSet(viewsets.ViewSet):
         if unauthorized := self._require_authenticated(request):
             return unauthorized
         try:
-            return Response(
-                OpenAIOAuthService.start(request), status=status.HTTP_200_OK
-            )
+            return Response(OpenAIOAuthService.start(request), status=status.HTTP_200_OK)
         except OpenAIOAuthSessionError as exc:
             return Response({"message": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except OpenAIOAuthError as exc:
             logger.warning("OpenAI OAuth device login start failed: %s", exc)
-            return Response(
-                {"message": str(exc)}, status=status.HTTP_502_BAD_GATEWAY
-            )
+            return Response({"message": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
 
     def openai_poll(self, request: Request) -> Response:
         """Poll one OpenAI device-code login and exchange it when complete."""
@@ -94,9 +90,20 @@ class ConnectorAuthViewSet(viewsets.ViewSet):
             return Response({"message": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except OpenAIOAuthError as exc:
             logger.warning("OpenAI OAuth device login poll failed: %s", exc)
-            return Response(
-                {"message": str(exc)}, status=status.HTTP_502_BAD_GATEWAY
-            )
+            return Response({"message": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    def openai_restore(self, request: Request) -> Response:
+        """Restore the user's most recently authenticated OpenAI account."""
+        if unauthorized := self._require_authenticated(request):
+            return unauthorized
+        try:
+            result = OpenAIOAuthService.restore(request)
+            return Response(result or {"status": "none"}, status=status.HTTP_200_OK)
+        except OpenAIOAuthSessionError as exc:
+            return Response({"message": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except OpenAIOAuthError as exc:
+            logger.warning("OpenAI OAuth account restore failed: %s", exc)
+            return Response({"message": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
 
     def openai_models(self, request: Request) -> Response:
         """Return the live model/reasoning schema for one OAuth account."""
@@ -149,6 +156,4 @@ class ConnectorAuthViewSet(viewsets.ViewSet):
             return Response({"message": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except OpenAIOAuthError as exc:
             logger.warning("OpenAI OAuth model discovery failed: %s", exc)
-            return Response(
-                {"message": str(exc)}, status=status.HTTP_502_BAD_GATEWAY
-            )
+            return Response({"message": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
