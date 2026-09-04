@@ -210,6 +210,27 @@ function OAuthDs({
         const message =
           err?.response?.data?.message ||
           "Could not load models available to this OpenAI account";
+
+        // The hand-off key is intentionally short-lived and is also removed
+        // after credentials are saved. Do not keep treating an expired key
+        // from localStorage as an authenticated new login. Saved adapters can
+        // fall back to their durable credentials on the next effect pass;
+        // unsaved adapters are returned to the sign-in state.
+        const isExpiredLoginSession =
+          sessionKey &&
+          typeof message === "string" &&
+          message.toLowerCase().includes("openai oauth login session");
+        if (isExpiredLoginSession) {
+          setLoginCacheKey(null);
+          setActiveLoginCacheKey(null);
+          setDeviceLogin(null);
+          setCacheKey("");
+          setStatus("");
+          setOAuthStatus("");
+          localStorage.removeItem(oauthCacheKey);
+          localStorage.removeItem(oauthStatusKey);
+          localStorage.removeItem(oauthDeviceKey);
+        }
         setAlertDetails(handleException(err, message));
       });
 
@@ -226,6 +247,8 @@ function OAuthDs({
     oAuthProvider,
     onModelsLoaded,
     setAlertDetails,
+    setCacheKey,
+    setStatus,
   ]);
 
   useEffect(() => {
