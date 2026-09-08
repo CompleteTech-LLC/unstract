@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import os
 import signal
 import threading
@@ -1676,9 +1677,10 @@ def _reaper_health_stale_from_env() -> float:
         raise ValueError(
             f"WORKER_PG_REAPER_HEALTH_STALE_SECONDS={raw!r} is not a number."
         ) from exc
-    if value <= 0:
+    if not math.isfinite(value) or value <= 0:
         raise ValueError(
-            f"WORKER_PG_REAPER_HEALTH_STALE_SECONDS={value} must be positive."
+            "WORKER_PG_REAPER_HEALTH_STALE_SECONDS="
+            f"{value} must be finite and positive."
         )
     return value
 

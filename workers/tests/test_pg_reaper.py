@@ -1275,7 +1275,7 @@ class TestHealthEnv:
         monkeypatch.setenv("WORKER_PG_REAPER_HEALTH_STALE_SECONDS", "10")
         assert reaper_mod._reaper_health_stale_from_env() == pytest.approx(10.0)
 
-    @pytest.mark.parametrize("bad", ["0", "-1", "x"])
+    @pytest.mark.parametrize("bad", ["0", "-1", "x", "nan", "inf", "-inf"])
     def test_stale_invalid_raises(self, monkeypatch, bad):
         monkeypatch.setenv("WORKER_PG_REAPER_HEALTH_STALE_SECONDS", bad)
         with pytest.raises(ValueError):
