@@ -232,6 +232,34 @@ def test_probe_signal_cleans_temporary_files(tmp_path: Path) -> None:
     assert not list(tmp_path.glob("unstract-health-*"))
 
 
+def test_native_probe_signal_cleans_temporary_files(tmp_path: Path) -> None:
+    redis_cli = write_fake(tmp_path, "redis-cli", "sleep 10")
+    env = os.environ.copy()
+    env.update(
+        {
+            "TMPDIR": str(tmp_path),
+            "REDIS_CLI_BIN": str(redis_cli),
+            "HEALTHCHECK_TIMEOUT_SECONDS": "30",
+        }
+    )
+    process = subprocess.Popen(
+        ["sh", str(SCRIPT), "redis"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        time.sleep(0.2)
+        process.terminate()
+        process.wait(timeout=4)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=4)
+    assert not list(tmp_path.glob("unstract-health-*"))
+
+
 def test_traefik_requires_nonempty_error_free_overview(tmp_path: Path) -> None:
     wget = write_fake(
         tmp_path,
