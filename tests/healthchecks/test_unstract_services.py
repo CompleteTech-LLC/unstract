@@ -64,6 +64,72 @@ exit "${FAKE_EXIT:-0}"
     assert "modules" not in failed.stderr
 
 
+@pytest.mark.parametrize("timeout", ["", "0", "00", "-1", "abc"])
+def test_invalid_timeout_configuration_is_rejected(timeout: str) -> None:
+    result = run_probe(
+        "redis",
+        {"HEALTHCHECK_TIMEOUT_SECONDS": timeout},
+    )
+    assert result.returncode == 2
+    assert "invalid timeout configuration" in result.stderr
+
+
+def test_timeout_configuration_is_capped(tmp_path: Path) -> None:
+    timeout_record = tmp_path / "timeout"
+    timeout = write_fake(
+        tmp_path,
+        "timeout",
+        f'printf "%s" "$1" > "{timeout_record}"; shift; "$@"',
+    )
+    redis_cli = write_fake(tmp_path, "redis-cli", 'printf "PONG\\n"')
+    result = run_probe(
+        "redis",
+        {
+            "HEALTHCHECK_TIMEOUT_SECONDS": "999999999999999999999999",
+            "TIMEOUT_BIN": str(timeout),
+            "REDIS_CLI_BIN": str(redis_cli),
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert timeout_record.read_text(encoding="utf-8") == "30"
+
+
+def test_qdrant_host_and_port_are_data_not_shell_source(tmp_path: Path) -> None:
+    marker = tmp_path / "injected"
+    result = run_probe(
+        "vector-db",
+        {
+            "QDRANT_HOST": f"host; touch {marker}; #",
+            "QDRANT_PORT": f"6333; touch {marker}; #",
+        },
+    )
+    assert result.returncode != 0
+    assert not marker.exists()
+
+
+def test_weaviate_response_is_bounded_and_client_failures_propagate(
+    tmp_path: Path,
+) -> None:
+    wget = write_fake(
+        tmp_path,
+        "wget",
+        """
+printf 'HTTP/1.1 200 OK\\r\\n' >&2
+case "${FAKE_MODE:-ok}" in
+  big) i=0; while [ "$i" -lt 70000 ]; do printf x; i=$((i + 1)); done ;;
+  fail) printf '%s' '{\"version\":\"1\"}'; exit 7 ;;
+  redirect) printf 'Location: http://example.test/\\r\\n' >&2; printf '%s' '{\"version\":\"1\"}' ;;
+  *) printf '%s' '{\"version\":\"1\"}' ;;
+esac
+""",
+    )
+    base = {"WGET_BIN": str(wget)}
+    assert run_probe("weaviate", base).returncode == 0
+    assert run_probe("weaviate", {**base, "FAKE_MODE": "big"}).returncode != 0
+    assert run_probe("weaviate", {**base, "FAKE_MODE": "fail"}).returncode != 0
+    assert run_probe("weaviate", {**base, "FAKE_MODE": "redirect"}).returncode != 0
+
+
 def test_traefik_requires_nonempty_error_free_overview(tmp_path: Path) -> None:
     wget = write_fake(
         tmp_path,
@@ -88,6 +154,24 @@ esac
         "proxy", {"WGET_BIN": str(wget), "FAKE_OVERVIEW": unhealthy}
     )
     assert failed.returncode != 0
+
+
+def test_frontend_response_is_bounded(tmp_path: Path) -> None:
+    curl = write_fake(
+        tmp_path,
+        "curl",
+        """
+case "${FAKE_MODE:-ok}" in
+  big) i=0; while [ "$i" -lt 70000 ]; do printf x; i=$((i + 1)); done ;;
+  fail) exit 7 ;;
+  *) printf '%s' '<html><title>Unstract</title></html>' ;;
+esac
+""",
+    )
+    base = {"CURL_BIN": str(curl)}
+    assert run_probe("frontend", base).returncode == 0
+    assert run_probe("frontend", {**base, "FAKE_MODE": "big"}).returncode != 0
+    assert run_probe("frontend", {**base, "FAKE_MODE": "fail"}).returncode != 0
 
 
 class _QdrantHandler(socketserver.BaseRequestHandler):
