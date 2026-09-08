@@ -22,7 +22,9 @@ import datetime as dt
 import fcntl
 import hashlib
 import json
+import math
 import os
+import re
 import select
 import shlex
 import subprocess
@@ -30,6 +32,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterator
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -90,6 +93,18 @@ EXPECTED_NETWORK = "unstract-network"
 SOURCE_STATE_SCHEMA = "unstract-source-state/v2"
 BACKUP_SCHEMA = "unstract-health-backup/v2"
 REPLACEMENT_SCHEMA = "unstract-health-replacements/v1"
+DURATION_TOKEN = re.compile(
+    r"(?P<number>(?:\d+(?:\.\d*)?|\.\d+))(?P<unit>ns|us|µs|ms|h|m|s)"
+)
+DURATION_UNITS_NS = {
+    "ns": 1,
+    "us": 1_000,
+    "µs": 1_000,
+    "ms": 1_000_000,
+    "s": 1_000_000_000,
+    "m": 60_000_000_000,
+    "h": 3_600_000_000_000,
+}
 
 # The two log consumers need these values to expose their source-level
 # heartbeat endpoints.  Every other environment value must survive a
@@ -205,32 +220,37 @@ def sha256_file(path: Path) -> str:
 
 
 def duration_ns(value: Any) -> int | None:
-    """Normalize Compose duration strings and Podman nanosecond values."""
+    """Normalize full Compose durations and Podman nanosecond values."""
     if value is None:
         return None
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return value
+        return value if value >= 0 else None
     if isinstance(value, float):
+        if not math.isfinite(value) or value < 0:
+            return None
         return round(value)
     text = str(value).strip().lower()
-    units = (
-        ("ns", 1),
-        ("us", 1_000),
-        ("µs", 1_000),
-        ("ms", 1_000_000),
-        ("s", 1_000_000_000),
-        ("m", 60_000_000_000),
-        ("h", 3_600_000_000_000),
-    )
-    for suffix, multiplier in units:
-        if text.endswith(suffix):
-            try:
-                return round(float(text[: -len(suffix)]) * multiplier)
-            except ValueError:
-                return None
-    return None
+    if text == "0":
+        return 0
+    position = 0
+    total = Decimal(0)
+    while position < len(text):
+        match = DURATION_TOKEN.match(text, position)
+        if match is None:
+            return None
+        try:
+            number = Decimal(match.group("number"))
+        except InvalidOperation:
+            return None
+        if not number.is_finite() or number < 0:
+            return None
+        total += number * DURATION_UNITS_NS[match.group("unit")]
+        if not total.is_finite():
+            return None
+        position = match.end()
+    return int(total.to_integral_value()) if position else None
 
 
 def runtime_command_env(
@@ -360,14 +380,36 @@ def health_runtime(value: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def normalize_mount(mount: dict[str, Any]) -> dict[str, Any]:
+    source = mount.get("Source")
+    if mount.get("Type") != "volume":
+        source = normalize_bind_mount_source(source)
     return {
         "type": mount.get("Type"),
         "name": mount.get("Name"),
-        "source": mount.get("Source"),
+        "source": source,
         "destination": mount.get("Destination"),
         "rw": mount.get("RW"),
         "options": sorted(mount.get("Options") or []),
     }
+
+
+def normalize_bind_mount_source(value: Any) -> Any:
+    """Compare bind sources by absolute lexical identity without resolving symlinks."""
+    if not isinstance(value, str) or not value:
+        return value
+    return os.path.normpath(os.path.abspath(value))
+
+
+def compose_mount_source(config: dict[str, Any], mount: dict[str, Any]) -> Any:
+    """Resolve a Compose volume alias to its project-scoped name."""
+    source = mount.get("source")
+    if mount.get("type") != "volume" or not isinstance(source, str):
+        return source
+    volumes = config.get("volumes") or {}
+    definition = volumes.get(source)
+    if isinstance(definition, dict):
+        return definition.get("name") or source
+    return source
 
 
 def normalize_networks(value: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1187,8 +1229,14 @@ def check_candidate_config(
                 if old_mount.get("type") == "volume"
                 else old_mount.get("source")
             )
-            new_source = new_mount.get("source")
-            if old_source and new_source and old_source != new_source:
+            new_source = compose_mount_source(config, new_mount)
+            if old_mount.get("type") == "volume" or new_mount.get("type") == "volume":
+                sources_match = old_source == new_source
+            else:
+                sources_match = normalize_bind_mount_source(
+                    old_source
+                ) == normalize_bind_mount_source(new_source)
+            if old_source and new_source and not sources_match:
                 raise GuardError(
                     f"candidate changed {service} mount source for {destination}: "
                     f"{new_source} != {old_source}"
