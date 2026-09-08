@@ -62,6 +62,21 @@ rabbitmq_diagnostics_bin=${RABBITMQ_DIAGNOSTICS_BIN:-rabbitmq-diagnostics}
 pg_isready_bin=${PG_ISREADY_BIN:-pg_isready}
 psql_bin=${PSQL_BIN:-psql}
 
+# The timeout wrapper starts client commands in their own process group on the
+# supported GNU and BusyBox implementations.  A healthcheck can be signalled
+# while its shell is waiting for that wrapper; terminate both the group and
+# the wrapper PID so a client descendant cannot keep a FIFO open or delay the
+# shell's trap indefinitely.  The group form is allowed to fail for readers
+# that share the shell's process group, after which the direct PID is killed.
+terminate_process_group() {
+    terminate_process_pid=$1
+    [ -n "$terminate_process_pid" ] || return 0
+    kill -TERM -"$terminate_process_pid" >/dev/null 2>&1 || :
+    kill -TERM "$terminate_process_pid" >/dev/null 2>&1 || :
+    kill -KILL -"$terminate_process_pid" >/dev/null 2>&1 || :
+    kill -KILL "$terminate_process_pid" >/dev/null 2>&1 || :
+}
+
 # BusyBox wget has no max-filesize or max-redirect option. Stream through
 # bounded head processes, while capturing response headers so redirects can be
 # rejected even when the client follows them internally. The status file keeps
@@ -72,7 +87,7 @@ bounded_wget_cleanup() {
         "${bounded_wget_body_reader_pid-}" \
         "${bounded_wget_header_reader_pid-}"; do
         if [ -n "$bounded_wget_cleanup_pid" ]; then
-            kill "$bounded_wget_cleanup_pid" >/dev/null 2>&1 || :
+            terminate_process_group "$bounded_wget_cleanup_pid"
         fi
     done
     for bounded_wget_cleanup_pid in \
@@ -168,7 +183,7 @@ bounded_curl_cleanup() {
         "${bounded_curl_client_pid-}" \
         "${bounded_curl_body_reader_pid-}"; do
         if [ -n "$bounded_curl_cleanup_pid" ]; then
-            kill "$bounded_curl_cleanup_pid" >/dev/null 2>&1 || :
+            terminate_process_group "$bounded_curl_cleanup_pid"
         fi
     done
     for bounded_curl_cleanup_pid in \
@@ -246,7 +261,7 @@ bounded_exec_cleanup() {
         "${bounded_exec_client_pid-}" \
         "${bounded_exec_reader_pid-}"; do
         if [ -n "$bounded_exec_cleanup_pid" ]; then
-            kill "$bounded_exec_cleanup_pid" >/dev/null 2>&1 || :
+            terminate_process_group "$bounded_exec_cleanup_pid"
         fi
     done
     for bounded_exec_cleanup_pid in \
