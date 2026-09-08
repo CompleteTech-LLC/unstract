@@ -25,7 +25,10 @@ healthcheck:
 ```
 
 The tracked `docker/compose.train.healthchecks.yaml` overlay mounts this probe
-read-only and supplies the eleven core service checks.  Apply it after the
-Train-only `docker/compose.train.yaml` file.  The script's endpoint and command
-paths can be overridden with environment variables for isolated contract
-tests; production defaults target service-local listeners.
+read-only and supplies the eleven core service checks.  The companion
+`docker/compose.train.worker-healthchecks.yaml` overlay supplies the runner and
+twelve worker checks while preserving the Train checkout's local Compose
+changes.  Apply both after the Train-only `docker/compose.train.yaml` file.  The
+script's endpoint and command paths can be overridden with environment
+variables for isolated contract tests; production defaults target service-local
+listeners.

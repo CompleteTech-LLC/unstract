@@ -8,11 +8,11 @@
 #
 # The overlay only adds a read-only probe mount and a bounded application
 # healthcheck.  It does not replace ports, volumes, images, environment, or
-# container names from the owner Compose files.  The existing worker and runner
-# checks remain defined in docker/docker-compose.yaml.
+# container names from the owner Compose files.  Worker and runner checks are
+# staged separately in docker/compose.train.worker-healthchecks.yaml.
 
 x-unstract-service-probe: &unstract_service_probe
-  - ./healthchecks/unstract-services.sh:/usr/local/bin/unstract-services.sh:ro
+  - ${UNSTRACT_HEALTHCHECK_SOURCE:-./healthchecks/unstract-services.sh}:/usr/local/bin/unstract-services.sh:ro
 
 x-unstract-healthcheck: &unstract_healthcheck
   interval: 30s

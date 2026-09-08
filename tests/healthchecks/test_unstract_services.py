@@ -542,7 +542,7 @@ def test_train_overlay_mounts_read_only_probe_and_sets_core_checks() -> None:
     for service, probe_name in expected.items():
         config = overlay["services"][service]
         assert config["volumes"] == [
-            "./healthchecks/unstract-services.sh:/usr/local/bin/unstract-services.sh:ro"
+            "${UNSTRACT_HEALTHCHECK_SOURCE:-./healthchecks/unstract-services.sh}:/usr/local/bin/unstract-services.sh:ro"
         ]
         healthcheck = config["healthcheck"]
         assert healthcheck["test"] == [
@@ -554,3 +554,79 @@ def test_train_overlay_mounts_read_only_probe_and_sets_core_checks() -> None:
         assert healthcheck["timeout"] == "10s"
         assert healthcheck["retries"] == 3
         assert isinstance(healthcheck["start_period"], str)
+
+
+def test_train_worker_overlay_covers_runner_and_all_workers() -> None:
+    overlay_path = ROOT / "docker" / "compose.train.worker-healthchecks.yaml"
+    overlay = yaml.safe_load(overlay_path.read_text(encoding="utf-8"))
+    expected = {
+        "runner": 5002,
+        "worker-log-history-scheduler-v2": 8092,
+        "worker-pg-orchestrator-api": 8090,
+        "worker-pg-orchestrator-general": 8090,
+        "worker-pg-fileproc": 8090,
+        "worker-pg-callback": 8090,
+        "worker-pg-scheduler": 8090,
+        "worker-pg-metrics": 8090,
+        "worker-log-stream-consumer": 8091,
+        "worker-pg-executor": 8090,
+        "worker-pg-ide-callback": 8090,
+        "worker-pg-notification": 8090,
+        "worker-pg-reaper": 8086,
+    }
+
+    assert set(overlay["services"]) == set(expected)
+    for service, port in expected.items():
+        healthcheck = overlay["services"][service]["healthcheck"]
+        expected_path = "/health"
+        if service == "runner":
+            expected_path = "/v1/api/health"
+        assert healthcheck["test"][-1] == f"http://127.0.0.1:{port}{expected_path}"
+        assert healthcheck["interval"] == "30s"
+        assert healthcheck["timeout"] == "5s"
+        assert healthcheck["retries"] == 3
+        assert healthcheck["start_period"] == "30s"
+
+    assert overlay["services"]["worker-log-history-scheduler-v2"]["environment"] == {
+        "LOG_HISTORY_SCHEDULER_HEALTH_PORT": "8092",
+        "LOG_HISTORY_SCHEDULER_HEALTH_STALE_SECONDS": "${LOG_HISTORY_SCHEDULER_HEALTH_STALE_SECONDS:-120}",
+    }
+    assert overlay["services"]["worker-log-stream-consumer"]["environment"] == {
+        "LOG_STREAM_CONSUMER_HEALTH_PORT": "8091",
+        "LOG_STREAM_CONSUMER_HEALTH_STALE_SECONDS": "${LOG_STREAM_CONSUMER_HEALTH_STALE_SECONDS:-15}",
+    }
+
+
+def test_dev_essentials_uses_bounded_database_probes() -> None:
+    compose_path = ROOT / "docker" / "docker-compose-dev-essentials.yaml"
+    compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+    services = compose["services"]
+
+    postgres = services["postgres-vector"]
+    assert "./healthchecks/postgres-readiness.sh:/usr/local/bin/postgres-readiness.sh:ro" in postgres[
+        "volumes"
+    ]
+    assert postgres["healthcheck"] == {
+        "test": ["CMD", "/usr/local/bin/postgres-readiness.sh"],
+        "interval": "10s",
+        "timeout": "6s",
+        "retries": 5,
+    }
+    assert "./scripts/db-setup/postgres-vector-entrypoint.sh:/usr/local/bin/postgres-vector-entrypoint.sh:ro" in postgres[
+        "volumes"
+    ]
+    assert "postgres_vector_ssl:/var/lib/postgresql/ssl/" in postgres["volumes"]
+
+    for service, url in {
+        "milvus-minio": "http://127.0.0.1:9000/minio/health/ready",
+        "milvus": "http://127.0.0.1:9091/healthz",
+    }.items():
+        config = services[service]
+        assert "./healthchecks/http-readiness.sh:/usr/local/bin/http-readiness.sh:ro" in config[
+            "volumes"
+        ]
+        assert config["healthcheck"]["test"] == [
+            "CMD",
+            "/usr/local/bin/http-readiness.sh",
+            url,
+        ]
