@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import Enum
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import psutil
@@ -491,6 +491,12 @@ class HealthHTTPHandler(BaseHTTPRequestHandler):
         self.health_checker = health_checker
         super().__init__(*args, **kwargs)
 
+    def setup(self) -> None:
+        super().setup()
+        # A client that opens a health connection and then stops sending must
+        # not consume the only server thread or keep shutdown waiting forever.
+        self.connection.settimeout(2.0)
+
     def do_GET(self):
         """Handle GET requests."""
         try:
@@ -536,11 +542,18 @@ class HealthHTTPHandler(BaseHTTPRequestHandler):
 
     def _send_json_response(self, data: dict[str, Any], status_code: int):
         """Send JSON response."""
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
         response_data = json.dumps(data, default=str, indent=2)
-        self.wfile.write(response_data.encode("utf-8"))
+        body = response_data.encode("utf-8")
+        try:
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            # Probe clients may disappear after a timeout. This is not a
+            # server failure and should not produce a secondary traceback.
+            pass
 
     def log_message(self, format, *args):
         """Override to suppress routine health check request logs."""
@@ -570,7 +583,9 @@ class HealthServer:
             def handler_factory(*args, **kwargs):
                 return HealthHTTPHandler(self.health_checker, *args, **kwargs)
 
-            self.server = HTTPServer(("0.0.0.0", self.port), handler_factory)
+            self.server = ThreadingHTTPServer(("0.0.0.0", self.port), handler_factory)
+            self.server.daemon_threads = True
+            self.server.block_on_close = False
 
             # Start server in background thread
             self.server_thread = threading.Thread(

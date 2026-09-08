@@ -170,8 +170,16 @@ class TestFleet:
             f.schedule_restart(0, uptime=0.1)
         assert math.isinf(f.freshness())
 
+    def test_freshness_is_inf_until_each_child_reports_dependency_progress(self):
+        import math
+
+        f = _Fleet(2)
+        f._heartbeats[0] = time.time()
+        assert math.isinf(f.freshness())
+
     def test_freshness_is_oldest_age_when_healthy(self):
         f = _Fleet(2)
+        f._heartbeats[0] = time.time()  # slot 0 completed a successful read
         f._heartbeats[1] = time.time() - 100
         assert 99 < f.freshness() < 102
 

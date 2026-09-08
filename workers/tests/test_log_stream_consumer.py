@@ -219,6 +219,7 @@ class TestRedisStreamHealth:
         assert health.seconds_since_last_success() > 100_000
         assert health.status() == {
             "queue": "log_stream_queue",
+            "redis_poll_ready": False,
             "redis_poll_failures": 0,
         }
 
@@ -227,6 +228,7 @@ class TestRedisStreamHealth:
         health.mark_success()
 
         assert health.seconds_since_last_success() < 1
+        assert health.status()["redis_poll_ready"] is True
 
     def test_failures_do_not_refresh_the_success_timestamp(self, consumer):
         health = consumer._RedisStreamHealth("log_stream_queue")
@@ -247,3 +249,19 @@ class TestRedisStreamHealth:
         monkeypatch.setenv("LOG_STREAM_CONSUMER_HEALTH_PORT", "not-a-port")
         with pytest.raises(ValueError, match="LOG_STREAM_CONSUMER_HEALTH_PORT"):
             consumer._health_port_from_env()
+
+        monkeypatch.setenv("LOG_STREAM_CONSUMER_HEALTH_PORT", "0")
+        with pytest.raises(ValueError, match="between 1 and 65535"):
+            consumer._health_port_from_env()
+
+    @pytest.mark.parametrize("value", ["0", "-1", "not-a-timeout"])
+    def test_block_timeout_is_positive_and_named(self, consumer, monkeypatch, value):
+        monkeypatch.setenv("LOG_STREAM_BLOCK_TIMEOUT", value)
+        with pytest.raises(ValueError, match="LOG_STREAM_BLOCK_TIMEOUT"):
+            consumer._positive_int_env("LOG_STREAM_BLOCK_TIMEOUT", 5)
+
+    @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+    def test_health_stale_bound_is_finite(self, consumer, monkeypatch, value):
+        monkeypatch.setenv("LOG_STREAM_CONSUMER_HEALTH_STALE_SECONDS", value)
+        with pytest.raises(ValueError, match="must be positive"):
+            consumer._health_stale_seconds()

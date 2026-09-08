@@ -1185,6 +1185,7 @@ class TestLivenessServer:
         reaper = PgReaper(
             _FakeLease(acquires=False), interval_seconds=0.01, sweep_conn=object()
         )
+        reaper.tick()  # readiness requires one completed lease operation
         server = self._server(reaper)
         try:
             status, body = _http_get(server)

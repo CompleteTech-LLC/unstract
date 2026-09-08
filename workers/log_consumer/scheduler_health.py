@@ -10,12 +10,13 @@ last success, or when either success is stale. A GET never invokes either task.
 from __future__ import annotations
 
 import json
+import math
 import os
 import signal
 import sys
 import time
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -68,12 +69,22 @@ def evaluate_state(
     parent_alive: Callable[[int], bool] = _parent_is_scheduler,
 ) -> SchedulerHealth:
     """Evaluate scheduler task freshness without executing application work."""
-    if stale_after <= 0:
+    if not math.isfinite(stale_after) or stale_after <= 0:
         raise ValueError("stale_after must be positive")
     if state is None:
         return SchedulerHealth("unhealthy", "scheduler state unavailable", {})
 
     current_time = time.time() if now is None else now
+    try:
+        current_time = float(current_time)
+    except (TypeError, ValueError):
+        return SchedulerHealth(
+            "unhealthy", "scheduler evaluation time is invalid", {}
+        )
+    if not math.isfinite(current_time):
+        return SchedulerHealth(
+            "unhealthy", "scheduler evaluation time is invalid", {}
+        )
     try:
         parent_pid = int(state["parent_pid"])
     except (KeyError, TypeError, ValueError):
@@ -102,20 +113,42 @@ def evaluate_state(
             )
         try:
             success_time = float(success_value)
-            ages[task_name] = max(0.0, current_time - success_time)
         except (TypeError, ValueError):
             return SchedulerHealth(
                 "unhealthy",
                 f"{task_name} task success timestamp is invalid",
                 {"task": task_name},
             )
+        if not math.isfinite(success_time):
+            return SchedulerHealth(
+                "unhealthy",
+                f"{task_name} task success timestamp is invalid",
+                {"task": task_name},
+            )
+        if success_time > current_time:
+            return SchedulerHealth(
+                "unhealthy",
+                f"{task_name} task success timestamp is in the future",
+                {"task": task_name},
+            )
+        ages[task_name] = current_time - success_time
         try:
-            if failure_value is not None and float(failure_value) > success_time:
-                return SchedulerHealth(
-                    "unhealthy",
-                    f"{task_name} task failed after its last success",
-                    {"task": task_name, "age_seconds": round(ages[task_name], 3)},
-                )
+            if failure_value is not None:
+                failure_time = float(failure_value)
+                if not math.isfinite(failure_time):
+                    raise ValueError
+                if failure_time > current_time:
+                    return SchedulerHealth(
+                        "unhealthy",
+                        f"{task_name} task failure timestamp is in the future",
+                        {"task": task_name},
+                    )
+                if failure_time > success_time:
+                    return SchedulerHealth(
+                        "unhealthy",
+                        f"{task_name} task failed after its last success",
+                        {"task": task_name, "age_seconds": round(ages[task_name], 3)},
+                    )
         except (TypeError, ValueError):
             return SchedulerHealth(
                 "unhealthy",
@@ -157,10 +190,19 @@ def serve(
     """Serve the scheduler probe until the shell parent terminates this process."""
 
     class Handler(BaseHTTPRequestHandler):
+        def setup(self) -> None:
+            super().setup()
+            # A health client that connects and never finishes its request must
+            # not pin a server thread indefinitely.
+            self.connection.settimeout(2.0)
+
         def do_GET(self) -> None:
             if urlsplit(self.path).path not in {"/health", "/healthz", "/livez"}:
-                self.send_response(404)
-                self.end_headers()
+                try:
+                    self.send_response(404)
+                    self.end_headers()
+                except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                    pass
                 return
             state = read_state(state_path)
             result = evaluate_state(
@@ -179,19 +221,22 @@ def serve(
                 },
                 separators=(",", ":"),
             ).encode("utf-8")
-            self.send_response(result.http_status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
             try:
+                self.send_response(result.http_status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
                 self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 pass
 
         def log_message(self, *_: object) -> None:
             pass
 
-    server = HTTPServer(("0.0.0.0", port), Handler)
+    port = _positive_port(str(port), "LOG_HISTORY_SCHEDULER_HEALTH_PORT")
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    server.daemon_threads = True
+    server.block_on_close = False
 
     def _stop(_signum: int, _frame: object) -> None:
         raise SystemExit(0)
@@ -209,13 +254,27 @@ def _positive_float(raw: str, name: str) -> float:
         value = float(raw)
     except ValueError as exc:
         raise ValueError(f"{name} must be numeric") from exc
-    if value <= 0:
+    if not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be positive")
     return value
 
 
+def _positive_port(raw: str, name: str) -> int:
+    """Parse a concrete listening port; zero is not a deployable health port."""
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer port") from exc
+    if not 1 <= value <= 65535:
+        raise ValueError(f"{name} must be between 1 and 65535")
+    return value
+
+
 def main() -> None:
-    port = int(os.environ["LOG_HISTORY_SCHEDULER_HEALTH_PORT"])
+    port = _positive_port(
+        os.environ["LOG_HISTORY_SCHEDULER_HEALTH_PORT"],
+        "LOG_HISTORY_SCHEDULER_HEALTH_PORT",
+    )
     state_path = os.getenv(
         "LOG_HISTORY_SCHEDULER_HEALTH_STATE", "/tmp/log-history-scheduler-health.json"
     )

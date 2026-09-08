@@ -143,15 +143,15 @@ class _Fleet:
 
     def __init__(self, concurrency: int) -> None:
         self._n = concurrency
-        # Shared, fork-inherited heartbeat slots (one last-poll wall-time per
-        # child). lock=False is safe: a slot is written either by the parent
-        # (seed, at construction, while no child owns it) OR by that child's
-        # heartbeat thread — never concurrently — and only read by the parent, so
-        # a torn double read just yields one stale sample that self-corrects.
+        # Shared, fork-inherited heartbeat slots (one last-success wall-time per
+        # child). Zero means that no child has completed a dependency read yet;
+        # the probe must stay unhealthy until each live slot earns a real sample.
+        # lock=False is safe: a slot is written by its child heartbeat thread and
+        # only read by the parent, so a torn double read just yields one stale
+        # sample that self-corrects.
         self._heartbeats = multiprocessing.Array("d", concurrency, lock=False)
-        now = time.time()
         for i in range(concurrency):
-            self._heartbeats[i] = now
+            self._heartbeats[i] = 0.0
         self._pids: dict[int, int] = {}
         self._last_fork: dict[int, float] = {}
         self._consecutive_crashes: dict[int, int] = {}
@@ -233,7 +233,13 @@ class _Fleet:
 
     def oldest_age(self) -> float:
         now = time.time()
-        return max((now - hb for hb in self._heartbeats), default=0.0)
+        ages = (
+            float("inf")
+            if not math.isfinite(hb) or hb <= 0
+            else max(0.0, now - hb)
+            for hb in self._heartbeats
+        )
+        return max(ages, default=0.0)
 
     def freshness(self) -> float:
         """Liveness verdict source: a crash-looping fleet is force-stale (``inf``)
@@ -261,15 +267,15 @@ def _run_child(slot: int, heartbeats) -> None:  # noqa: ANN001 (ctypes array)
     consumer = build_consumer_from_env()
 
     def _publish_heartbeat() -> None:
-        # last-poll wall-time = now − (seconds since last poll). Frozen while a
-        # task runs (the consumer stamps its heartbeat at the top of poll_once),
-        # so a child stuck on a too-long task goes stale exactly as the single
-        # consumer does. Guarded so a transient error (e.g. teardown during
-        # shutdown) logs loudly and the loop continues instead of dying silently
-        # and false-staling a healthy child.
+        # Dependency-aware wall-time. A child that keeps looping while every PG
+        # read fails publishes 0, which the parent treats as infinitely stale;
+        # a task stuck after a poll still ages from the poll start.
         while True:
             try:
-                heartbeats[slot] = time.time() - consumer.seconds_since_last_poll()
+                age = consumer.seconds_since_dependency_progress()
+                heartbeats[slot] = (
+                    0.0 if not math.isfinite(age) else time.time() - age
+                )
             except Exception:
                 logger.exception(
                     "PG-queue consumer: heartbeat publish failed for slot=%s", slot

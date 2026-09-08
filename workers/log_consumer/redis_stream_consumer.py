@@ -27,6 +27,7 @@ would duplicate log lines on every start.
 from __future__ import annotations
 
 import json
+import math
 import os
 import signal
 import socket
@@ -52,9 +53,25 @@ app, config = WorkerBuilder.build_celery_app(WorkerType.LOG_CONSUMER)
 from log_consumer.tasks import logs_consumer  # noqa: E402
 
 _QUEUE_NAME = os.getenv("LOG_STREAM_QUEUE_NAME", "log_stream_queue")
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    """Read a positive integer setting and fail with its deployment name."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid {name}={raw!r}: {exc}") from exc
+    if value <= 0:
+        raise ValueError(f"Invalid {name}={value}: value must be positive")
+    return value
+
+
 # BLMOVE blocks up to this long before returning None, which is the loop's only chance to
 # notice a shutdown signal. Keep it well under the pod's terminationGracePeriodSeconds.
-_BLOCK_TIMEOUT_SECONDS = int(os.getenv("LOG_STREAM_BLOCK_TIMEOUT", "5"))
+_BLOCK_TIMEOUT_SECONDS = _positive_int_env("LOG_STREAM_BLOCK_TIMEOUT", 5)
 # redis-py enforces ``socket_timeout`` on the BLMOVE read itself, so it MUST exceed the
 # server-side block or every call aborts mid-block with ``redis.TimeoutError``.
 # ``create_redis_client`` defaults it to 5s — exactly ``_BLOCK_TIMEOUT_SECONDS`` — and the
@@ -96,17 +113,20 @@ class _RedisStreamHealth:
     def seconds_since_last_success(self) -> float:
         with self._lock:
             last_success = self._last_success
-        # A finite, large value keeps the JSON response valid before the first
-        # completed read while making the probe unambiguously stale.
-        return 1_000_000.0 if last_success is None else max(
+        # No completed Redis round trip means readiness has not been established.
+        # Keep this non-finite so the shared probe cannot turn green merely
+        # because an operator chose a very large stale bound.
+        return float("inf") if last_success is None else max(
             0.0, time.monotonic() - last_success
         )
 
     def status(self) -> dict[str, object]:
         with self._lock:
+            ready = self._last_success is not None
             failures = self._poll_failures
         return {
             "queue": self._queue_name,
+            "redis_poll_ready": ready,
             "redis_poll_failures": failures,
         }
 
@@ -122,8 +142,10 @@ def _health_port_from_env() -> int | None:
         raise ValueError(
             f"Invalid LOG_STREAM_CONSUMER_HEALTH_PORT={raw!r}: {exc}"
         ) from exc
-    if not 0 <= port <= 65535:
-        raise ValueError(f"LOG_STREAM_CONSUMER_HEALTH_PORT={port} out of range")
+    if not 1 <= port <= 65535:
+        raise ValueError(
+            f"LOG_STREAM_CONSUMER_HEALTH_PORT={port} must be between 1 and 65535"
+        )
     return port
 
 
@@ -139,7 +161,7 @@ def _health_stale_seconds() -> float:
         raise ValueError(
             f"Invalid LOG_STREAM_CONSUMER_HEALTH_STALE_SECONDS={raw!r}: {exc}"
         ) from exc
-    if stale_after <= 0:
+    if not math.isfinite(stale_after) or stale_after <= 0:
         raise ValueError(
             "LOG_STREAM_CONSUMER_HEALTH_STALE_SECONDS must be positive"
         )

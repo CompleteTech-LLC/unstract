@@ -7,6 +7,7 @@ It uses WorkerBuilder to ensure proper configuration including chord retry setti
 
 import importlib.util
 import logging
+import math
 import os
 import sys
 import threading
@@ -545,7 +546,7 @@ def _worker_health_stale_seconds() -> float:
         value = float(raw)
     except ValueError as exc:
         raise ValueError(f"WORKER_HEALTH_STALE_SECONDS={raw!r} is not numeric") from exc
-    if value <= 0:
+    if not math.isfinite(value) or value <= 0:
         raise ValueError(f"WORKER_HEALTH_STALE_SECONDS={value} must be positive")
     return value
 
