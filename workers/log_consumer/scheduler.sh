@@ -75,13 +75,17 @@ while true; do
 
     if [[ $((now - last_log_run)) -ge "${LOG_HISTORY_INTERVAL}" ]]; then
         run_count=$((run_count + 1))
-        run_task "process_log_history" "${LOG_HISTORY_CMD}" "${run_count}"
+        if run_task "process_log_history" "${LOG_HISTORY_CMD}" "${run_count}"; then
+            /app/.venv/bin/python -m log_consumer.heartbeat mark log-history
+        fi
         last_log_run="${now}"
     fi
 
     if [[ $((now - last_buffer_run)) -ge "${NOTIFICATION_BUFFER_INTERVAL}" ]]; then
         run_count=$((run_count + 1))
-        run_task "process_notification_buffer" "${BUFFER_FLUSH_CMD}" "${run_count}"
+        if run_task "process_notification_buffer" "${BUFFER_FLUSH_CMD}" "${run_count}"; then
+            /app/.venv/bin/python -m log_consumer.heartbeat mark notification-buffer
+        fi
         last_buffer_run="${now}"
     fi
 

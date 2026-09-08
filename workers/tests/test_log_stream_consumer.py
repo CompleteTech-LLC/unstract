@@ -58,6 +58,7 @@ def _load(monkeypatch):
             WorkerLogger=types.SimpleNamespace(setup=lambda _t: MagicMock()),
         ),
         "log_consumer": _mod("log_consumer"),
+        "log_consumer.heartbeat": _mod("log_consumer.heartbeat", mark=MagicMock()),
         "log_consumer.tasks": _mod("log_consumer.tasks", logs_consumer=logs_consumer),
     }
     for name, mod in stubs.items():
@@ -69,6 +70,7 @@ def _load(monkeypatch):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     mod._test_logs_consumer = logs_consumer
+    mod._test_heartbeat = stubs["log_consumer.heartbeat"].mark
     return mod
 
 
@@ -78,7 +80,9 @@ def consumer(monkeypatch):
 
 
 def _envelope(task="logs_consumer", **kwargs):
-    return json.dumps({"task": task, "kwargs": kwargs or {"event": "logs:c", "room": "c"}})
+    return json.dumps(
+        {"task": task, "kwargs": kwargs or {"event": "logs:c", "room": "c"}}
+    )
 
 
 class TestDispatch:
@@ -108,7 +112,12 @@ class TestAtLeastOnceDelivery:
         consumer._recover_in_flight(redis, "proc")
         assert redis.lmove.call_count == 3
         # Back to the HEAD of the source list, so recovered logs precede newer ones.
-        assert redis.lmove.call_args_list[0][0] == ("proc", "log_stream_queue", "RIGHT", "LEFT")
+        assert redis.lmove.call_args_list[0][0] == (
+            "proc",
+            "log_stream_queue",
+            "RIGHT",
+            "LEFT",
+        )
 
     def _one_shot_redis(self, consumer, raw):
         """A redis mock that yields exactly one envelope, then ends the loop.
@@ -142,6 +151,20 @@ class TestAtLeastOnceDelivery:
         # a crash, which is exactly the acks_late behaviour this replaces.
         assert order == ["handled", "lrem"]
         redis.lrem.assert_called_once_with("log_stream_queue:processing:pod-abc", 1, raw)
+        consumer._test_heartbeat.assert_called_with("log-stream")
+
+    def test_redis_failure_does_not_refresh_progress(self, consumer):
+        redis = MagicMock()
+        redis.lmove.return_value = None
+
+        def fail_poll(*_args):
+            consumer._shutdown = True
+            raise ConnectionError("Redis unavailable")
+
+        redis.blmove.side_effect = fail_poll
+        with patch.object(consumer, "create_redis_client", return_value=redis):
+            consumer.run()
+        consumer._test_heartbeat.assert_not_called()
 
     def test_a_poison_envelope_is_dropped_not_replayed_forever(self, consumer):
         raw = b"not-json"
@@ -186,9 +209,7 @@ class TestSocketTimeoutOutlivesTheBlock:
 
         redis.blmove.side_effect = _blmove
 
-        with patch.object(
-            consumer, "create_redis_client", return_value=redis
-        ) as factory:
+        with patch.object(consumer, "create_redis_client", return_value=redis) as factory:
             consumer.run()
 
         assert factory.call_args.kwargs["socket_timeout"] == (

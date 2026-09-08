@@ -2,6 +2,13 @@ services:
   db:
     image: "pgvector/pgvector:pg15"
     container_name: unstract-db
+    healthcheck:
+      # TCP avoids reporting the entrypoint's temporary Unix-socket server ready.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER:-postgres}\" -d \"$${POSTGRES_DB:-postgres}\""]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
     restart: unless-stopped
     # set shared memory limit when using docker-compose
     shm_size: 128mb
@@ -18,6 +25,11 @@ services:
   redis:
     image: "redis:7.2.3"
     container_name: unstract-redis
+    healthcheck:
+      test: ["CMD-SHELL", "test \"$$(redis-cli ping)\" = PONG"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     restart: unless-stopped
     # uncomment below command if persistance required.
     #command: redis-server --save 20 1 --loglevel warning --
@@ -31,6 +43,12 @@ services:
   minio:
     image: "minio/minio:latest"
     container_name: unstract-minio
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "5", "-o", "/dev/null", "http://127.0.0.1:9000/minio/health/ready"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
     hostname: minio
     restart: unless-stopped
     ports:
@@ -65,6 +83,12 @@ services:
     # The official v2 Traefik docker image
     image: traefik:v3.6.2
     container_name: unstract-proxy
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
     restart: unless-stopped
     # - Enables the web UI.
     # - Tells Traefik to use docker and file providers.
@@ -73,6 +97,7 @@ services:
     #   round-robin fashion. With multiple providers, services can be on multiple
     #   networks causing 504 Gateway Timeout.
     command: --api.insecure=true
+      --ping=true
       --accesslog=true --log.level=INFO
       --providers.docker=true --providers.docker.network=unstract-network
       --providers.file.filename=/proxy_overrides.yaml --providers.file.watch=true
@@ -122,6 +147,14 @@ services:
     # the 1.16 client calls endpoints the 1.8 server lacks and returns 404 with empty body.
     image: "qdrant/qdrant:v1.16.1"
     container_name: unstract-vector-db
+    healthcheck:
+      # This image ships bash but neither curl nor wget. Check the HTTP status,
+      # rather than accepting an open TCP socket or any /readyz response.
+      test: ["CMD", "bash", "-ec", "exec 3<>/dev/tcp/127.0.0.1/6333; printf 'GET /readyz HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3; read -r status <&3; [[ $$status == 'HTTP/1.0 200 '* || $$status == 'HTTP/1.1 200 '* ]]"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
     restart: unless-stopped
     ports:
       - "127.0.0.1:6333:6333"
@@ -154,7 +187,7 @@ services:
       # retaining a separate data directory and container.
       - ./essentials.env
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER:-postgres}\" -d \"$${POSTGRES_DB:-postgres}\""]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -167,6 +200,13 @@ services:
   weaviate:
     image: "docker.io/semitechnologies/weaviate:1.39.2"
     container_name: unstract-weaviate
+    healthcheck:
+      # The pinned Alpine image includes BusyBox wget; this is server readiness.
+      test: ["CMD", "wget", "-q", "-T", "5", "-O", "/dev/null", "http://127.0.0.1:8080/v1/.well-known/ready"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
     restart: unless-stopped
     command:
       - --host
@@ -272,6 +312,12 @@ services:
   rabbitmq:
     image: rabbitmq:4.1.0-management
     container_name: unstract-rabbitmq
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q check_running && rabbitmq-diagnostics -q check_port_connectivity"]
+      interval: 30s
+      timeout: 20s
+      start_period: 60s
+      retries: 3
     hostname: unstract-rabbit
     restart: unless-stopped
     env_file:

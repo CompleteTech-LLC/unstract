@@ -37,7 +37,6 @@ from typing import Any
 from shared.enums.worker_enums import WorkerType
 from shared.infrastructure.config.builder import WorkerBuilder
 from shared.infrastructure.logging import WorkerLogger
-
 from unstract.core.cache.redis_client import create_redis_client
 from unstract.core.constants import LogProcessingTask
 
@@ -111,6 +110,8 @@ def _dispatch(raw: bytes | str) -> None:
 
 
 def run() -> int:
+    from log_consumer.heartbeat import mark
+
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
@@ -141,6 +142,7 @@ def run() -> int:
             continue
 
         if raw is None:  # timeout, no work — loop so shutdown can be observed
+            mark("log-stream")
             continue
 
         try:
@@ -154,6 +156,7 @@ def run() -> int:
             # Remove exactly one copy, whether it succeeded or was discarded — leaving it
             # parked would have it re-queued on the next restart and replayed forever.
             redis_client.lrem(processing, 1, raw)
+            mark("log-stream")
 
     logger.info("Log stream consumer stopped")
     return 0

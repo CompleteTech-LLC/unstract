@@ -1,0 +1,14 @@
+[Unit]
+Description=Start the deployed Unstract rootless Compose stack in dependency order
+Requires=podman.socket
+After=podman.socket
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=%h/.config/unstract/compose.env
+ExecStart=/bin/bash %h/.local/libexec/unstract/start-rootless-stack.sh
+TimeoutStartSec=700
+
+[Install]
+WantedBy=default.target
