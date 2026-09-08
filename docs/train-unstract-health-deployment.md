@@ -127,9 +127,13 @@ and are not mistaken for active jobs.
 
 Use the live dirty Compose files plus the staged overlays. This preserves the
 local embedding includes, port changes, env files, named volumes, bind mounts,
-container names, and network ownership:
+container names, and network ownership. The live `docker/.env` derives
+`TOOL_REGISTRY_CONFIG_SRC_PATH` from `PWD`, so preserve the Train Compose
+working-directory value while the guard still uses the project root for
+Compose:
 
 ```sh
+export PWD=/home/completetrain/etl.home.complete.tech/docker
 python3 docker/scripts/train_health_deployment_guard.py preflight \
   --baseline /run/user/1000/unstract-goal09/baseline.json \
   --project-dir /home/completetrain/etl.home.complete.tech \
@@ -137,6 +141,7 @@ python3 docker/scripts/train_health_deployment_guard.py preflight \
   --candidate-lock /run/user/1000/unstract-goal09/candidate-lock.json \
   --probe-source /run/user/1000/unstract-goal09/source/docker/healthchecks/unstract-services.sh \
   --compose-file docker/docker-compose.yaml \
+  --compose-file docker/compose.train.yaml \
   --compose-file /run/user/1000/unstract-goal09/source/docker/compose.train.worker-healthchecks.yaml \
   --compose-file /run/user/1000/unstract-goal09/source/docker/compose.train.healthchecks.yaml \
   --operation-timeout 1200
@@ -167,6 +172,7 @@ the DB advisory lock before each batch and immediately rechecks source hashes,
 untargeted container identities, queue quiescence, and candidate image IDs.
 
 ```sh
+export PWD=/home/completetrain/etl.home.complete.tech/docker
 python3 docker/scripts/train_health_deployment_guard.py apply \
   --confirm APPLY_UNSTRACT_HEALTH \
   --backup-dir /run/user/1000/unstract-goal09/backup \
@@ -176,6 +182,7 @@ python3 docker/scripts/train_health_deployment_guard.py apply \
   --candidate-lock /run/user/1000/unstract-goal09/candidate-lock.json \
   --probe-source /run/user/1000/unstract-goal09/source/docker/healthchecks/unstract-services.sh \
   --compose-file docker/docker-compose.yaml \
+  --compose-file docker/compose.train.yaml \
   --compose-file /run/user/1000/unstract-goal09/source/docker/compose.train.worker-healthchecks.yaml \
   --compose-file /run/user/1000/unstract-goal09/source/docker/compose.train.healthchecks.yaml \
   --operation-timeout 2400
