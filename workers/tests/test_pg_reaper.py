@@ -1195,6 +1195,8 @@ class TestLivenessServer:
         assert body["status"] == "healthy"
         assert body["check"] == "pg_reaper_tick"
         assert body["is_leader"] is False
+        assert "seconds_since_dependency_progress" in body
+        assert "seconds_since_last_tick" in body
 
     def test_stale_returns_503(self):
         reaper = PgReaper(_FakeLease(), interval_seconds=0.01, sweep_conn=object())

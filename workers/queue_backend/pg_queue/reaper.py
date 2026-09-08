@@ -1157,7 +1157,11 @@ class PgReaper:
         # sweep gate: first leader tick refreshes immediately).
         self._last_gauge_refresh_monotonic: float | None = None
         self._metrics = ReaperMetrics(
-            heartbeat_fn=self.seconds_since_last_tick,
+            # Export the same dependency-aware age used by /health. The loop
+            # start timestamp remains useful for diagnostics, but publishing it
+            # here would let /metrics report fresh while /health is stale after
+            # repeated lease/DB failures.
+            heartbeat_fn=self.seconds_since_dependency_progress,
             is_leader_fn=lambda: self._is_leader,
         )
 
@@ -1636,9 +1640,10 @@ _DEFAULT_HEALTH_STALE_SECONDS = 30.0
 class ReaperLivenessServer(_BaseLivenessServer):
     """Reaper tick-loop liveness — a thin wrapper over the shared
     :class:`queue_backend.pg_queue.liveness.LivenessServer`, bound to the reaper's
-    heartbeat (``seconds_since_last_tick``) and surfacing ``is_leader`` (which pod
-    holds the lease — informational; the 200/503 verdict is purely the heartbeat,
-    so a standby is healthy).
+    dependency heartbeat (``seconds_since_dependency_progress``) and surfacing
+    ``is_leader`` (which pod holds the lease — informational; the 200/503 verdict
+    is based on completed lease/recovery progress, so a standby is healthy after a
+    successful lease operation).
     """
 
     def __init__(self, reaper: PgReaper, *, port: int, stale_after: float) -> None:
@@ -1647,9 +1652,12 @@ class ReaperLivenessServer(_BaseLivenessServer):
             stale_after=stale_after,
             port=port,
             check_name="pg_reaper_tick",
-            age_key="seconds_since_last_tick",
+            age_key="seconds_since_dependency_progress",
             extra_status_fn=lambda: {
                 "is_leader": reaper.is_leader,
+                "seconds_since_last_tick": round(
+                    reaper.seconds_since_last_tick(), 3
+                ),
                 **reaper.dependency_health_status(),
             },
             metrics_fn=reaper.metrics.render,

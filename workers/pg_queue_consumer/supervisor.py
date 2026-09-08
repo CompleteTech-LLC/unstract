@@ -173,18 +173,25 @@ class _Fleet:
             raise IndexError(f"slot {slot} out of range [0, {self._n})")
 
     def record_fork(self, slot: int, pid: int) -> None:
-        """Mark ``slot`` alive under ``pid``; clears any pending restart. Note the
-        heartbeat is deliberately NOT reseeded here — a re-forked child must earn
-        freshness by actually polling, so a crash-looping slot ages instead of
-        looking perpetually fresh.
+        """Mark ``slot`` alive under ``pid``; clears any pending restart.
+
+        A replacement child must earn readiness with its own completed
+        dependency read. Reset the shared timestamp here because a child can be
+        forked after a prior child left a fresh sample in the same slot.
         """
         self._validate(slot)
         self._pids[slot] = pid
         self._last_fork[slot] = time.monotonic()
+        self._heartbeats[slot] = 0.0
         self._restart_due.pop(slot, None)
 
     def reap(self, slot: int) -> float:
         """Drop the slot's pid + last-fork together; return the child's uptime (s)."""
+        self._validate(slot)
+        # Keep the slot stale during the gap between reaping the old process and
+        # recording its replacement. This also prevents a failed fork from
+        # inheriting the old child's dependency-ready timestamp.
+        self._heartbeats[slot] = 0.0
         forked_at = self._last_fork.pop(slot, time.monotonic())
         self._pids.pop(slot, None)
         return time.monotonic() - forked_at
