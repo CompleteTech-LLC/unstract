@@ -237,6 +237,95 @@ bounded_curl() {
     bounded_curl_result_file=$bounded_curl_body_file
 }
 
+# Native command clients can also return an unexpectedly large response before
+# exiting.  Keep their stdout in a bounded FIFO capture and apply the same
+# outer deadline used by HTTP clients.  This is used for the Redis and
+# PostgreSQL probes, whose contracts only need a tiny scalar response.
+bounded_exec_cleanup() {
+    for bounded_exec_cleanup_pid in \
+        "${bounded_exec_client_pid-}" \
+        "${bounded_exec_reader_pid-}"; do
+        if [ -n "$bounded_exec_cleanup_pid" ]; then
+            kill "$bounded_exec_cleanup_pid" >/dev/null 2>&1 || :
+        fi
+    done
+    for bounded_exec_cleanup_pid in \
+        "${bounded_exec_client_pid-}" \
+        "${bounded_exec_reader_pid-}"; do
+        if [ -n "$bounded_exec_cleanup_pid" ]; then
+            wait "$bounded_exec_cleanup_pid" >/dev/null 2>&1 || :
+        fi
+    done
+    for bounded_exec_cleanup_file in \
+        "${bounded_exec_body_file-}" \
+        "${bounded_exec_status_file-}" \
+        "${bounded_exec_body_fifo-}"; do
+        if [ -n "$bounded_exec_cleanup_file" ]; then
+            "$rm_bin" -f "$bounded_exec_cleanup_file" >/dev/null 2>&1 || :
+        fi
+    done
+}
+
+bounded_exec_finish() {
+    trap - HUP INT TERM EXIT
+    bounded_exec_cleanup
+}
+
+bounded_exec() {
+    bounded_exec_limit=$1
+    shift
+    bounded_exec_result_file=
+    bounded_exec_body_file=
+    bounded_exec_status_file=
+    bounded_exec_body_fifo=
+    bounded_exec_client_pid=
+    bounded_exec_reader_pid=
+    trap bounded_exec_cleanup HUP INT TERM EXIT
+
+    bounded_exec_body_file=$(
+        "$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-body.XXXXXX" 2>/dev/null
+    ) || return 1
+    bounded_exec_status_file=$(
+        "$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-status.XXXXXX" 2>/dev/null
+    ) || return 1
+    bounded_exec_body_fifo=$(
+        "$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-body-fifo.XXXXXX" 2>/dev/null
+    ) || return 1
+    "$rm_bin" -f "$bounded_exec_body_fifo" >/dev/null 2>&1 || return 1
+    "$mkfifo_bin" "$bounded_exec_body_fifo" >/dev/null 2>&1 || return 1
+    "$head_bin" -c "$((bounded_exec_limit + 1))" <"$bounded_exec_body_fifo" \
+        >"$bounded_exec_body_file" &
+    bounded_exec_reader_pid=$!
+    "$timeout_bin" "$timeout_seconds" "$@" >"$bounded_exec_body_fifo" 2>/dev/null &
+    bounded_exec_client_pid=$!
+    if wait "$bounded_exec_client_pid"; then
+        bounded_exec_status=0
+    else
+        bounded_exec_status=$?
+    fi
+    bounded_exec_client_pid=
+    printf '%s\n' "$bounded_exec_status" >"$bounded_exec_status_file" || return 1
+    if wait "$bounded_exec_reader_pid"; then
+        bounded_exec_reader_pid=
+    else
+        bounded_exec_reader_status=$?
+        bounded_exec_reader_pid=
+        return "$bounded_exec_reader_status"
+    fi
+    bounded_exec_status=$(
+        "$head_bin" -c 16 "$bounded_exec_status_file" 2>/dev/null
+    ) || return 1
+    case "$bounded_exec_status" in
+        0) ;;
+        *) return 1 ;;
+    esac
+    bounded_exec_body_size=$(
+        "$wc_bin" -c <"$bounded_exec_body_file"
+    ) || return 1
+    [ "$bounded_exec_body_size" -le "$bounded_exec_limit" ] || return 1
+    bounded_exec_result_file=$bounded_exec_body_file
+}
+
 probe_weaviate() {
     bounded_wget "$weaviate_url" 65536 2>/dev/null || fail
     body=$("$head_bin" -c 65536 "$bounded_wget_result_file") || {
@@ -281,7 +370,12 @@ probe_vector_db() {
 probe_redis() {
     # PING is read-only and is authenticated automatically when the image's
     # REDISCLI_AUTH/ACL environment is supplied by Compose.
-    response=$("$timeout_bin" "$timeout_seconds" "$redis_cli_bin" --raw ping 2>/dev/null) || fail
+    bounded_exec 16 "$redis_cli_bin" --raw ping || fail
+    response=$("$head_bin" -c 16 "$bounded_exec_result_file") || {
+        bounded_exec_finish
+        fail
+    }
+    bounded_exec_finish
     [ "$response" = PONG ] || fail
 }
 
@@ -315,14 +409,19 @@ probe_db() {
     db_user=${POSTGRES_USER:-postgres}
     db_name=${POSTGRES_DB:-postgres}
     "$timeout_bin" "$timeout_seconds" "$pg_isready_bin" -t "$timeout_seconds" -U "$db_user" -d "$db_name" >/dev/null 2>&1 || fail
-    result=$("$timeout_bin" "$timeout_seconds" "$psql_bin" -XAtqc 'SELECT 1' -U "$db_user" -d "$db_name" 2>/dev/null) || fail
+    bounded_exec 16 "$psql_bin" -XAtqc 'SELECT 1' -U "$db_user" -d "$db_name" || fail
+    result=$("$head_bin" -c 16 "$bounded_exec_result_file") || {
+        bounded_exec_finish
+        fail
+    }
+    bounded_exec_finish
     [ "$result" = 1 ] || fail
 }
 
 probe_python_body() {
     url=$1
     expected=$2
-    "$python_bin" -c '
+    "$timeout_bin" "$timeout_seconds" "$python_bin" -c '
 import sys
 import urllib.request
 
@@ -349,7 +448,7 @@ probe_platform() {
 }
 
 probe_backend() {
-    "$python_bin" -c '
+    "$timeout_bin" "$timeout_seconds" "$python_bin" -c '
 import json
 import os
 import sys

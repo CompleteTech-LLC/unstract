@@ -95,6 +95,29 @@ def test_timeout_configuration_is_capped(tmp_path: Path) -> None:
     assert timeout_record.read_text(encoding="utf-8") == "30"
 
 
+def test_redis_response_and_total_deadline_are_bounded(tmp_path: Path) -> None:
+    redis_cli = write_fake(
+        tmp_path,
+        "redis-cli",
+        """
+case "${FAKE_MODE:-ok}" in
+  big) i=0; while [ "$i" -lt 70000 ]; do printf x; i=$((i + 1)); done ;;
+  slow) sleep 5 ;;
+  *) printf 'PONG\n' ;;
+esac
+""",
+    )
+    base = {
+        "REDIS_CLI_BIN": str(redis_cli),
+        "HEALTHCHECK_TIMEOUT_SECONDS": "1",
+    }
+    assert run_probe("redis", base).returncode == 0
+    assert run_probe("redis", {**base, "FAKE_MODE": "big"}).returncode != 0
+    started = time.monotonic()
+    assert run_probe("redis", {**base, "FAKE_MODE": "slow"}).returncode != 0
+    assert time.monotonic() - started < 4
+
+
 def test_qdrant_host_and_port_are_data_not_shell_source(tmp_path: Path) -> None:
     marker = tmp_path / "injected"
     result = run_probe(
@@ -351,6 +374,33 @@ def test_postgres_probe_requires_read_only_query_result(tmp_path: Path) -> None:
     assert run_probe("db", {**env, "FAKE_RESULT": "0"}).returncode != 0
 
 
+def test_postgres_response_and_total_deadline_are_bounded(tmp_path: Path) -> None:
+    pg_isready = write_fake(tmp_path, "pg_isready", "exit 0")
+    psql = write_fake(
+        tmp_path,
+        "psql",
+        """
+case "${FAKE_MODE:-ok}" in
+  big) i=0; while [ "$i" -lt 70000 ]; do printf x; i=$((i + 1)); done ;;
+  slow) sleep 5 ;;
+  *) printf '1\n' ;;
+esac
+""",
+    )
+    base = {
+        "PG_ISREADY_BIN": str(pg_isready),
+        "PSQL_BIN": str(psql),
+        "POSTGRES_USER": "probe-user",
+        "POSTGRES_DB": "probe-db",
+        "HEALTHCHECK_TIMEOUT_SECONDS": "1",
+    }
+    assert run_probe("db", base).returncode == 0
+    assert run_probe("db", {**base, "FAKE_MODE": "big"}).returncode != 0
+    started = time.monotonic()
+    assert run_probe("db", {**base, "FAKE_MODE": "slow"}).returncode != 0
+    assert time.monotonic() - started < 4
+
+
 class _AppHandler(http.server.BaseHTTPRequestHandler):
     mode = "healthy"
 
@@ -426,3 +476,17 @@ def test_application_probe_rejects_wrong_body(app_server: tuple[_AppServer, str]
         assert result.returncode != 0
     finally:
         _AppHandler.mode = "healthy"
+
+
+def test_python_probe_has_outer_deadline(tmp_path: Path) -> None:
+    python_bin = write_fake(tmp_path, "python", "sleep 5")
+    started = time.monotonic()
+    result = run_probe(
+        "x2text-service",
+        {
+            "PYTHON_BIN": str(python_bin),
+            "HEALTHCHECK_TIMEOUT_SECONDS": "1",
+        },
+    )
+    assert result.returncode != 0
+    assert time.monotonic() - started < 4
