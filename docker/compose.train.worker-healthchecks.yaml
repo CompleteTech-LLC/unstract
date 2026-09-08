@@ -1,0 +1,97 @@
+# Worker and runner health coverage overlay for the dirty Train checkout.
+#
+# Apply this after docker/compose.train.yaml and before the core service
+# overlay.  It contains the same checks committed in docker-compose.yaml, so a
+# coordinator can stage the health configuration without checking out over
+# Train's local Compose and embedding changes.
+
+x-worker-healthcheck: &worker_healthcheck
+  interval: 30s
+  timeout: 5s
+  retries: 3
+  start_period: 30s
+
+services:
+  runner:
+    healthcheck:
+      <<: *worker_healthcheck
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:5002/v1/api/health"]
+
+  worker-log-history-scheduler-v2:
+    environment:
+      LOG_HISTORY_SCHEDULER_HEALTH_PORT: "8092"
+      LOG_HISTORY_SCHEDULER_HEALTH_STALE_SECONDS: ${LOG_HISTORY_SCHEDULER_HEALTH_STALE_SECONDS:-120}
+    healthcheck:
+      <<: *worker_healthcheck
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8092/health"]
+
+  worker-pg-orchestrator-api:
+    healthcheck:
+      <<: *worker_healthcheck
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8090/health"]
+
+  worker-pg-orchestrator-general:
+    healthcheck:
+      <<: *worker_healthcheck
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8090/health"]
+
+  worker-pg-fileproc:
+    healthcheck:
+      <<: *worker_healthcheck
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8090/health"]
+
+  worker-pg-callback:
+    healthcheck:
+      <<: *worker_healthcheck
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8090/health"]
+
+  worker-pg-scheduler:
+    healthcheck:
+      <<: *worker_healthcheck
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8090/health"]
+
+  worker-pg-metrics:
+    healthcheck:
+      <<: *worker_healthcheck
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8090/health"]
+
+  worker-log-stream-consumer:
+    environment:
+      LOG_STREAM_CONSUMER_HEALTH_PORT: "8091"
+      LOG_STREAM_CONSUMER_HEALTH_STALE_SECONDS: ${LOG_STREAM_CONSUMER_HEALTH_STALE_SECONDS:-15}
+    healthcheck:
+      <<: *worker_healthcheck
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8091/health"]
+
+  worker-pg-executor:
+    healthcheck:
+      <<: *worker_healthcheck
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8090/health"]
+
+  worker-pg-ide-callback:
+    healthcheck:
+      <<: *worker_healthcheck
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8090/health"]
+
+  worker-pg-notification:
+    healthcheck:
+      <<: *worker_healthcheck
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8090/health"]
+
+  worker-pg-reaper:
+    healthcheck:
+      <<: *worker_healthcheck
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8086/health"]
