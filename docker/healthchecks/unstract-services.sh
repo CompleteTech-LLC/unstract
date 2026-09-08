@@ -13,6 +13,7 @@ head_bin=${HEAD_BIN:-head}
 wc_bin=${WC_BIN:-wc}
 rm_bin=${RM_BIN:-rm}
 mktemp_bin=${MKTEMP_BIN:-mktemp}
+mkfifo_bin=${MKFIFO_BIN:-mkfifo}
 
 case "$timeout_seconds" in
     ''|*[!0-9]*|0*)
@@ -61,133 +62,188 @@ rabbitmq_diagnostics_bin=${RABBITMQ_DIAGNOSTICS_BIN:-rabbitmq-diagnostics}
 pg_isready_bin=${PG_ISREADY_BIN:-pg_isready}
 psql_bin=${PSQL_BIN:-psql}
 
-# BusyBox wget has no max-filesize or max-redirect option. Stream through a
-# bounded head process, while capturing response headers so redirects can be
+# BusyBox wget has no max-filesize or max-redirect option. Stream through
+# bounded head processes, while capturing response headers so redirects can be
 # rejected even when the client follows them internally. The status file keeps
 # the upstream client status visible without relying on non-POSIX pipefail.
+bounded_wget_cleanup() {
+    for bounded_wget_cleanup_pid in \
+        "${bounded_wget_client_pid-}" \
+        "${bounded_wget_body_reader_pid-}" \
+        "${bounded_wget_header_reader_pid-}"; do
+        if [ -n "$bounded_wget_cleanup_pid" ]; then
+            kill "$bounded_wget_cleanup_pid" >/dev/null 2>&1 || :
+        fi
+    done
+    for bounded_wget_cleanup_pid in \
+        "${bounded_wget_client_pid-}" \
+        "${bounded_wget_body_reader_pid-}" \
+        "${bounded_wget_header_reader_pid-}"; do
+        if [ -n "$bounded_wget_cleanup_pid" ]; then
+            wait "$bounded_wget_cleanup_pid" >/dev/null 2>&1 || :
+        fi
+    done
+    for bounded_wget_cleanup_file in \
+        "${bounded_wget_headers-}" \
+        "${bounded_wget_body_file-}" \
+        "${bounded_wget_status_file-}" \
+        "${bounded_wget_body_fifo-}" \
+        "${bounded_wget_header_fifo-}"; do
+        if [ -n "$bounded_wget_cleanup_file" ]; then
+            "$rm_bin" -f "$bounded_wget_cleanup_file" >/dev/null 2>&1 || :
+        fi
+    done
+}
+
+bounded_wget_finish() {
+    trap - HUP INT TERM EXIT
+    bounded_wget_cleanup
+}
+
 bounded_wget() {
     bounded_wget_url=$1
     bounded_wget_limit=$2
+    bounded_wget_result_file=
+    bounded_wget_headers=
+    bounded_wget_body_file=
+    bounded_wget_status_file=
+    bounded_wget_body_fifo=
+    bounded_wget_header_fifo=
+    bounded_wget_client_pid=
+    bounded_wget_body_reader_pid=
+    bounded_wget_header_reader_pid=
+    trap bounded_wget_cleanup HUP INT TERM EXIT
+
     bounded_wget_headers=$("$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-headers.XXXXXX" 2>/dev/null) || return 1
-    bounded_wget_body_file=$("$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-body.XXXXXX" 2>/dev/null) || {
-        "$rm_bin" -f "$bounded_wget_headers" >/dev/null 2>&1 || :
-        return 1
-    }
-    bounded_wget_status_file=$("$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-status.XXXXXX" 2>/dev/null) || {
-        "$rm_bin" -f "$bounded_wget_headers" "$bounded_wget_body_file" >/dev/null 2>&1 || :
-        return 1
-    }
-    if (
-        if "$wget_bin" -qS -O- -t 1 -T "$timeout_seconds" "$bounded_wget_url" 2>"$bounded_wget_headers"; then
-            bounded_wget_status=0
-        else
-            bounded_wget_status=$?
-        fi
-        printf '%s\n' "$bounded_wget_status" >"$bounded_wget_status_file"
-        exit "$bounded_wget_status"
-    ) | "$head_bin" -c "$((bounded_wget_limit + 1))" >"$bounded_wget_body_file"; then
-        bounded_wget_pipeline_status=0
+    bounded_wget_body_file=$("$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-body.XXXXXX" 2>/dev/null) || return 1
+    bounded_wget_status_file=$("$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-status.XXXXXX" 2>/dev/null) || return 1
+    bounded_wget_body_fifo=$("$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-body-fifo.XXXXXX" 2>/dev/null) || return 1
+    bounded_wget_header_fifo=$("$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-header-fifo.XXXXXX" 2>/dev/null) || return 1
+    "$rm_bin" -f "$bounded_wget_body_fifo" "$bounded_wget_header_fifo" >/dev/null 2>&1 || return 1
+    "$mkfifo_bin" "$bounded_wget_body_fifo" >/dev/null 2>&1 || return 1
+    "$mkfifo_bin" "$bounded_wget_header_fifo" >/dev/null 2>&1 || return 1
+    "$head_bin" -c "$((bounded_wget_limit + 1))" <"$bounded_wget_body_fifo" >"$bounded_wget_body_file" &
+    bounded_wget_body_reader_pid=$!
+    "$head_bin" -c 16385 <"$bounded_wget_header_fifo" >"$bounded_wget_headers" &
+    bounded_wget_header_reader_pid=$!
+    "$timeout_bin" "$timeout_seconds" "$wget_bin" -qS -O- -t 1 -T "$timeout_seconds" "$bounded_wget_url" \
+        >"$bounded_wget_body_fifo" 2>"$bounded_wget_header_fifo" &
+    bounded_wget_client_pid=$!
+    if wait "$bounded_wget_client_pid"; then
+        bounded_wget_status=0
     else
-        bounded_wget_pipeline_status=$?
+        bounded_wget_status=$?
     fi
-    if [ "$bounded_wget_pipeline_status" -ne 0 ]; then
-        "$rm_bin" -f "$bounded_wget_headers" "$bounded_wget_body_file" "$bounded_wget_status_file" >/dev/null 2>&1 || :
-        return 1
+    bounded_wget_client_pid=
+    printf '%s\n' "$bounded_wget_status" >"$bounded_wget_status_file" || return 1
+    if wait "$bounded_wget_body_reader_pid"; then
+        bounded_wget_body_reader_pid=
+    else
+        bounded_wget_body_reader_status=$?
+        bounded_wget_body_reader_pid=
+        return "$bounded_wget_body_reader_status"
     fi
-    bounded_wget_status=$("$head_bin" -c 16 "$bounded_wget_status_file" 2>/dev/null) || {
-        "$rm_bin" -f "$bounded_wget_headers" "$bounded_wget_body_file" "$bounded_wget_status_file" >/dev/null 2>&1 || :
-        return 1
-    }
+    if wait "$bounded_wget_header_reader_pid"; then
+        bounded_wget_header_reader_pid=
+    else
+        bounded_wget_header_reader_status=$?
+        bounded_wget_header_reader_pid=
+        return "$bounded_wget_header_reader_status"
+    fi
+    bounded_wget_status=$("$head_bin" -c 16 "$bounded_wget_status_file" 2>/dev/null) || return 1
     case "$bounded_wget_status" in
         0) ;;
-        *)
-            "$rm_bin" -f "$bounded_wget_headers" "$bounded_wget_body_file" "$bounded_wget_status_file" >/dev/null 2>&1 || :
-            return 1
-            ;;
+        *) return 1 ;;
     esac
-    bounded_wget_header_size=$("$wc_bin" -c <"$bounded_wget_headers" 2>/dev/null) || {
-        "$rm_bin" -f "$bounded_wget_headers" "$bounded_wget_body_file" "$bounded_wget_status_file" >/dev/null 2>&1 || :
-        return 1
-    }
-    if [ "$bounded_wget_header_size" -gt 16384 ]; then
-        "$rm_bin" -f "$bounded_wget_headers" "$bounded_wget_body_file" "$bounded_wget_status_file" >/dev/null 2>&1 || :
-        return 1
-    fi
-    if grep -Eq '(^|[[:space:]])HTTP/[0-9.]+[[:space:]]+3[0-9][0-9]([[:space:]]|$)|^.*Location:' "$bounded_wget_headers"; then
-        "$rm_bin" -f "$bounded_wget_headers" "$bounded_wget_body_file" "$bounded_wget_status_file" >/dev/null 2>&1 || :
-        return 1
-    fi
-    bounded_wget_body_size=$("$wc_bin" -c <"$bounded_wget_body_file") || {
-        "$rm_bin" -f "$bounded_wget_headers" "$bounded_wget_body_file" "$bounded_wget_status_file" >/dev/null 2>&1 || :
-        return 1
-    }
-    if [ "$bounded_wget_body_size" -gt "$bounded_wget_limit" ]; then
-        "$rm_bin" -f "$bounded_wget_headers" "$bounded_wget_body_file" "$bounded_wget_status_file" >/dev/null 2>&1 || :
-        return 1
-    fi
-    bounded_wget_body=$("$head_bin" -c "$bounded_wget_limit" "$bounded_wget_body_file") || {
-        "$rm_bin" -f "$bounded_wget_headers" "$bounded_wget_body_file" "$bounded_wget_status_file" >/dev/null 2>&1 || :
-        return 1
-    }
-    "$rm_bin" -f "$bounded_wget_headers" "$bounded_wget_body_file" "$bounded_wget_status_file" >/dev/null 2>&1 || :
-    printf '%s' "$bounded_wget_body"
+    bounded_wget_header_size=$("$wc_bin" -c <"$bounded_wget_headers" 2>/dev/null) || return 1
+    [ "$bounded_wget_header_size" -le 16384 ] || return 1
+    grep -Eiq '(^|[[:space:]])HTTP/[0-9.]+[[:space:]]+3[0-9][0-9]([[:space:]]|$)|^.*Location:' "$bounded_wget_headers" && return 1
+    bounded_wget_body_size=$("$wc_bin" -c <"$bounded_wget_body_file") || return 1
+    [ "$bounded_wget_body_size" -le "$bounded_wget_limit" ] || return 1
+    bounded_wget_result_file=$bounded_wget_body_file
+}
+
+bounded_curl_cleanup() {
+    for bounded_curl_cleanup_pid in \
+        "${bounded_curl_client_pid-}" \
+        "${bounded_curl_body_reader_pid-}"; do
+        if [ -n "$bounded_curl_cleanup_pid" ]; then
+            kill "$bounded_curl_cleanup_pid" >/dev/null 2>&1 || :
+        fi
+    done
+    for bounded_curl_cleanup_pid in \
+        "${bounded_curl_client_pid-}" \
+        "${bounded_curl_body_reader_pid-}"; do
+        if [ -n "$bounded_curl_cleanup_pid" ]; then
+            wait "$bounded_curl_cleanup_pid" >/dev/null 2>&1 || :
+        fi
+    done
+    for bounded_curl_cleanup_file in \
+        "${bounded_curl_body_file-}" \
+        "${bounded_curl_status_file-}" \
+        "${bounded_curl_body_fifo-}"; do
+        if [ -n "$bounded_curl_cleanup_file" ]; then
+            "$rm_bin" -f "$bounded_curl_cleanup_file" >/dev/null 2>&1 || :
+        fi
+    done
+}
+
+bounded_curl_finish() {
+    trap - HUP INT TERM EXIT
+    bounded_curl_cleanup
 }
 
 bounded_curl() {
     bounded_curl_url=$1
     bounded_curl_limit=$2
+    bounded_curl_result_file=
+    bounded_curl_body_file=
+    bounded_curl_status_file=
+    bounded_curl_body_fifo=
+    bounded_curl_client_pid=
+    bounded_curl_body_reader_pid=
+    trap bounded_curl_cleanup HUP INT TERM EXIT
     bounded_curl_body_file=$("$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-body.XXXXXX" 2>/dev/null) || return 1
-    bounded_curl_status_file=$("$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-status.XXXXXX" 2>/dev/null) || {
-        "$rm_bin" -f "$bounded_curl_body_file" >/dev/null 2>&1 || :
-        return 1
-    }
-    if (
-        if "$curl_bin" -fsS --location --max-redirs 0 --max-filesize "$bounded_curl_limit" \
-            --max-time "$timeout_seconds" "$bounded_curl_url"; then
-            bounded_curl_status=0
-        else
-            bounded_curl_status=$?
-        fi
-        printf '%s\n' "$bounded_curl_status" >"$bounded_curl_status_file"
-        exit "$bounded_curl_status"
-    ) | "$head_bin" -c "$((bounded_curl_limit + 1))" >"$bounded_curl_body_file"; then
-        bounded_curl_pipeline_status=0
+    bounded_curl_status_file=$("$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-status.XXXXXX" 2>/dev/null) || return 1
+    bounded_curl_body_fifo=$("$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-body-fifo.XXXXXX" 2>/dev/null) || return 1
+    "$rm_bin" -f "$bounded_curl_body_fifo" >/dev/null 2>&1 || return 1
+    "$mkfifo_bin" "$bounded_curl_body_fifo" >/dev/null 2>&1 || return 1
+    "$head_bin" -c "$((bounded_curl_limit + 1))" <"$bounded_curl_body_fifo" >"$bounded_curl_body_file" &
+    bounded_curl_body_reader_pid=$!
+    "$timeout_bin" "$timeout_seconds" "$curl_bin" -fsS --location --max-redirs 0 --max-filesize "$bounded_curl_limit" \
+        --max-time "$timeout_seconds" "$bounded_curl_url" >"$bounded_curl_body_fifo" &
+    bounded_curl_client_pid=$!
+    if wait "$bounded_curl_client_pid"; then
+        bounded_curl_status=0
     else
-        bounded_curl_pipeline_status=$?
+        bounded_curl_status=$?
     fi
-    if [ "$bounded_curl_pipeline_status" -ne 0 ]; then
-        "$rm_bin" -f "$bounded_curl_body_file" "$bounded_curl_status_file" >/dev/null 2>&1 || :
-        return 1
+    bounded_curl_client_pid=
+    printf '%s\n' "$bounded_curl_status" >"$bounded_curl_status_file" || return 1
+    if wait "$bounded_curl_body_reader_pid"; then
+        bounded_curl_body_reader_pid=
+    else
+        bounded_curl_body_reader_status=$?
+        bounded_curl_body_reader_pid=
+        return "$bounded_curl_body_reader_status"
     fi
-    bounded_curl_status=$("$head_bin" -c 16 "$bounded_curl_status_file" 2>/dev/null) || {
-        "$rm_bin" -f "$bounded_curl_body_file" "$bounded_curl_status_file" >/dev/null 2>&1 || :
-        return 1
-    }
+    bounded_curl_status=$("$head_bin" -c 16 "$bounded_curl_status_file" 2>/dev/null) || return 1
     case "$bounded_curl_status" in
         0) ;;
-        *)
-            "$rm_bin" -f "$bounded_curl_body_file" "$bounded_curl_status_file" >/dev/null 2>&1 || :
-            return 1
-            ;;
+        *) return 1 ;;
     esac
-    bounded_curl_body_size=$("$wc_bin" -c <"$bounded_curl_body_file") || {
-        "$rm_bin" -f "$bounded_curl_body_file" "$bounded_curl_status_file" >/dev/null 2>&1 || :
-        return 1
-    }
-    if [ "$bounded_curl_body_size" -gt "$bounded_curl_limit" ]; then
-        "$rm_bin" -f "$bounded_curl_body_file" "$bounded_curl_status_file" >/dev/null 2>&1 || :
-        return 1
-    fi
-    bounded_curl_body=$("$head_bin" -c "$bounded_curl_limit" "$bounded_curl_body_file") || {
-        "$rm_bin" -f "$bounded_curl_body_file" "$bounded_curl_status_file" >/dev/null 2>&1 || :
-        return 1
-    }
-    "$rm_bin" -f "$bounded_curl_body_file" "$bounded_curl_status_file" >/dev/null 2>&1 || :
-    printf '%s' "$bounded_curl_body"
+    bounded_curl_body_size=$("$wc_bin" -c <"$bounded_curl_body_file") || return 1
+    [ "$bounded_curl_body_size" -le "$bounded_curl_limit" ] || return 1
+    bounded_curl_result_file=$bounded_curl_body_file
 }
 
 probe_weaviate() {
-    body=$(bounded_wget "$weaviate_url" 65536 2>/dev/null) || fail
+    bounded_wget "$weaviate_url" 65536 2>/dev/null || fail
+    body=$("$head_bin" -c 65536 "$bounded_wget_result_file") || {
+        bounded_wget_finish
+        fail
+    }
+    bounded_wget_finish
     # /v1/meta is a bounded, application-level response. It proves that the
     # Weaviate HTTP API is serving metadata, rather than only accepting TCP.
     printf '%s' "$body" | grep -Eq '"version"[[:space:]]*:[[:space:]]*"[^"[:space:]]+"' || fail
@@ -195,6 +251,7 @@ probe_weaviate() {
     # empty body, so its HTTP status is the contract here.
     ready_url=${WEAVIATE_READY_URL:-http://127.0.0.1:8080/v1/.well-known/ready}
     bounded_wget "$ready_url" 1024 >/dev/null 2>&1 || fail
+    bounded_wget_finish
 }
 
 probe_vector_db() {
@@ -229,7 +286,12 @@ probe_redis() {
 }
 
 probe_proxy() {
-    body=$(bounded_wget "$proxy_url" 65536 2>/dev/null) || fail
+    bounded_wget "$proxy_url" 65536 2>/dev/null || fail
+    body=$("$head_bin" -c 65536 "$bounded_wget_result_file") || {
+        bounded_wget_finish
+        fail
+    }
+    bounded_wget_finish
     # Traefik's overview is its own control-plane readiness contract. Require
     # at least one router and service, with no reported warnings or errors.
     printf '%s' "$body" | grep -Eq '"routers":\{"total":[1-9][0-9]*,"warnings":0,"errors":0\}' || fail
@@ -244,9 +306,9 @@ probe_rabbitmq() {
 probe_minio() {
     # MinIO's unauthenticated readiness endpoint reports cluster readiness and
     # avoids a mutating S3 operation or a dependency on an mc alias file.
-    "$curl_bin" -fsS --location --max-redirs 0 --max-time "$timeout_seconds" \
-        "${MINIO_READY_URL:-http://127.0.0.1:9000/minio/health/ready}" \
+    bounded_curl "${MINIO_READY_URL:-http://127.0.0.1:9000/minio/health/ready}" 1024 \
         >/dev/null 2>&1 || fail
+    bounded_curl_finish
 }
 
 probe_db() {
@@ -317,7 +379,12 @@ with opener.open(request, timeout=float(sys.argv[2])) as response:
 }
 
 probe_frontend() {
-    body=$(bounded_curl "$frontend_url" 65536 2>/dev/null) || fail
+    bounded_curl "$frontend_url" 65536 2>/dev/null || fail
+    body=$("$head_bin" -c 65536 "$bounded_curl_result_file") || {
+        bounded_curl_finish
+        fail
+    }
+    bounded_curl_finish
     case "$body" in
         *'<title>Unstract</title>'*) : ;;
         *) fail ;;

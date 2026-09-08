@@ -8,6 +8,7 @@ import os
 import socketserver
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -128,6 +129,84 @@ esac
     assert run_probe("weaviate", {**base, "FAKE_MODE": "big"}).returncode != 0
     assert run_probe("weaviate", {**base, "FAKE_MODE": "fail"}).returncode != 0
     assert run_probe("weaviate", {**base, "FAKE_MODE": "redirect"}).returncode != 0
+
+
+def test_wget_headers_and_total_deadline_are_bounded(tmp_path: Path) -> None:
+    wget = write_fake(
+        tmp_path,
+        "wget",
+        """
+case "${FAKE_MODE:-ok}" in
+  big_headers)
+    i=0
+    while [ "$i" -lt 20000000 ]; do printf x >&2; i=$((i + 1)); done
+    printf '%s' '{\"version\":\"1\"}'
+    ;;
+  lower_redirect)
+    printf 'HTTP/1.1 200 OK\\r\\nlocation: http://example.test/\\r\\n' >&2
+    printf '%s' '{\"version\":\"1\"}'
+    ;;
+  slow)
+    sleep 5
+    ;;
+  *)
+    printf 'HTTP/1.1 200 OK\\r\\n' >&2
+    printf '%s' '{\"version\":\"1\"}'
+    ;;
+esac
+""",
+    )
+    base = {"WGET_BIN": str(wget), "HEALTHCHECK_TIMEOUT_SECONDS": "1"}
+    assert run_probe("weaviate", base).returncode == 0
+    assert run_probe("weaviate", {**base, "FAKE_MODE": "big_headers"}).returncode != 0
+    assert run_probe("weaviate", {**base, "FAKE_MODE": "lower_redirect"}).returncode != 0
+    started = time.monotonic()
+    assert run_probe("weaviate", {**base, "FAKE_MODE": "slow"}).returncode != 0
+    assert time.monotonic() - started < 4
+
+
+def test_minio_response_is_bounded(tmp_path: Path) -> None:
+    curl = write_fake(
+        tmp_path,
+        "curl",
+        """
+case "${FAKE_MODE:-ok}" in
+  big) i=0; while [ "$i" -lt 70000 ]; do printf x; i=$((i + 1)); done ;;
+  *) : ;;
+esac
+""",
+    )
+    base = {"CURL_BIN": str(curl)}
+    assert run_probe("minio", base).returncode == 0
+    assert run_probe("minio", {**base, "FAKE_MODE": "big"}).returncode != 0
+
+
+def test_probe_signal_cleans_temporary_files(tmp_path: Path) -> None:
+    wget = write_fake(tmp_path, "wget", "sleep 10")
+    env = os.environ.copy()
+    env.update(
+        {
+            "TMPDIR": str(tmp_path),
+            "WGET_BIN": str(wget),
+            "HEALTHCHECK_TIMEOUT_SECONDS": "30",
+        }
+    )
+    process = subprocess.Popen(
+        ["sh", str(SCRIPT), "weaviate"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        time.sleep(0.2)
+        process.terminate()
+        process.wait(timeout=4)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=4)
+    assert not list(tmp_path.glob("unstract-health-*"))
 
 
 def test_traefik_requires_nonempty_error_free_overview(tmp_path: Path) -> None:
