@@ -31,6 +31,8 @@ import os
 import signal
 import socket
 import sys
+import threading
+import time
 from types import FrameType
 from typing import Any
 
@@ -64,6 +66,122 @@ _BLOCK_TIMEOUT_SECONDS = int(os.getenv("LOG_STREAM_BLOCK_TIMEOUT", "5"))
 _SOCKET_TIMEOUT_SECONDS = _BLOCK_TIMEOUT_SECONDS + 5
 
 _shutdown = False
+
+
+class _RedisStreamHealth:
+    """Freshness state for the Redis stream poll loop.
+
+    A process check cannot tell whether this consumer can still reach Redis. The
+    loop records a successful ``BLMOVE`` return (including an empty-list timeout),
+    which proves that the Redis read completed without publishing or consuming
+    anything as a side effect of the health request. A failed or hung read leaves
+    the previous success timestamp untouched, so the endpoint eventually returns
+    503 after the configured bound.
+    """
+
+    def __init__(self, queue_name: str) -> None:
+        self._queue_name = queue_name
+        self._lock = threading.Lock()
+        self._last_success: float | None = None
+        self._poll_failures = 0
+
+    def mark_success(self) -> None:
+        with self._lock:
+            self._last_success = time.monotonic()
+
+    def mark_failure(self) -> None:
+        with self._lock:
+            self._poll_failures += 1
+
+    def seconds_since_last_success(self) -> float:
+        with self._lock:
+            last_success = self._last_success
+        # A finite, large value keeps the JSON response valid before the first
+        # completed read while making the probe unambiguously stale.
+        return 1_000_000.0 if last_success is None else max(
+            0.0, time.monotonic() - last_success
+        )
+
+    def status(self) -> dict[str, object]:
+        with self._lock:
+            failures = self._poll_failures
+        return {
+            "queue": self._queue_name,
+            "redis_poll_failures": failures,
+        }
+
+
+def _health_port_from_env() -> int | None:
+    """Return the opt-in health port, validating bad deployment input early."""
+    raw = os.getenv("LOG_STREAM_CONSUMER_HEALTH_PORT")
+    if raw is None or raw == "":
+        return None
+    try:
+        port = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid LOG_STREAM_CONSUMER_HEALTH_PORT={raw!r}: {exc}"
+        ) from exc
+    if not 0 <= port <= 65535:
+        raise ValueError(f"LOG_STREAM_CONSUMER_HEALTH_PORT={port} out of range")
+    return port
+
+
+def _health_stale_seconds() -> float:
+    """Resolve a bound that outlives the blocking read and its socket timeout."""
+    default = max(15.0, float(_SOCKET_TIMEOUT_SECONDS * 2))
+    raw = os.getenv("LOG_STREAM_CONSUMER_HEALTH_STALE_SECONDS")
+    if raw is None or raw == "":
+        return default
+    try:
+        stale_after = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid LOG_STREAM_CONSUMER_HEALTH_STALE_SECONDS={raw!r}: {exc}"
+        ) from exc
+    if stale_after <= 0:
+        raise ValueError(
+            "LOG_STREAM_CONSUMER_HEALTH_STALE_SECONDS must be positive"
+        )
+    return stale_after
+
+
+def _maybe_start_health_server(
+    health: _RedisStreamHealth,
+) -> Any | None:
+    """Start the opt-in loop probe without making it a process dependency."""
+    port = _health_port_from_env()
+    if port is None:
+        return None
+
+    from queue_backend.pg_queue.liveness import LivenessServer
+
+    stale_after = _health_stale_seconds()
+    server = LivenessServer(
+        freshness_fn=health.seconds_since_last_success,
+        stale_after=stale_after,
+        port=port,
+        check_name="redis_stream_loop",
+        age_key="seconds_since_last_successful_poll",
+        extra_status_fn=health.status,
+        thread_name="redis-stream-liveness",
+        log_label="redis stream consumer",
+    )
+    try:
+        server.start()
+    except OSError:
+        logger.exception(
+            "Redis stream consumer: liveness could not bind :%s; continuing "
+            "without a probe",
+            port,
+        )
+        return None
+    logger.info(
+        "Redis stream consumer: liveness on :%s/health (stale after %ss)",
+        server.bound_port,
+        stale_after,
+    )
+    return server
 
 
 def _processing_list_name() -> str:
@@ -114,46 +232,59 @@ def run() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    # Not ``RedisQueueClient.from_env()``: that hard-codes the 5s socket timeout, which
-    # cannot outlive this loop's block. Built directly so the two stay related by
-    # construction — see _SOCKET_TIMEOUT_SECONDS.
-    redis_client = create_redis_client(
-        decode_responses=True,
-        socket_timeout=_SOCKET_TIMEOUT_SECONDS,
-    )
-    processing = _processing_list_name()
-    logger.info(
-        "Log stream consumer starting: queue='%s' processing='%s'",
-        _QUEUE_NAME,
-        processing,
-    )
-    _recover_in_flight(redis_client, processing)
+    health = _RedisStreamHealth(_QUEUE_NAME)
+    health_server = _maybe_start_health_server(health)
+    try:
+        # Not ``RedisQueueClient.from_env()``: that hard-codes the 5s socket timeout,
+        # which cannot outlive this loop's block. Built directly so the two stay
+        # related by construction — see _SOCKET_TIMEOUT_SECONDS.
+        redis_client = create_redis_client(
+            decode_responses=True,
+            socket_timeout=_SOCKET_TIMEOUT_SECONDS,
+        )
+        processing = _processing_list_name()
+        logger.info(
+            "Log stream consumer starting: queue='%s' processing='%s'",
+            _QUEUE_NAME,
+            processing,
+        )
+        _recover_in_flight(redis_client, processing)
 
-    while not _shutdown:
-        try:
-            raw = redis_client.blmove(
-                _QUEUE_NAME, processing, _BLOCK_TIMEOUT_SECONDS, "LEFT", "RIGHT"
-            )
-        except Exception:
-            # Connection blips must not kill the pod — the next iteration reconnects via
-            # the client's own retry. Sleeping is unnecessary: BLMOVE already blocks.
-            logger.error("Log stream read failed; retrying", exc_info=True)
-            continue
+        while not _shutdown:
+            try:
+                raw = redis_client.blmove(
+                    _QUEUE_NAME, processing, _BLOCK_TIMEOUT_SECONDS, "LEFT", "RIGHT"
+                )
+                # A nil result is still a successful Redis round trip and proves
+                # that an idle queue is reachable. The health GET itself never
+                # calls BLMOVE and therefore never consumes an envelope.
+                health.mark_success()
+            except Exception:
+                health.mark_failure()
+                # Connection blips must not kill the pod — the next iteration
+                # reconnects via the client's own retry. Sleeping is unnecessary:
+                # BLMOVE already blocks.
+                logger.error("Log stream read failed; retrying", exc_info=True)
+                continue
 
-        if raw is None:  # timeout, no work — loop so shutdown can be observed
-            continue
+            if raw is None:  # timeout, so the loop can observe shutdown
+                continue
 
-        try:
-            _dispatch(raw)
-        except Exception:
-            # Match the Celery consumer's posture: a poison envelope is logged and
-            # dropped, never retried forever. logs_consumer already swallows its own
-            # sink failures, so reaching here means a malformed envelope.
-            logger.error("Discarding unprocessable log envelope", exc_info=True)
-        finally:
-            # Remove exactly one copy, whether it succeeded or was discarded — leaving it
-            # parked would have it re-queued on the next restart and replayed forever.
-            redis_client.lrem(processing, 1, raw)
+            try:
+                _dispatch(raw)
+            except Exception:
+                # Match the Celery consumer's posture: a poison envelope is logged
+                # and dropped, never retried forever. logs_consumer already swallows
+                # its own sink failures, so reaching here means a malformed envelope.
+                logger.error("Discarding unprocessable log envelope", exc_info=True)
+            finally:
+                # Remove exactly one copy, whether it succeeded or was discarded —
+                # leaving it parked would have it re-queued on the next restart and
+                # replayed forever.
+                redis_client.lrem(processing, 1, raw)
+    finally:
+        if health_server is not None:
+            health_server.stop()
 
     logger.info("Log stream consumer stopped")
     return 0
