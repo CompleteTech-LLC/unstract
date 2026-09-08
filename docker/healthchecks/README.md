@@ -1,0 +1,30 @@
+# Unstract service health probes
+
+`unstract-services.sh` is a bounded, read-only probe entrypoint for the core
+services in the Train Compose deployment.  It is kept separate from the base
+Compose file so a Train-specific deployment can bind-mount it read-only and
+select the service name in that service's native Podman healthcheck.
+
+The probe returns zero only after the service-specific readiness contract has
+passed.  It never prints response bodies, environment values, or credentials;
+failure output names only the service whose probe failed.  The helper uses the
+clients already present in the target images.  In particular, Qdrant's minimal
+image has no curl/wget, so its check uses the Bash runtime and the official
+`/healthz` endpoint with a 512-byte response bound.
+
+The Train deployment should mount this file at
+`/usr/local/bin/unstract-services.sh` with `:ro`, then use for example:
+
+```yaml
+healthcheck:
+  test: ["CMD-SHELL", "/usr/local/bin/unstract-services.sh backend"]
+  interval: 30s
+  timeout: 5s
+  start_period: 120s
+  retries: 3
+```
+
+The exact service contracts and a prepared Train fragment are kept in the
+private integration evidence bundle for the deployment owner.  The script's
+endpoint and command paths can be overridden with environment variables for
+isolated contract tests; production defaults target service-local listeners.
