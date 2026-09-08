@@ -160,6 +160,13 @@ services:
       - ./workflow_data:/data
       # Docker socket bind mount to spawn tool containers
       - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:5002/v1/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     depends_on:
       - redis
       - rabbitmq
@@ -186,8 +193,17 @@ services:
       - LOG_TRANSPORT=redis
       # Scheduler interval in seconds
       - LOG_HISTORY_CONSUMER_INTERVAL=${LOG_HISTORY_CONSUMER_INTERVAL:-5}
+      - LOG_HISTORY_SCHEDULER_HEALTH_PORT=8092
+      - LOG_HISTORY_SCHEDULER_HEALTH_STALE_SECONDS=${LOG_HISTORY_SCHEDULER_HEALTH_STALE_SECONDS:-120}
       # Override example: TASK_TRIGGER_COMMAND=/custom/trigger/script.sh
       - TASK_TRIGGER_COMMAND=${TASK_TRIGGER_COMMAND:-}
+    healthcheck:
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8092/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     labels:
       - traefik.enable=false
 
@@ -204,6 +220,13 @@ services:
     depends_on:
       - db
       - redis
+    healthcheck:
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     environment:
       - ENVIRONMENT=development
       - APPLICATION_NAME=unstract-worker-pg-orchestrator-api
@@ -240,6 +263,13 @@ services:
     depends_on:
       - db
       - redis
+    healthcheck:
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     environment:
       - ENVIRONMENT=development
       - APPLICATION_NAME=unstract-worker-pg-orchestrator-general
@@ -274,6 +304,13 @@ services:
       - db
       - redis
       - rabbitmq   # still dispatches the tool-execution RPC to the Celery executor (until the executor/tool-RPC moves to PG)
+    healthcheck:
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     environment:
       - ENVIRONMENT=development
       - APPLICATION_NAME=unstract-worker-pg-fileproc
@@ -315,6 +352,13 @@ services:
       - db
       - redis
       - rabbitmq   # may dispatch Celery notifications when not PG-routed (until notifications move to PG)
+    healthcheck:
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     environment:
       - ENVIRONMENT=development
       - APPLICATION_NAME=unstract-worker-pg-callback
@@ -354,6 +398,13 @@ services:
       - db
       - redis
       - rabbitmq   # the trigger dispatches async_execute_bin (Celery path when not PG-routed)
+    healthcheck:
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     environment:
       - ENVIRONMENT=development
       - APPLICATION_NAME=unstract-worker-pg-scheduler
@@ -407,6 +458,13 @@ services:
     depends_on:
       - db
       - redis
+    healthcheck:
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     environment:
       - ENVIRONMENT=development
       - APPLICATION_NAME=unstract-worker-pg-metrics
@@ -459,6 +517,15 @@ services:
       # Downstream sinks are unchanged — same durable buffer the Celery worker wrote to.
       - LOG_HISTORY_QUEUE_NAME=${LOG_HISTORY_QUEUE_NAME:-log_history_queue}
       - ENABLE_LOG_HISTORY=${ENABLE_LOG_HISTORY:-true}
+      - LOG_STREAM_CONSUMER_HEALTH_PORT=8091
+      - LOG_STREAM_CONSUMER_HEALTH_STALE_SECONDS=${LOG_STREAM_CONSUMER_HEALTH_STALE_SECONDS:-15}
+    healthcheck:
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8091/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     labels:
       - traefik.enable=false
 
@@ -482,6 +549,13 @@ services:
       - db
       - redis
       - platform-service
+    healthcheck:
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     environment:
       - ENVIRONMENT=development
       - APPLICATION_NAME=unstract-worker-pg-executor
@@ -534,6 +608,13 @@ services:
       - db
       - redis
       - platform-service
+    healthcheck:
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     environment:
       - ENVIRONMENT=development
       - APPLICATION_NAME=unstract-worker-pg-ide-callback
@@ -575,6 +656,13 @@ services:
       - db
       - redis
       - platform-service
+    healthcheck:
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     environment:
       - ENVIRONMENT=development
       - APPLICATION_NAME=unstract-worker-pg-notification
@@ -614,6 +702,13 @@ services:
     depends_on:
       - db
       - redis
+    healthcheck:
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+             "--max-time", "3", "http://127.0.0.1:8086/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     environment:
       - ENVIRONMENT=development
       - APPLICATION_NAME=unstract-worker-pg-reaper
