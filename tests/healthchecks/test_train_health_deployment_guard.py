@@ -111,6 +111,58 @@ def test_duration_parser_rejects_invalid_or_nonfinite_values(value) -> None:
     assert guard.duration_ns(value) is None
 
 
+def test_healthcheck_none_is_equivalent_to_no_healthcheck() -> None:
+    assert guard.health_config(None) == {"configured": False}
+    assert guard.health_config({"Test": ["NONE"]}) == {"configured": False}
+    assert guard.health_config({"Test": ["CMD", "true"]})["configured"] is True
+
+
+def test_generated_hostname_is_excluded_but_custom_hostname_is_retained() -> None:
+    container_id = "abcdef0123456789"
+    generated = guard.env_hashes(
+        ["HOSTNAME=abcdef012345", "APP_MODE=prod"], container_id=container_id
+    )
+    custom = guard.env_hashes(
+        ["HOSTNAME=worker-custom", "APP_MODE=prod"], container_id=container_id
+    )
+
+    assert "HOSTNAME" not in generated
+    assert "HOSTNAME" in custom
+
+
+def test_generated_network_alias_is_excluded_but_explicit_alias_is_retained() -> None:
+    container_id = "abcdef0123456789"
+    network = {
+        "unstract-network": {
+            "Aliases": [
+                "abcdef012345",
+                "abcdef012345-explicit",
+                "unstract-runner",
+            ],
+            "NetworkID": "network-id",
+            "DriverOpts": {},
+        }
+    }
+
+    normalized = guard.normalize_networks(network, container_id=container_id)
+
+    assert normalized["unstract-network"]["aliases"] == [
+        "abcdef012345-explicit",
+        "unstract-runner",
+    ]
+
+
+def test_exception_reason_is_bounded_and_redacts_secret_assignments() -> None:
+    reason = guard.exception_reason(
+        RuntimeError("token=private-value password: another-private-value " + "x" * 500)
+    )
+
+    assert "private-value" not in reason
+    assert "another-private-value" not in reason
+    assert "<redacted>" in reason
+    assert len(reason) < 260
+
+
 def test_core_probe_checks_require_read_only_probe_mount() -> None:
     config, baseline, lock, authored = candidate_fixture()
     config["services"]["db"]["volumes"] = []

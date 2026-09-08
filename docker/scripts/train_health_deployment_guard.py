@@ -93,6 +93,7 @@ EXPECTED_NETWORK = "unstract-network"
 SOURCE_STATE_SCHEMA = "unstract-source-state/v2"
 BACKUP_SCHEMA = "unstract-health-backup/v2"
 REPLACEMENT_SCHEMA = "unstract-health-replacements/v1"
+FAILURE_SCHEMA = "unstract-health-failure/v1"
 DURATION_TOKEN = re.compile(
     r"(?P<number>(?:\d+(?:\.\d*)?|\.\d+))(?P<unit>ns|us|µs|ms|h|m|s)"
 )
@@ -198,6 +199,21 @@ class OperationDeadline:
 
 class GuardError(RuntimeError):
     """A precondition or postcondition failed."""
+
+
+def exception_reason(error: BaseException, *, limit: int = 240) -> str:
+    """Return bounded, single-line failure context without secret-looking values."""
+    text = " ".join(str(error).split())
+    text = re.sub(
+        r"(?i)(password|passwd|secret|token|authorization|api[_-]?key)(\s*[=:]\s*)\S+",
+        r"\1\2<redacted>",
+        text,
+    )
+    if not text:
+        text = "<no detail>"
+    if len(text) > limit:
+        text = text[: limit - 3] + "..."
+    return f"{type(error).__name__}: {text}"
 
 
 def utc_now() -> str:
@@ -315,12 +331,19 @@ def image_digest(image: dict[str, Any]) -> str | None:
     return image.get("Digest") or next(iter(image.get("RepoDigests") or []), None)
 
 
-def env_hashes(values: list[str] | None) -> dict[str, dict[str, Any]]:
+def env_hashes(
+    values: list[str] | None, *, container_id: str | None = None
+) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for item in values or []:
         key, separator, value = item.partition("=")
         if not separator:
             value = ""
+        # Podman injects HOSTNAME from the container ID. Recreated containers
+        # therefore receive a new value even when the application environment
+        # is unchanged. Keep an explicit custom HOSTNAME in the contract.
+        if key == "HOSTNAME" and container_id and value == container_id[:12]:
+            continue
         result[key] = {"length": len(value), "sha256": sha256_bytes(value.encode())}
     return dict(sorted(result.items()))
 
@@ -344,6 +367,12 @@ def health_config(value: dict[str, Any] | None) -> dict[str, Any]:
     if not value:
         return {"configured": False}
     test = value.get("Test") or []
+    # Compose's ``healthcheck: {test: ["NONE"]}`` disables a healthcheck.
+    # Podman reports that override as a Healthcheck object while an unchanged
+    # container reports no object at all; normalize both to the same state so
+    # rollback verification compares effective configuration.
+    if test == ["NONE"]:
+        return {"configured": False}
     return {
         "configured": True,
         # Healthcheck command vectors contain no credentials and are retained
@@ -441,12 +470,18 @@ def compose_mount_source(config: dict[str, Any], mount: dict[str, Any]) -> Any:
     return source
 
 
-def normalize_networks(value: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def normalize_networks(
+    value: dict[str, Any], *, container_id: str | None = None
+) -> dict[str, dict[str, Any]]:
     """Keep stable network identity while omitting replacement-specific IPs."""
     result: dict[str, dict[str, Any]] = {}
+    generated_alias = container_id[:12] if container_id else None
     for name, network in sorted(value.items()):
+        aliases = network.get("Aliases") or []
+        if generated_alias:
+            aliases = [alias for alias in aliases if alias != generated_alias]
         result[name] = {
-            "aliases": sorted(network.get("Aliases") or []),
+            "aliases": sorted(aliases),
             "network_mode": network.get("NetworkID") or None,
             "driver_opts": network.get("DriverOpts") or {},
         }
@@ -536,7 +571,7 @@ def inspect_project(
                     "configured": health_config(config.get("Healthcheck")),
                     "runtime": health_runtime(state.get("Health")),
                 },
-                "env_hashes": env_hashes(config.get("Env")),
+                "env_hashes": env_hashes(config.get("Env"), container_id=item.get("Id")),
                 "mounts": [normalize_mount(mount) for mount in item.get("Mounts") or []],
                 "options": runtime_options(item, config),
                 "graphdriver": {
@@ -545,7 +580,7 @@ def inspect_project(
                     "work_dir": (item.get("GraphDriver") or {}).get("Data", {}).get("WorkDir"),
                 },
                 "networks": sorted(networks),
-                "network_details": normalize_networks(networks),
+                "network_details": normalize_networks(networks, container_id=item.get("Id")),
                 "user": config.get("User"),
                 "working_dir": config.get("WorkingDir"),
                 "rootless_runtime": item.get("OCIRuntime"),
@@ -2089,11 +2124,20 @@ def command_apply(args: argparse.Namespace) -> int:
                 compare_source_and_quiescence(baseline, final)
                 write_json(backup_dir / "post-apply.json", final)
             except Exception as exc:
+                failure_record = {
+                    "schema": FAILURE_SCHEMA,
+                    "original_error": exception_reason(exc),
+                }
+                try:
+                    write_json(backup_dir / "apply-failure.json", failure_record)
+                except OSError:
+                    pass
                 if backup_images is not None and attempted:
                     try:
                         failed_state = capture(
                             Path(args.project_dir), deadline=operation_deadline
                         )
+                        write_json(backup_dir / "failed-state.json", failed_state)
                         discovered = record_replacements(
                             baseline,
                             failed_state,
@@ -2121,9 +2165,16 @@ def command_apply(args: argparse.Namespace) -> int:
                                 operation_deadline=operation_deadline,
                             )
                     except Exception as rollback_error:
+                        failure_record["rollback_error"] = exception_reason(rollback_error)
+                        try:
+                            write_json(backup_dir / "apply-failure.json", failure_record)
+                        except OSError:
+                            pass
                         raise GuardError(
                             "guarded apply failed and compensating rollback failed; "
-                            f"manual recovery is required: {type(rollback_error).__name__}"
+                            "manual recovery is required; "
+                            f"original failure: {failure_record['original_error']}; "
+                            f"recovery failure: {failure_record['rollback_error']}"
                         ) from exc
                 raise
     print(f"apply: verified {len(TARGET_SERVICES)} targeted services; backup={backup_dir}")
