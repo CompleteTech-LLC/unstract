@@ -29,9 +29,12 @@ container is intentionally excluded.
 
 ## Candidate preparation
 
-Build the six changed images from a clean detached worktree at the exact
-integrated source commit. Run this on an external builder or disposable build
-host; do not build from the dirty Train checkout:
+Build the two changed application images from a clean detached worktree at the
+exact integrated source commit. The runner source and shared worker source are
+the only image-bearing changes. Runner and the twelve worker services use those
+new image builds; the eleven core services use immutable image IDs/digests
+already captured from the live stack. Run this on an external builder or
+disposable build host; do not build from the dirty Train checkout:
 
 ```sh
 CANDIDATE_COMMIT="$(git rev-parse HEAD)"
@@ -40,7 +43,7 @@ CANDIDATE_VERSION="goal09-${CANDIDATE_SHORT}"
 git worktree add --detach /var/tmp/unstract-goal09 "$CANDIDATE_COMMIT"
 cd /var/tmp/unstract-goal09
 VERSION="$CANDIDATE_VERSION" docker compose -f docker/docker-compose.build.yaml build --pull never \
-  backend frontend runner platform-service x2text-service worker-unified
+  runner worker-unified
 ```
 
 The static database, broker, storage, proxy, and vector images are pinned by
@@ -55,9 +58,9 @@ python3 docker/scripts/train_health_deployment_guard.py lock \
   --candidate-version "$CANDIDATE_VERSION" \
   --output /run/user/1000/unstract-goal09/candidate-lock.json \
   --image runner=localhost/unstract/runner:"$CANDIDATE_VERSION" \
-  --image backend=localhost/unstract/backend:"$CANDIDATE_VERSION" \
-  --image frontend=localhost/unstract/frontend:"$CANDIDATE_VERSION" \
-  --image platform-service=localhost/unstract/platform-service:"$CANDIDATE_VERSION" \
+  --image backend=localhost/unstract/backend:all-active-prs-20260903-oauthfix-3a273af \
+  --image frontend=localhost/unstract/frontend:all-active-prs-20260903-oauthfix-a4da8ff \
+  --image platform-service=localhost/unstract/platform-service:all-active-prs-20260903-7b95921 \
   --image worker-pg-orchestrator-api=localhost/unstract/worker-unified:"$CANDIDATE_VERSION" \
   --image worker-pg-orchestrator-general=localhost/unstract/worker-unified:"$CANDIDATE_VERSION" \
   --image worker-pg-fileproc=localhost/unstract/worker-unified:"$CANDIDATE_VERSION" \
@@ -77,7 +80,7 @@ python3 docker/scripts/train_health_deployment_guard.py lock \
   --image qdrant=docker.io/qdrant/qdrant:v1.16.1 \
   --image rabbitmq=docker.io/library/rabbitmq:4.1.0-management \
   --image weaviate=docker.io/semitechnologies/weaviate:1.39.2 \
-  --image x2text-service=localhost/unstract/x2text-service:"$CANDIDATE_VERSION"
+  --image x2text-service=localhost/unstract/x2text-service:all-active-prs-20260903-7b95921
 ```
 
 The final lock must include exactly one mapping for every target service and
@@ -87,7 +90,10 @@ deliberate static image change has separately been reviewed. The lock also
 contains the candidate commit's tree hash and hashes for the two overlays, the
 core and database probes, and the development essentials Compose file. The
 guard writes a temporary image override from this lock, so Compose cannot
-silently resolve a different registry or tag.
+silently resolve a different registry or tag. Only `runner` and the twelve
+worker services point at the new build; backend, frontend, platform-service,
+x2text-service, and the seven core data services point at the captured static
+references.
 
 Stage only the committed guard, overlays, and probe into a separate directory
 such as `/run/user/1000/unstract-goal09/source`; never copy over the live
@@ -138,12 +144,13 @@ python3 docker/scripts/train_health_deployment_guard.py preflight \
 
 Preflight refuses a changed dirty-path list, container name, persistent mount
 source or access mode, network, candidate image ID/digest, source commit, or
-artifact hash. It also refuses missing images and any service outside the
-fixed target set. The mutation phase repeats the runtime identity and queue
-checks while holding the PostgreSQL advisory deployment lock. The lock
-serializes competing guarded deployments; the queue counts are rechecked
-immediately before each batch because independently running application
-producers cannot be stopped by an advisory lock.
+artifact hash. It also binds Compose and direct Podman to the rootless
+`/run/user/1000/podman/podman.sock` context, rejects duplicate service labels,
+and checks the exact trusted health command and timing for every target. It
+refuses missing images and any service outside the fixed target set. Each queue
+capture requires three consecutive zero-work samples at two-second intervals;
+the mutation phase takes a final settled sample immediately before each
+targeted Compose change while holding the PostgreSQL advisory deployment lock.
 
 After a fresh quiescence check and automatic `podman commit` backup of each
 target container, `apply` recreates only the worker batch, waits for every

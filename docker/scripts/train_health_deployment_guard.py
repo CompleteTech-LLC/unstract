@@ -48,6 +48,11 @@ DEFAULT_APPLY_TIMEOUT_SECONDS = 2400
 DEFAULT_ROLLBACK_TIMEOUT_SECONDS = 1200
 ADVISORY_LOCK_SQL = "SELECT pg_try_advisory_lock(hashtextextended('train-unstract-health-deploy', 0));"
 ADVISORY_UNLOCK_SQL = "SELECT pg_advisory_unlock(hashtextextended('train-unstract-health-deploy', 0));"
+EXPECTED_RUNTIME_ENDPOINT = "unix:///run/user/1000/podman/podman.sock"
+EXPECTED_RUNTIME_UID = 1000
+QUIESCENCE_REQUIRED_SAMPLES = 3
+QUIESCENCE_SAMPLE_INTERVAL_SECONDS = 2.0
+QUIESCENCE_MAX_WAIT_SECONDS = 10.0
 
 # Compose service names.  Keep this explicit so a typo or a newly added service
 # cannot silently turn a targeted deployment into a project-wide update.
@@ -101,6 +106,62 @@ ALLOWED_ENV_ADDITIONS = {
 }
 
 
+def _probe_test(service: str) -> list[str]:
+    if service in CORE_SERVICES:
+        probe_name = {
+            "reverse-proxy": "proxy",
+            "qdrant": "vector-db",
+        }.get(service, service)
+        return ["CMD", "/usr/local/bin/unstract-services.sh", probe_name]
+    if service == "runner":
+        port, path = "5002", "/v1/api/health"
+    elif service == "worker-pg-reaper":
+        port, path = "8086", "/health"
+    elif service == "worker-log-history-scheduler-v2":
+        port, path = "8092", "/health"
+    elif service == "worker-log-stream-consumer":
+        port, path = "8091", "/health"
+    else:
+        port, path = "8090", "/health"
+    return [
+        "CMD",
+        "/usr/bin/curl",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--max-time",
+        "3",
+        f"http://127.0.0.1:{port}{path}",
+    ]
+
+
+def health_contract(service: str) -> dict[str, Any]:
+    if service in CORE_SERVICES:
+        start_period = {
+            "db": "30s",
+            "redis": "15s",
+            "minio": "60s",
+            "reverse-proxy": "60s",
+            "qdrant": "60s",
+            "rabbitmq": "60s",
+            "weaviate": "120s",
+            "x2text-service": "120s",
+            "platform-service": "120s",
+            "backend": "180s",
+            "frontend": "60s",
+        }[service]
+        timeout = "10s"
+    else:
+        start_period, timeout = "30s", "5s"
+    return {
+        "test": _probe_test(service),
+        "interval_ns": 30_000_000_000,
+        "timeout_ns": duration_ns(timeout),
+        "start_period_ns": duration_ns(start_period),
+        "retries": 3,
+    }
+
+
 class OperationDeadline:
     """Monotonic deadline shared by every command in one guarded operation."""
 
@@ -143,6 +204,54 @@ def sha256_file(path: Path) -> str:
         raise GuardError(f"cannot hash required artifact {path}: {exc}") from exc
 
 
+def duration_ns(value: Any) -> int | None:
+    """Normalize Compose duration strings and Podman nanosecond values."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return round(value)
+    text = str(value).strip().lower()
+    units = (
+        ("ns", 1),
+        ("us", 1_000),
+        ("µs", 1_000),
+        ("ms", 1_000_000),
+        ("s", 1_000_000_000),
+        ("m", 60_000_000_000),
+        ("h", 3_600_000_000_000),
+    )
+    for suffix, multiplier in units:
+        if text.endswith(suffix):
+            try:
+                return round(float(text[: -len(suffix)]) * multiplier)
+            except ValueError:
+                return None
+    return None
+
+
+def runtime_command_env(
+    command: list[str], env: dict[str, str] | None = None
+) -> dict[str, str] | None:
+    """Bind Docker-compatible Compose and direct Podman calls to one socket."""
+    if not command or command[0] not in {"docker", "podman"}:
+        return env
+    effective = os.environ.copy()
+    if env is not None:
+        effective.update(env)
+    for key in ("DOCKER_HOST", "CONTAINER_HOST"):
+        supplied = effective.get(key)
+        if supplied and supplied != EXPECTED_RUNTIME_ENDPOINT:
+            raise GuardError(
+                f"{key} must be {EXPECTED_RUNTIME_ENDPOINT} for the rootless Train runtime"
+            )
+        effective[key] = EXPECTED_RUNTIME_ENDPOINT
+    return effective
+
+
 def run(
     args: list[str],
     *,
@@ -154,6 +263,7 @@ def run(
     deadline: OperationDeadline | None = None,
 ) -> subprocess.CompletedProcess[str]:
     timeout = deadline.remaining(timeout_seconds) if deadline else timeout_seconds
+    env = runtime_command_env(args, env)
     try:
         result = subprocess.run(
             args,
@@ -216,12 +326,18 @@ def health_config(value: dict[str, Any] | None) -> dict[str, Any]:
     test = value.get("Test") or []
     return {
         "configured": True,
+        # Healthcheck command vectors contain no credentials and are retained
+        # so post-apply verification binds healthy status to the trusted probe.
+        "test": test,
         "test_sha256": sha256_bytes(json.dumps(test, separators=(",", ":")).encode()),
         "test_argv_count": len(test),
         "interval": value.get("Interval"),
         "timeout": value.get("Timeout"),
         "start_period": value.get("StartPeriod"),
         "retries": value.get("Retries"),
+        "interval_ns": duration_ns(value.get("Interval")),
+        "timeout_ns": duration_ns(value.get("Timeout")),
+        "start_period_ns": duration_ns(value.get("StartPeriod")),
     }
 
 
@@ -563,6 +679,93 @@ def queue_snapshot(deadline: OperationDeadline | None = None) -> dict[str, Any]:
     }
 
 
+def settled_queue_snapshot(deadline: OperationDeadline | None = None) -> dict[str, Any]:
+    """Require consecutive zero-work samples before any destructive change."""
+    started = time.monotonic()
+    end = started + QUIESCENCE_MAX_WAIT_SECONDS
+    consecutive = 0
+    observations: list[dict[str, Any]] = []
+    last: dict[str, Any] | None = None
+    while True:
+        last = queue_snapshot(deadline)
+        observations.append(
+            {
+                "observed_at": last.get("observed_at"),
+                "quiescent": last.get("quiescent"),
+                "rabbitmq_empty": (last.get("rabbitmq") or {}).get("empty"),
+                "postgres_counts": (last.get("postgres") or {}).get("counts"),
+            }
+        )
+        if last.get("quiescent"):
+            consecutive += 1
+            if consecutive >= QUIESCENCE_REQUIRED_SAMPLES:
+                last["stability"] = {
+                    "stable": True,
+                    "sample_count": len(observations),
+                    "stable_for_seconds": round(time.monotonic() - started, 3),
+                    "observations": observations,
+                }
+                return last
+        else:
+            consecutive = 0
+        remaining = end - time.monotonic()
+        if deadline:
+            remaining = min(remaining, deadline.remaining())
+        if remaining <= 0:
+            raise GuardError(
+                "queue and active-job state did not remain quiescent for the bounded stability interval"
+            )
+        time.sleep(min(QUIESCENCE_SAMPLE_INTERVAL_SECONDS, remaining))
+
+
+def runtime_context(*, deadline: OperationDeadline | None = None) -> dict[str, Any]:
+    """Prove direct Podman and Docker-compatible Compose share one rootless store."""
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    if uid != EXPECTED_RUNTIME_UID:
+        raise GuardError(
+            f"guard must run as UID {EXPECTED_RUNTIME_UID}; observed {uid}"
+        )
+    podman_info = parse_json_output(
+        run(["podman", "info", "--format", "json"], deadline=deadline),
+        "Podman info",
+    )
+    host = podman_info.get("host") or {}
+    security = host.get("security") or {}
+    rootless = security.get("rootless")
+    if rootless is not True and str(rootless).lower() != "true":
+        raise GuardError("direct Podman runtime is not rootless")
+    store = podman_info.get("store") or {}
+    remote_socket = (host.get("remoteSocket") or {}).get("path")
+    if remote_socket and remote_socket not in EXPECTED_RUNTIME_ENDPOINT:
+        raise GuardError("direct Podman runtime reports a different API socket")
+    docker_info = parse_json_output(
+        run(["docker", "info", "--format", "{{json .}}"], deadline=deadline),
+        "Docker-compatible runtime info",
+    )
+    graph_root = store.get("graphRoot")
+    docker_root = docker_info.get("DockerRootDir")
+    if graph_root and docker_root and graph_root != docker_root:
+        raise GuardError(
+            "Docker Compose and direct Podman report different container stores"
+        )
+    return {
+        "endpoint": EXPECTED_RUNTIME_ENDPOINT,
+        "uid": uid,
+        "podman": {
+            "rootless": True,
+            "graph_root": graph_root,
+            "run_root": store.get("runRoot"),
+            "remote_socket": remote_socket,
+        },
+        "compose": {
+            "docker_host": EXPECTED_RUNTIME_ENDPOINT,
+            "server_version": docker_info.get("ServerVersion"),
+            "name": docker_info.get("Name"),
+            "docker_root_dir": docker_root,
+        },
+    }
+
+
 def capture(
     project_dir: Path, *, deadline: OperationDeadline | None = None
 ) -> dict[str, Any]:
@@ -575,8 +778,9 @@ def capture(
             "hostname": os.uname().nodename,
             "rootless_project": PROJECT,
         },
+        "runtime_context": runtime_context(deadline=deadline),
         "source": source_state(project_dir, deadline=deadline),
-        "job_quiescence": queue_snapshot(deadline),
+        "job_quiescence": settled_queue_snapshot(deadline),
         "containers": inspect_project(deadline=deadline),
     }
 
@@ -591,16 +795,21 @@ def service_map(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
     for container in snapshot.get("containers", []):
         service = container.get("compose", {}).get("com.docker.compose.service")
         if service:
+            if service in result:
+                raise GuardError(f"duplicate Compose service container in snapshot: {service}")
             result[service] = container
     return result
 
 
 def container_name_map(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    return {
-        container["name"]: container
-        for container in snapshot.get("containers", [])
-        if container.get("name")
-    }
+    result: dict[str, dict[str, Any]] = {}
+    for container in snapshot.get("containers", []):
+        name = container.get("name")
+        if name:
+            if name in result:
+                raise GuardError(f"duplicate container name in snapshot: {name}")
+            result[name] = container
+    return result
 
 
 def compare_preserved_runtime(
@@ -668,10 +877,13 @@ def compare_untargeted_runtime(
 def compare_source_and_quiescence(
     baseline: dict[str, Any], current: dict[str, Any]
 ) -> None:
+    if baseline.get("runtime_context") != current.get("runtime_context"):
+        raise GuardError("Compose and direct Podman runtime context changed")
     if baseline.get("source") != current.get("source"):
         raise GuardError("dirty live source state changed since baseline capture")
-    if not current.get("job_quiescence", {}).get("quiescent"):
-        raise GuardError("fresh queue or active-job quiescence check failed")
+    stability = current.get("job_quiescence", {}).get("stability") or {}
+    if not current.get("job_quiescence", {}).get("quiescent") or not stability.get("stable"):
+        raise GuardError("fresh queue or active-job settled-quiescence check failed")
 
 
 def verify_untouched_targets(
@@ -741,6 +953,11 @@ def load_baseline(path: Path) -> dict[str, Any]:
         raise GuardError("baseline source state is incomplete; capture a fresh baseline")
     if not isinstance(baseline.get("containers"), list):
         raise GuardError("baseline container snapshot is missing")
+    if not isinstance(baseline.get("runtime_context"), dict):
+        raise GuardError("baseline runtime context is missing; capture a fresh baseline")
+    stability = baseline.get("job_quiescence", {}).get("stability") or {}
+    if not stability.get("stable"):
+        raise GuardError("baseline quiescence is not settled; capture a fresh baseline")
     return baseline
 
 
@@ -842,10 +1059,52 @@ def compose_config(
     )
 
 
+def compose_environment(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, list):
+        result: dict[str, Any] = {}
+        for item in value:
+            if not isinstance(item, str):
+                raise GuardError("Compose environment contains a non-string entry")
+            key, separator, item_value = item.partition("=")
+            result[key] = item_value if separator else None
+        return result
+    if isinstance(value, dict):
+        return {str(key): item for key, item in value.items()}
+    raise GuardError("Compose environment is not a mapping")
+
+
+def compose_value_hash(value: Any) -> dict[str, Any]:
+    if value is None:
+        raise GuardError("Compose environment contains a host-inherited value")
+    text = str(value)
+    return {"length": len(text), "sha256": sha256_bytes(text.encode())}
+
+
+def check_health_contract(
+    service: str, value: dict[str, Any], *, runtime: bool = False
+) -> None:
+    expected = health_contract(service)
+    test = value.get("test") if not runtime else value.get("test")
+    if test != expected["test"]:
+        raise GuardError(f"healthcheck command identity mismatch for {service}")
+    for field in ("interval_ns", "timeout_ns", "start_period_ns", "retries"):
+        actual = value.get(field)
+        if runtime and field.endswith("_ns") and actual is None:
+            # Older captures did not include normalized timing fields.  A
+            # fresh capture is required because timing identity is part of the
+            # deployment contract.
+            raise GuardError(f"healthcheck timing identity is missing for {service}")
+        if actual != expected[field]:
+            raise GuardError(f"healthcheck {field} mismatch for {service}")
+
+
 def check_candidate_config(
     config: dict[str, Any],
     baseline: dict[str, Any],
     lock: dict[str, Any],
+    baseline_config: dict[str, Any] | None = None,
 ) -> None:
     services = config.get("services") or {}
     missing = set(TARGET_SERVICES) - set(services)
@@ -874,9 +1133,38 @@ def check_candidate_config(
         if EXPECTED_NETWORK not in networks and "default" not in networks:
             raise GuardError(f"candidate service {service} leaves {EXPECTED_NETWORK}")
         healthcheck = candidate.get("healthcheck") or {}
+        unexpected_health_fields = set(healthcheck) - {
+            "test",
+            "interval",
+            "timeout",
+            "start_period",
+            "retries",
+        }
+        if unexpected_health_fields:
+            raise GuardError(
+                f"candidate healthcheck has unsupported fields for {service}: "
+                f"{sorted(unexpected_health_fields)}"
+            )
         health_test = healthcheck.get("test") or []
         if not health_test or health_test == ["NONE"]:
             raise GuardError(f"candidate healthcheck is missing for {service}")
+        check_health_contract(
+            service,
+            {
+                "test": health_test,
+                "interval_ns": duration_ns(healthcheck.get("interval")),
+                "timeout_ns": duration_ns(healthcheck.get("timeout")),
+                "start_period_ns": duration_ns(healthcheck.get("start_period")),
+                "retries": healthcheck.get("retries"),
+            },
+        )
+        probe_mounts = [
+            mount
+            for mount in candidate.get("volumes", [])
+            if mount.get("target") == PROBE_MOUNT_TARGET
+        ]
+        if len(probe_mounts) != 1 or probe_mounts[0].get("read_only") is not True:
+            raise GuardError(f"candidate trusted probe mount is missing or writable for {service}")
         old_mounts = {
             mount["destination"]: mount
             for mount in old[service].get("mounts", [])
@@ -902,45 +1190,43 @@ def check_candidate_config(
                     f"candidate changed {service} mount source for {destination}: "
                     f"{new_source} != {old_source}"
                 )
-            if old_mount.get("rw") is not None and new_mount.get("read_only") is not None:
-                if bool(old_mount["rw"]) == bool(new_mount["read_only"]):
-                    raise GuardError(f"candidate changed mount access for {service} {destination}")
+            candidate_read_only = new_mount.get("read_only", False)
+            if not isinstance(candidate_read_only, bool):
+                raise GuardError(
+                    f"candidate mount access is not a boolean for {service} {destination}"
+                )
+            if old_mount.get("rw") is not None:
+                expected_read_only = not bool(old_mount["rw"])
+                if candidate_read_only != expected_read_only:
+                    raise GuardError(
+                        f"candidate changed mount access for {service} {destination}"
+                    )
         if set(candidate_mounts) != set(old_mounts):
             raise GuardError(f"candidate changed data mounts for {service}")
 
-        candidate_environment = candidate.get("environment") or {}
-        if isinstance(candidate_environment, list):
-            candidate_environment = {
-                item.partition("=")[0]: item.partition("=")[2]
-                for item in candidate_environment
-                if isinstance(item, str)
-            }
-        if not isinstance(candidate_environment, dict):
-            raise GuardError(f"candidate environment is not a mapping for {service}")
-        old_environment = old[service].get("env_hashes") or {}
+        candidate_environment = compose_environment(candidate.get("environment"))
+        authored_services = (baseline_config or {}).get("services") or {}
+        if service not in authored_services:
+            raise GuardError(f"baseline Compose environment is missing for {service}")
+        old_authored_environment = compose_environment(
+            authored_services[service].get("environment")
+        )
         allowed_additions = ALLOWED_ENV_ADDITIONS.get(service, set())
+        for key, value in old_authored_environment.items():
+            if key not in candidate_environment:
+                raise GuardError(f"candidate removed authored environment for {service}: {key}")
+            if compose_value_hash(candidate_environment[key]) != compose_value_hash(value):
+                raise GuardError(f"candidate changed environment for {service}: {key}")
         for key, value in candidate_environment.items():
-            if value is None:
-                # Compose's null means "inherit from the host".  It is not a
-                # deterministic deployment contract and cannot be preflighted.
-                raise GuardError(f"candidate environment is host-inherited for {service}")
-            value_hash = {
-                "length": len(str(value)),
-                "sha256": sha256_bytes(str(value).encode()),
-            }
-            if key in old_environment and old_environment[key] != value_hash:
-                raise GuardError(f"candidate environment changed for {service}: {key}")
-            if key not in old_environment and key not in allowed_additions:
+            if key not in old_authored_environment and key not in allowed_additions:
                 raise GuardError(f"candidate added environment for {service}: {key}")
-        # Compose config does not include image-provided defaults such as PATH,
-        # while the runtime snapshot does.  The post-recreation inspect still
-        # compares the complete environment contract; only the two declared
-        # heartbeat additions are permitted.
 
 
 def compare_baseline_current(
     baseline: dict[str, Any], current: dict[str, Any], *, allow_new_probe: bool
 ) -> None:
+    if baseline.get("runtime_context") != current.get("runtime_context"):
+        raise GuardError("Compose and direct Podman runtime context changed")
     old = service_map(baseline)
     new = service_map(current)
     for service in TARGET_SERVICES:
@@ -973,8 +1259,9 @@ def compare_baseline_current(
             raise GuardError(f"runtime mounts/options drifted for {service}")
         if not previous.get("state", {}).get("running"):
             raise GuardError(f"baseline service {service} was not running")
-    if not current.get("job_quiescence", {}).get("quiescent"):
-        raise GuardError("fresh job quiescence check failed")
+    stability = current.get("job_quiescence", {}).get("stability") or {}
+    if not current.get("job_quiescence", {}).get("quiescent") or not stability.get("stable"):
+        raise GuardError("fresh job quiescence check did not remain settled")
 
 
 def compare_post_apply(
@@ -1021,12 +1308,15 @@ def compare_post_apply(
             raise GuardError(f"post-apply environment additions changed for {service}")
         if not actual["state"].get("running"):
             raise GuardError(f"post-apply service is not running: {service}")
-        if not (actual.get("health", {}).get("configured") or {}).get("configured"):
+        actual_health = actual.get("health", {}).get("configured") or {}
+        if not actual_health.get("configured"):
             raise GuardError(f"post-apply healthcheck is not configured: {service}")
+        check_health_contract(service, actual_health, runtime=True)
         if actual["health"]["runtime"].get("status") != "healthy":
             raise GuardError(f"post-apply service is not healthy: {service}")
-    if not current.get("job_quiescence", {}).get("quiescent"):
-        raise GuardError("post-apply queue snapshot is not quiescent")
+    stability = current.get("job_quiescence", {}).get("stability") or {}
+    if not current.get("job_quiescence", {}).get("quiescent") or not stability.get("stable"):
+        raise GuardError("post-apply queue snapshot is not settled")
 
 
 def require_clean_candidate_source(
@@ -1079,6 +1369,7 @@ def advisory_lock(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=runtime_command_env(["podman"], os.environ.copy()),
     )
     assert process.stdin is not None
     assert process.stdout is not None
@@ -1304,6 +1595,8 @@ def commit_backups(
             raise GuardError(f"backup image has no immutable ID for {service}")
         image = image_rows[0]
         digest = image_digest(image)
+        if not digest:
+            raise GuardError(f"backup image has no immutable digest for {service}")
         backup_images["services"][service] = {
             "reference": tag,
             "id": image["Id"],
@@ -1392,7 +1685,14 @@ def prepare(
         image_override=image_override,
         deadline=operation_deadline,
     )
-    check_candidate_config(config, baseline, lock)
+    authored_baseline = compose_config(
+        Path(args.project_dir),
+        tuple(args.compose_file or DEFAULT_COMPOSE_FILES),
+        candidate_version=lock["candidate_version"],
+        probe_source=Path(args.probe_source),
+        deadline=operation_deadline,
+    )
+    check_candidate_config(config, baseline, lock, authored_baseline)
     return baseline, lock, current
 
 
@@ -1497,7 +1797,9 @@ def verify_rollback_result(
             raise GuardError(f"rollback service is missing: {service}")
         if actual.get("image", {}).get("id") != record.get("id"):
             raise GuardError(f"rollback backup image ID mismatch for {service}")
-        if record.get("digest") and actual.get("image", {}).get("digest") != record.get("digest"):
+        if not record.get("digest"):
+            raise GuardError(f"rollback backup image digest is missing for {service}")
+        if actual.get("image", {}).get("digest") != record.get("digest"):
             raise GuardError(f"rollback backup image digest mismatch for {service}")
         compare_preserved_runtime(previous, actual, service)
         old_health = previous.get("health") or {}
@@ -1587,7 +1889,19 @@ def apply_batch(
             image_override=image_override,
             deadline=operation_deadline,
         )
-        check_candidate_config(config, baseline, lock)
+        authored_baseline = compose_config(
+            Path(args.project_dir),
+            compose_files,
+            candidate_version=lock["candidate_version"],
+            probe_source=Path(args.probe_source),
+            deadline=operation_deadline,
+        )
+        check_candidate_config(config, baseline, lock, authored_baseline)
+        # Take the final settled sample after all preflight commands and
+        # immediately before the targeted Compose mutation.
+        final_quiescence = settled_queue_snapshot(operation_deadline)
+        if not final_quiescence.get("stability", {}).get("stable"):
+            raise GuardError("queue was not settled immediately before targeted recreation")
         targeted_up(
             Path(args.project_dir),
             compose_files,
@@ -1749,6 +2063,10 @@ def command_rollback(args: argparse.Namespace) -> int:
         raise GuardError("backup image manifest has an unsupported schema")
     if set(backup_images.get("services") or {}) != set(TARGET_SERVICES):
         raise GuardError("backup image manifest does not cover the exact target set")
+    for service in TARGET_SERVICES:
+        record = backup_service_record(backup_images, service)
+        if not record.get("id") or not record.get("digest"):
+            raise GuardError(f"backup image manifest lacks immutable identity for {service}")
     replacement_path = backup_dir / "replacements.json"
     if not replacement_path.exists():
         raise GuardError("rollback requires the exact replacement ID manifest")
