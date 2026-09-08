@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).parents[2]
 SCRIPT = ROOT / "docker" / "healthchecks" / "unstract-services.sh"
@@ -518,3 +519,38 @@ def test_python_probe_has_outer_deadline(tmp_path: Path) -> None:
     )
     assert result.returncode != 0
     assert time.monotonic() - started < 4
+
+
+def test_train_overlay_mounts_read_only_probe_and_sets_core_checks() -> None:
+    overlay_path = ROOT / "docker" / "compose.train.healthchecks.yaml"
+    overlay = yaml.safe_load(overlay_path.read_text(encoding="utf-8"))
+    expected = {
+        "db": "db",
+        "redis": "redis",
+        "minio": "minio",
+        "reverse-proxy": "proxy",
+        "qdrant": "vector-db",
+        "rabbitmq": "rabbitmq",
+        "weaviate": "weaviate",
+        "x2text-service": "x2text-service",
+        "platform-service": "platform-service",
+        "backend": "backend",
+        "frontend": "frontend",
+    }
+
+    assert set(overlay["services"]) == set(expected)
+    for service, probe_name in expected.items():
+        config = overlay["services"][service]
+        assert config["volumes"] == [
+            "./healthchecks/unstract-services.sh:/usr/local/bin/unstract-services.sh:ro"
+        ]
+        healthcheck = config["healthcheck"]
+        assert healthcheck["test"] == [
+            "CMD",
+            "/usr/local/bin/unstract-services.sh",
+            probe_name,
+        ]
+        assert healthcheck["interval"] == "30s"
+        assert healthcheck["timeout"] == "10s"
+        assert healthcheck["retries"] == 3
+        assert isinstance(healthcheck["start_period"], str)

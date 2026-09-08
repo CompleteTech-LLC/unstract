@@ -1,0 +1,98 @@
+# Train health coverage overlay.
+#
+# Apply this file after docker/compose.train.yaml:
+#
+#   docker compose -f docker/docker-compose.yaml \
+#     -f docker/compose.train.yaml \
+#     -f docker/compose.train.healthchecks.yaml up -d
+#
+# The overlay only adds a read-only probe mount and a bounded application
+# healthcheck.  It does not replace ports, volumes, images, environment, or
+# container names from the owner Compose files.  The existing worker and runner
+# checks remain defined in docker/docker-compose.yaml.
+
+x-unstract-service-probe: &unstract_service_probe
+  - ./healthchecks/unstract-services.sh:/usr/local/bin/unstract-services.sh:ro
+
+x-unstract-healthcheck: &unstract_healthcheck
+  interval: 30s
+  timeout: 10s
+  retries: 3
+
+services:
+  db:
+    volumes: *unstract_service_probe
+    healthcheck:
+      <<: *unstract_healthcheck
+      start_period: 30s
+      test: ["CMD", "/usr/local/bin/unstract-services.sh", "db"]
+
+  redis:
+    volumes: *unstract_service_probe
+    healthcheck:
+      <<: *unstract_healthcheck
+      start_period: 15s
+      test: ["CMD", "/usr/local/bin/unstract-services.sh", "redis"]
+
+  minio:
+    volumes: *unstract_service_probe
+    healthcheck:
+      <<: *unstract_healthcheck
+      start_period: 60s
+      test: ["CMD", "/usr/local/bin/unstract-services.sh", "minio"]
+
+  reverse-proxy:
+    volumes: *unstract_service_probe
+    healthcheck:
+      <<: *unstract_healthcheck
+      start_period: 60s
+      test: ["CMD", "/usr/local/bin/unstract-services.sh", "proxy"]
+
+  qdrant:
+    volumes: *unstract_service_probe
+    healthcheck:
+      <<: *unstract_healthcheck
+      start_period: 60s
+      test: ["CMD", "/usr/local/bin/unstract-services.sh", "vector-db"]
+
+  rabbitmq:
+    volumes: *unstract_service_probe
+    healthcheck:
+      <<: *unstract_healthcheck
+      start_period: 60s
+      test: ["CMD", "/usr/local/bin/unstract-services.sh", "rabbitmq"]
+
+  weaviate:
+    volumes: *unstract_service_probe
+    healthcheck:
+      <<: *unstract_healthcheck
+      start_period: 120s
+      test: ["CMD", "/usr/local/bin/unstract-services.sh", "weaviate"]
+
+  x2text-service:
+    volumes: *unstract_service_probe
+    healthcheck:
+      <<: *unstract_healthcheck
+      start_period: 120s
+      test: ["CMD", "/usr/local/bin/unstract-services.sh", "x2text-service"]
+
+  platform-service:
+    volumes: *unstract_service_probe
+    healthcheck:
+      <<: *unstract_healthcheck
+      start_period: 120s
+      test: ["CMD", "/usr/local/bin/unstract-services.sh", "platform-service"]
+
+  backend:
+    volumes: *unstract_service_probe
+    healthcheck:
+      <<: *unstract_healthcheck
+      start_period: 180s
+      test: ["CMD", "/usr/local/bin/unstract-services.sh", "backend"]
+
+  frontend:
+    volumes: *unstract_service_probe
+    healthcheck:
+      <<: *unstract_healthcheck
+      start_period: 60s
+      test: ["CMD", "/usr/local/bin/unstract-services.sh", "frontend"]

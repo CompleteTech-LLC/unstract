@@ -24,7 +24,8 @@ healthcheck:
   retries: 3
 ```
 
-The exact service contracts and a prepared Train fragment are kept in the
-private integration evidence bundle for the deployment owner.  The script's
-endpoint and command paths can be overridden with environment variables for
-isolated contract tests; production defaults target service-local listeners.
+The tracked `docker/compose.train.healthchecks.yaml` overlay mounts this probe
+read-only and supplies the eleven core service checks.  Apply it after the
+Train-only `docker/compose.train.yaml` file.  The script's endpoint and command
+paths can be overridden with environment variables for isolated contract
+tests; production defaults target service-local listeners.
