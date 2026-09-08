@@ -394,10 +394,39 @@ def normalize_mount(mount: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_bind_mount_source(value: Any) -> Any:
-    """Compare bind sources by absolute lexical identity without resolving symlinks."""
+    """Return a bind source's filesystem-aware absolute identity.
+
+    Resolve symlinks before comparing paths so a parent segment such as
+    ``docker/../data`` cannot hide a symlink that redirects the bind source.
+    Keep relative-path handling separate from ``abspath`` because ``abspath``
+    normalizes ``..`` before symlink resolution.
+    """
     if not isinstance(value, str) or not value:
         return value
-    return os.path.normpath(os.path.abspath(value))
+    if not os.path.isabs(value):
+        value = os.path.join(os.getcwd(), value)
+    return os.path.realpath(value)
+
+
+def bind_mount_sources_match(left: Any, right: Any) -> bool:
+    """Compare bind sources while failing closed on uncertain filesystem state."""
+    left_path = normalize_bind_mount_source(left)
+    right_path = normalize_bind_mount_source(right)
+    if not isinstance(left_path, str) or not isinstance(right_path, str):
+        return False
+    try:
+        left_exists = os.path.exists(left_path)
+        right_exists = os.path.exists(right_path)
+    except OSError:
+        return False
+    if left_exists != right_exists:
+        return False
+    if left_exists:
+        try:
+            return os.path.samefile(left_path, right_path)
+        except OSError:
+            return False
+    return left_path == right_path
 
 
 def compose_mount_source(config: dict[str, Any], mount: dict[str, Any]) -> Any:
@@ -1224,6 +1253,10 @@ def check_candidate_config(
             new_mount = candidate_mounts.get(destination)
             if not new_mount:
                 raise GuardError(f"candidate removed {service} mount {destination}")
+            if old_mount.get("type") != new_mount.get("type"):
+                raise GuardError(
+                    f"candidate changed {service} mount type for {destination}"
+                )
             old_source = (
                 old_mount.get("name") or old_mount.get("source")
                 if old_mount.get("type") == "volume"
@@ -1233,9 +1266,7 @@ def check_candidate_config(
             if old_mount.get("type") == "volume" or new_mount.get("type") == "volume":
                 sources_match = old_source == new_source
             else:
-                sources_match = normalize_bind_mount_source(
-                    old_source
-                ) == normalize_bind_mount_source(new_source)
+                sources_match = bind_mount_sources_match(old_source, new_source)
             if old_source and new_source and not sources_match:
                 raise GuardError(
                     f"candidate changed {service} mount source for {destination}: "

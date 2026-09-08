@@ -193,6 +193,86 @@ def test_bind_mount_source_rejects_distinct_path() -> None:
         guard.check_candidate_config(config, baseline, lock, authored)
 
 
+def test_bind_mount_source_rejects_symlink_parent_to_distinct_physical_path(
+    tmp_path: Path,
+) -> None:
+    config, baseline, lock, authored = candidate_fixture()
+    live_source = tmp_path / "data"
+    redirected_source = tmp_path / "other" / "data"
+    live_source.mkdir()
+    redirected_source.mkdir(parents=True)
+    symlink_parent = tmp_path / "docker"
+    symlink_parent.symlink_to(tmp_path / "other" / "nested", target_is_directory=True)
+    db_container = next(
+        container
+        for container in baseline["containers"]
+        if container["compose"]["com.docker.compose.service"] == "db"
+    )
+    db_container["mounts"] = [
+        {
+            "type": "bind",
+            "source": str(live_source),
+            "destination": "/data/tool_registry_config",
+            "rw": True,
+            "options": [],
+        }
+    ]
+    trusted_probe = {
+        "type": "bind",
+        "source": "/staged/unstract-services.sh",
+        "target": guard.PROBE_MOUNT_TARGET,
+        "read_only": True,
+    }
+    config["services"]["db"]["volumes"] = [
+        trusted_probe,
+        {
+            "type": "bind",
+            "source": str(symlink_parent / ".." / "data"),
+            "target": "/data/tool_registry_config",
+            "read_only": False,
+        },
+    ]
+    authored["services"]["db"]["volumes"] = config["services"]["db"]["volumes"]
+
+    with pytest.raises(guard.GuardError, match="mount source"):
+        guard.check_candidate_config(config, baseline, lock, authored)
+
+
+def test_mount_type_change_rejected_even_when_source_matches() -> None:
+    config, baseline, lock, authored = candidate_fixture()
+    volume_name = "unstract-etl-home-complete-tech_prompt_studio_data"
+    executor = next(
+        container
+        for container in baseline["containers"]
+        if container["compose"]["com.docker.compose.service"]
+        == "worker-pg-executor"
+    )
+    executor["mounts"] = [
+        {
+            "type": "volume",
+            "name": volume_name,
+            "source": f"/var/lib/containers/storage/volumes/{volume_name}/_data",
+            "destination": "/app/prompt-studio-data",
+            "rw": True,
+            "options": [],
+        }
+    ]
+    config["services"]["worker-pg-executor"]["volumes"] = [
+        {
+            "type": "bind",
+            "source": volume_name,
+            "target": "/app/prompt-studio-data",
+            "read_only": False,
+        }
+    ]
+    authored["services"]["worker-pg-executor"]["volumes"] = config["services"][
+        "worker-pg-executor"
+    ]["volumes"]
+
+    with pytest.raises(guard.GuardError, match="mount type"):
+        guard.check_candidate_config(config, baseline, lock, authored)
+
+
 def test_named_volume_alias_resolves_to_live_name() -> None:
     config, baseline, lock, authored = candidate_fixture()
     volume_name = "unstract-etl-home-complete-tech_prompt_studio_data"
