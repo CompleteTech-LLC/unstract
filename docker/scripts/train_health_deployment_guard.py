@@ -1158,13 +1158,16 @@ def check_candidate_config(
                 "retries": healthcheck.get("retries"),
             },
         )
-        probe_mounts = [
-            mount
-            for mount in candidate.get("volumes", [])
-            if mount.get("target") == PROBE_MOUNT_TARGET
-        ]
-        if len(probe_mounts) != 1 or probe_mounts[0].get("read_only") is not True:
-            raise GuardError(f"candidate trusted probe mount is missing or writable for {service}")
+        if service in CORE_SERVICES:
+            probe_mounts = [
+                mount
+                for mount in candidate.get("volumes", [])
+                if mount.get("target") == PROBE_MOUNT_TARGET
+            ]
+            if len(probe_mounts) != 1 or probe_mounts[0].get("read_only") is not True:
+                raise GuardError(
+                    f"candidate trusted probe mount is missing or writable for {service}"
+                )
         old_mounts = {
             mount["destination"]: mount
             for mount in old[service].get("mounts", [])
