@@ -9,8 +9,6 @@ Before=podman-restart.service
 # Requires edge in the podman-restart drop-in then schedules a fresh replay in
 # the same restart transaction instead of reusing RemainAfterExit state.
 PartOf=podman-restart.service
-ConditionPathExists=%h/.config/unstract/durable-replay.env
-ConditionPathExists=%h/.local/libexec/unstract-durable-replay.py
 
 [Service]
 Type=oneshot

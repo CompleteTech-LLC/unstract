@@ -418,6 +418,8 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
         "TOOL_REGISTRY_CONFIG_SRC_PATH=/srv/tool-registry\nCOMPOSE_PROJECT_NAME=test\n",
         encoding="utf-8",
     )
+    compose = tmp_path / "compose.yaml"
+    compose.write_text("services: {}\n", encoding="utf-8")
     calls: list[tuple[list[str], dict[str, str] | None]] = []
 
     def fake_run(
@@ -425,26 +427,46 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
         *,
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
-        **_: object,
+        **kwargs: object,
     ) -> subprocess.CompletedProcess[str]:
         calls.append((args, env))
         if "config" in args:
-            bound_files = [
-                Path(argument)
+            bound_files = {
+                argument
                 for argument in args
                 if argument.startswith("/proc/self/fd/")
-            ]
-            assert len(bound_files) == 2
-            original_image = image_override.read_bytes()
-            image_override.write_text("tampered after final verification\n", encoding="utf-8")
+            }
+            assert len(bound_files) == 4
+            assert str(live_env) not in args
+            assert str(compose) not in args
+            assert str(image_override) not in args
+            assert str(environment_override) not in args
+            assert env is not None
+            bound_probe = env["UNSTRACT_HEALTHCHECK_SOURCE"]
+            assert bound_probe.startswith("/proc/self/fd/")
+            bound_paths = {Path(value) for value in bound_files | {bound_probe}}
+            assert len(bound_paths) == 5
+            originals = {
+                compose: compose.read_bytes(),
+                live_env: live_env.read_bytes(),
+                probe: probe.read_bytes(),
+                image_override: image_override.read_bytes(),
+                environment_override: environment_override.read_bytes(),
+            }
+            for source in originals:
+                source.write_bytes(b"tampered after final verification\n")
             try:
-                assert any(path.read_bytes() == original_image for path in bound_files)
+                for source, original in originals.items():
+                    assert any(path.read_bytes() == original for path in bound_paths), source
             finally:
-                image_override.write_bytes(original_image)
+                for source, original in originals.items():
+                    source.write_bytes(original)
             env_file = Path(args[args.index("--env-file") + 1])
             assert "TOOL_REGISTRY_CONFIG_SRC_PATH=/srv/tool-registry" in env_file.read_text(
                 encoding="utf-8"
             )
+            assert Path(bound_probe).read_bytes() == originals[probe]
+            assert kwargs["pass_fds"]
             return subprocess.CompletedProcess(args, 0, json.dumps({"services": {}}), "")
         return subprocess.CompletedProcess(args, 0, "", "")
 
@@ -481,14 +503,15 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
 
     assert len(calls) == 2
     config_args, config_env = calls[0]
-    assert config_args[:3] == ["docker", "compose", "--env-file"]
-    assert str(live_env) in config_args
+    assert config_args[:3] == ["docker", "compose", "--project-directory"]
+    assert str(tmp_path.resolve()) in config_args
+    assert str(live_env) not in config_args
     assert str(settings) not in config_args
     assert str(image_override) not in config_args
     assert str(environment_override) not in config_args
-    assert sum(argument.startswith("/proc/self/fd/") for argument in config_args) == 2
+    assert sum(argument.startswith("/proc/self/fd/") for argument in config_args) == 4
     assert config_env and config_env["VERSION"] == "goal09-test"
-    assert config_env["UNSTRACT_HEALTHCHECK_SOURCE"] == str(probe)
+    assert config_env["UNSTRACT_HEALTHCHECK_SOURCE"].startswith("/proc/self/fd/")
     assert calls[1][0][-1] == "runner"
 
     monkeypatch.setattr(guard, "verify_candidate_source_state", lambda *_: None)
@@ -551,6 +574,7 @@ def test_compose_rejects_ignored_live_input_drift(tmp_path: Path) -> None:
 
 
 def test_compose_rechecks_candidate_artifacts_before_each_config(tmp_path: Path) -> None:
+    (tmp_path / "compose.yaml").write_text("services: {}\n", encoding="utf-8")
     source = tmp_path / "candidate"
     source.mkdir()
     source_root = GUARD_PATH.parents[2]

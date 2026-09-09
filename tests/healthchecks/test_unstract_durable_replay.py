@@ -66,6 +66,7 @@ def test_launcher_builds_guarded_start_with_all_persistent_inputs(tmp_path: Path
     ("name", "value", "message"),
     [
         ("UNSTRACT_GUARD", "relative/guard.py", "absolute path"),
+        ("UNSTRACT_COMPOSE_BASE", "", "UNSTRACT_COMPOSE_BASE is required"),
         ("UNSTRACT_START_CONFIRM", "APPLY_UNSTRACT_HEALTH", "does not authorize"),
         ("UNSTRACT_OPERATION_TIMEOUT", "0", "positive integer"),
     ],
@@ -89,5 +90,6 @@ def test_systemd_owner_orders_guard_before_generic_restart() -> None:
     assert "ExecStart=/usr/bin/python3 %h/.local/libexec/unstract-durable-replay.py" in unit
     assert "PartOf=podman-restart.service" in unit
     assert "WantedBy=default.target" in unit
+    assert "ConditionPathExists" not in unit
     assert "Requires=unstract-durable-replay.service" in drop_in
     assert "After=unstract-durable-replay.service" in drop_in

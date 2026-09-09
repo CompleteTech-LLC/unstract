@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import errno
 import fcntl
 import hashlib
 import json
@@ -395,33 +396,61 @@ def _immutable_snapshot_fd(data: bytes) -> tuple[int, tempfile.TemporaryFile[byt
     return fd, temporary
 
 
+def _compose_input_path(project_dir: Path, value: str | Path) -> Path:
+    """Resolve a Compose input the same way the explicit project directory does."""
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return project_dir.resolve() / path
+
+
+def _open_compose_input(path: Path) -> int:
+    """Open a Compose input without following a mutable pathname in place."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        return os.open(path, flags)
+    except OSError as exc:
+        # A live .env or Compose file may be a symlink. Resolve it once and
+        # snapshot the target; the final source fingerprint check still runs
+        # before the child launch, while the child consumes the bound bytes.
+        if exc.errno != getattr(errno, "ELOOP", 40):
+            raise
+        try:
+            return os.open(path.resolve(strict=True), flags)
+        except OSError:
+            raise exc
+
+
 @contextlib.contextmanager
-def bound_private_compose_file(
+def bound_compose_file(
     path: Path,
     *,
     expected_sha256: str | None,
     description: str,
+    private: bool = False,
 ) -> Iterator[tuple[str, int]]:
-    """Bind a verified private Compose file to an immutable child-visible fd.
+    """Bind one Compose input to an immutable child-visible descriptor.
 
     Hashing the pathname and then passing that pathname to Compose leaves a
     same-user write window between verification and subprocess open. Read the
     reviewed bytes first, seal a memfd snapshot, and pass the descriptor to
-    Compose through ``/proc/self/fd``. The original path can change after this
-    point without changing the bytes that the child parses.
+    Compose through ``/proc/self/fd``. The original path can change after
+    this point without changing the bytes that the child parses. Private
+    replay files retain their stricter mode and ownership contract.
     """
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        source_fd = os.open(path, flags)
+        source_fd = _open_compose_input(path)
     except OSError as exc:
         raise GuardError(f"cannot read private {description}: {path}") from exc
     snapshot_fd: int | None = None
     temporary: tempfile.TemporaryFile[bytes] | None = None
     try:
         metadata = os.fstat(source_fd)
-        if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
+        if not stat.S_ISREG(metadata.st_mode):
+            raise GuardError(f"{description} is not a regular file: {path}")
+        if private and stat.S_IMODE(metadata.st_mode) != 0o600:
             raise GuardError(f"{description} is not a private regular file: {path}")
-        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        if private and hasattr(os, "getuid") and metadata.st_uid != os.getuid():
             raise GuardError(f"{description} has the wrong owner: {path}")
         data = _read_fd(source_fd)
         actual_sha256 = sha256_bytes(data)
@@ -444,36 +473,82 @@ def bound_private_compose_file(
 
 
 @contextlib.contextmanager
-def bound_private_compose_inputs(
+def bound_compose_inputs(
     *,
+    project_dir: Path,
+    compose_files: tuple[str, ...],
+    live_env_file: Path | None,
+    probe_source: Path,
+    probe_source_sha256: str | None,
     image_override: Path | None,
     image_override_sha256: str | None,
     environment_override: Path | None,
     environment_override_sha256: str | None,
 ) -> Iterator[tuple[dict[str, str], tuple[int, ...]]]:
-    """Snapshot each private override and return path replacements plus fds."""
+    """Snapshot every file Compose and its interpolation environment consume."""
     replacements: dict[str, str] = {}
     pass_fds: list[int] = []
     with contextlib.ExitStack() as stack:
-        inputs = (
-            (image_override, image_override_sha256, "candidate image override"),
+        inputs: list[tuple[str, Path, str | None, str, bool]] = []
+        for compose_file in compose_files:
+            inputs.append(
+                (
+                    compose_file,
+                    _compose_input_path(project_dir, compose_file),
+                    None,
+                    "Compose file",
+                    False,
+                )
+            )
+        if live_env_file:
+            inputs.append(
+                (
+                    str(live_env_file),
+                    _compose_input_path(project_dir, live_env_file),
+                    None,
+                    "Compose environment file",
+                    False,
+                )
+            )
+        inputs.append(
             (
-                environment_override,
-                environment_override_sha256,
-                "runtime environment override",
-            ),
+                str(probe_source),
+                _compose_input_path(project_dir, probe_source),
+                probe_source_sha256,
+                "health probe source",
+                False,
+            )
         )
-        for path, expected_sha256, description in inputs:
-            if path is None:
-                continue
+        if image_override:
+            inputs.append(
+                (
+                    str(image_override),
+                    image_override,
+                    image_override_sha256,
+                    "candidate image override",
+                    True,
+                )
+            )
+        if environment_override:
+            inputs.append(
+                (
+                    str(environment_override),
+                    environment_override,
+                    environment_override_sha256,
+                    "runtime environment override",
+                    True,
+                )
+            )
+        for argument, path, expected_sha256, description, private in inputs:
             proc_path, fd = stack.enter_context(
-                bound_private_compose_file(
+                bound_compose_file(
                     path,
                     expected_sha256=expected_sha256,
                     description=description,
+                    private=private,
                 )
             )
-            replacements[str(path)] = proc_path
+            replacements[argument] = proc_path
             pass_fds.append(fd)
         yield replacements, tuple(pass_fds)
 
@@ -1466,13 +1541,14 @@ def compose_config(
             environment_override, expected_sha256=environment_override_sha256
         )
         files += (str(environment_override),)
-    args = ["docker", "compose"]
-    if live_env_file:
-        args.extend(["--env-file", str(live_env_file)])
-    for compose_file in files:
-        args.extend(["-f", compose_file])
+    args = compose_args(project_dir, files, live_env_file=live_env_file)
     args.extend(["config", "--format", "json"])
-    with bound_private_compose_inputs(
+    with bound_compose_inputs(
+        project_dir=project_dir,
+        compose_files=files,
+        live_env_file=live_env_file,
+        probe_source=probe_source,
+        probe_source_sha256=probe_source_sha256,
         image_override=image_override,
         image_override_sha256=image_override_sha256,
         environment_override=environment_override,
@@ -1497,9 +1573,11 @@ def compose_config(
         )
         if final_settings:
             env["VERSION"] = final_settings["VERSION"]
-            env["UNSTRACT_HEALTHCHECK_SOURCE"] = final_settings[
-                "UNSTRACT_HEALTHCHECK_SOURCE"
-            ]
+        env["UNSTRACT_HEALTHCHECK_SOURCE"] = bound_paths.get(
+            str(probe_source), final_settings["UNSTRACT_HEALTHCHECK_SOURCE"]
+            if final_settings
+            else env["UNSTRACT_HEALTHCHECK_SOURCE"]
+        )
         result = run(
             bound_args,
             cwd=project_dir,
@@ -2305,9 +2383,12 @@ def capture_and_write(
 
 
 def compose_args(
-    compose_files: tuple[str, ...], *, live_env_file: Path | None = None
+    project_dir: Path,
+    compose_files: tuple[str, ...],
+    *,
+    live_env_file: Path | None = None,
 ) -> list[str]:
-    args = ["docker", "compose"]
+    args = ["docker", "compose", "--project-directory", str(project_dir.resolve())]
     if live_env_file:
         args.extend(["--env-file", str(live_env_file)])
     for compose_file in compose_files:
@@ -2589,7 +2670,7 @@ def targeted_up(
             environment_override, expected_sha256=environment_override_sha256
         )
         files += (str(environment_override),)
-    args = compose_args(files, live_env_file=live_env_file)
+    args = compose_args(project_dir, files, live_env_file=live_env_file)
     args.extend(
         [
             "up",
@@ -2602,7 +2683,12 @@ def targeted_up(
             *services,
         ]
     )
-    with bound_private_compose_inputs(
+    with bound_compose_inputs(
+        project_dir=project_dir,
+        compose_files=files,
+        live_env_file=live_env_file,
+        probe_source=probe_source,
+        probe_source_sha256=probe_source_sha256,
         image_override=image_override,
         image_override_sha256=image_override_sha256,
         environment_override=environment_override,
@@ -2627,9 +2713,11 @@ def targeted_up(
         )
         if final_settings:
             env["VERSION"] = final_settings["VERSION"]
-            env["UNSTRACT_HEALTHCHECK_SOURCE"] = final_settings[
-                "UNSTRACT_HEALTHCHECK_SOURCE"
-            ]
+        env["UNSTRACT_HEALTHCHECK_SOURCE"] = bound_paths.get(
+            str(probe_source), final_settings["UNSTRACT_HEALTHCHECK_SOURCE"]
+            if final_settings
+            else env["UNSTRACT_HEALTHCHECK_SOURCE"]
+        )
         run(
             bound_args,
             cwd=project_dir,
@@ -2682,9 +2770,14 @@ def compose_start(
         environment_override, expected_sha256=environment_override_sha256
     )
     files = compose_files + (str(image_override), str(environment_override))
-    args = compose_args(files, live_env_file=live_env_file)
+    args = compose_args(project_dir, files, live_env_file=live_env_file)
     args.extend(["up", "-d", "--no-build", "--pull", "never"])
-    with bound_private_compose_inputs(
+    with bound_compose_inputs(
+        project_dir=project_dir,
+        compose_files=files,
+        live_env_file=live_env_file,
+        probe_source=probe_source,
+        probe_source_sha256=probe_source_sha256,
         image_override=image_override,
         image_override_sha256=image_override_sha256,
         environment_override=environment_override,
@@ -2709,9 +2802,11 @@ def compose_start(
         )
         if final_settings:
             env["VERSION"] = final_settings["VERSION"]
-            env["UNSTRACT_HEALTHCHECK_SOURCE"] = final_settings[
-                "UNSTRACT_HEALTHCHECK_SOURCE"
-            ]
+        env["UNSTRACT_HEALTHCHECK_SOURCE"] = bound_paths.get(
+            str(probe_source), final_settings["UNSTRACT_HEALTHCHECK_SOURCE"]
+            if final_settings
+            else env["UNSTRACT_HEALTHCHECK_SOURCE"]
+        )
         run(
             bound_args,
             cwd=project_dir,
