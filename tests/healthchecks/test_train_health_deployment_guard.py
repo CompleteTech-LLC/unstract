@@ -429,6 +429,18 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
     ) -> subprocess.CompletedProcess[str]:
         calls.append((args, env))
         if "config" in args:
+            bound_files = [
+                Path(argument)
+                for argument in args
+                if argument.startswith("/proc/self/fd/")
+            ]
+            assert len(bound_files) == 2
+            original_image = image_override.read_bytes()
+            image_override.write_text("tampered after final verification\n", encoding="utf-8")
+            try:
+                assert any(path.read_bytes() == original_image for path in bound_files)
+            finally:
+                image_override.write_bytes(original_image)
             env_file = Path(args[args.index("--env-file") + 1])
             assert "TOOL_REGISTRY_CONFIG_SRC_PATH=/srv/tool-registry" in env_file.read_text(
                 encoding="utf-8"
@@ -472,8 +484,9 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
     assert config_args[:3] == ["docker", "compose", "--env-file"]
     assert str(live_env) in config_args
     assert str(settings) not in config_args
-    assert str(image_override) in config_args
-    assert str(environment_override) in config_args
+    assert str(image_override) not in config_args
+    assert str(environment_override) not in config_args
+    assert sum(argument.startswith("/proc/self/fd/") for argument in config_args) == 2
     assert config_env and config_env["VERSION"] == "goal09-test"
     assert config_env["UNSTRACT_HEALTHCHECK_SOURCE"] == str(probe)
     assert calls[1][0][-1] == "runner"

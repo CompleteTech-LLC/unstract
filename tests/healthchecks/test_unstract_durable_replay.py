@@ -87,6 +87,7 @@ def test_systemd_owner_orders_guard_before_generic_restart() -> None:
     assert "Requires=train-rootless-boot-recovery.service" in unit
     assert "Before=podman-restart.service" in unit
     assert "ExecStart=/usr/bin/python3 %h/.local/libexec/unstract-durable-replay.py" in unit
+    assert "PartOf=podman-restart.service" in unit
     assert "WantedBy=default.target" in unit
     assert "Requires=unstract-durable-replay.service" in drop_in
     assert "After=unstract-durable-replay.service" in drop_in

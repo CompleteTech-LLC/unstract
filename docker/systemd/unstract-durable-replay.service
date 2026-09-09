@@ -5,6 +5,10 @@ Wants=network-online.target podman.socket
 Requires=train-rootless-boot-recovery.service
 After=network-online.target podman.socket train-rootless-boot-recovery.service
 Before=podman-restart.service
+# A restart of the generic owner must stop this settled oneshot first. Its
+# Requires edge in the podman-restart drop-in then schedules a fresh replay in
+# the same restart transaction instead of reusing RemainAfterExit state.
+PartOf=podman-restart.service
 ConditionPathExists=%h/.config/unstract/durable-replay.env
 ConditionPathExists=%h/.local/libexec/unstract-durable-replay.py
 
