@@ -97,9 +97,14 @@ replay-manifest files from
 this lock, so every health, environment, and image replay uses the same
 immutable references, `VERSION`, and staged probe path. The replay manifest
 binds those three private files, the candidate lock, source commit/tree, probe
-digest, and reviewed environment-key set. These artifacts remain
-in the preflight state directory and apply backup directory for later startup
-or recovery; the guard validates their SHA-256 values before each Compose
+digest, reviewed environment-key set, and a retained Compose snapshot. That
+snapshot copies every Compose file and literal `include` target into a
+daemon-visible tree with the original relative layout, stores the live env
+file and private overrides in the same tree, and places the probe at a stable
+helper mount path. Snapshot files and directories are non-writable and every
+entry is hash-checked before Compose starts. These artifacts remain in the
+preflight state directory and apply backup directory for later startup or
+recovery; the guard validates their SHA-256 values before each Compose
 invocation. Only `runner` and the twelve
 worker services point at the new build; backend, frontend, platform-service,
 x2text-service, and the seven core data services point at the captured static
@@ -226,12 +231,15 @@ rows, zero claimed or scheduled queue rows, zero active barriers, and zero
 orchestration claims. Terminal result and dedup rows are recorded separately
 and are not mistaken for active jobs.
 
-Use the live dirty Compose files plus the staged overlays. This preserves the
-local embedding includes, port changes, env files, named volumes, bind mounts,
-container names, and network ownership. The live `docker/.env` derives
-`TOOL_REGISTRY_CONFIG_SRC_PATH` from `PWD`, so preserve the Train Compose
-working-directory value while the guard still uses the project root for
-Compose:
+Use the live dirty Compose files plus the staged overlays. Preflight freezes
+those files, their literal includes, referenced env and bind files, the live
+`docker/.env`, and the health probe into a retained daemon-visible snapshot.
+Runtime data directories remain at their original paths through validated
+snapshot passthroughs. This preserves the local embedding includes, port
+changes, env files, named volumes, bind mounts, container names, and network
+ownership. The live `docker/.env` derives `TOOL_REGISTRY_CONFIG_SRC_PATH` from
+`PWD`, so preserve the Train Compose working-directory value while the guard
+still passes the project root explicitly to Compose:
 
 ```sh
 export PWD=/home/completetrain/etl.home.complete.tech/docker

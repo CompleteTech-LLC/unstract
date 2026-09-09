@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
+import sys
 from copy import deepcopy
 from pathlib import Path
 
@@ -346,6 +348,24 @@ def test_replay_manifest_binds_private_runtime_override_hash(tmp_path: Path) -> 
     )
     runtime = tmp_path / guard.RUNTIME_ENVIRONMENT_FILENAME
     guard.write_runtime_environment_override({}, runtime)
+    compose = tmp_path / "docker" / "compose.yaml"
+    compose.parent.mkdir()
+    compose.write_text("include:\n  - included.yaml\nservices: {}\n", encoding="utf-8")
+    (compose.parent / "included.yaml").write_text("services: {}\n", encoding="utf-8")
+    live_env = tmp_path / "docker" / ".env"
+    live_env.write_text("COMPOSE_PROJECT_NAME=test\n", encoding="utf-8")
+    snapshot = guard.create_compose_snapshot(
+        state_dir=tmp_path / "state",
+        project_dir=tmp_path,
+        compose_files=("docker/compose.yaml", str(image_override), str(runtime)),
+        live_env_file=live_env,
+        probe_source=probe,
+        probe_source_sha256=probe_sha256,
+        image_override=image_override,
+        image_override_sha256=guard.sha256_file(image_override),
+        environment_override=runtime,
+        environment_override_sha256=guard.sha256_file(runtime),
+    )
     manifest = tmp_path / guard.REPLAY_MANIFEST_FILENAME
 
     guard.write_replay_manifest(
@@ -357,6 +377,7 @@ def test_replay_manifest_binds_private_runtime_override_hash(tmp_path: Path) -> 
         runtime_environment_override=runtime,
         probe_source=probe,
         probe_source_sha256=probe_sha256,
+        snapshot=snapshot,
     )
     loaded = guard.load_replay_manifest(
         manifest,
@@ -367,8 +388,10 @@ def test_replay_manifest_binds_private_runtime_override_hash(tmp_path: Path) -> 
         runtime_environment_override=runtime,
         probe_source=probe,
         probe_source_sha256=probe_sha256,
+        state_dir=tmp_path / "state",
     )
     assert loaded["runtime_environment_sha256"] == guard.sha256_file(runtime)
+    assert loaded["compose_snapshot"].probe_path.read_bytes() == probe.read_bytes()
     assert manifest.stat().st_mode & 0o777 == 0o600
 
     runtime.write_text(runtime.read_text(encoding="utf-8") + "# changed\n", encoding="utf-8")
@@ -382,6 +405,7 @@ def test_replay_manifest_binds_private_runtime_override_hash(tmp_path: Path) -> 
             runtime_environment_override=runtime,
             probe_source=probe,
             probe_source_sha256=probe_sha256,
+            state_dir=tmp_path / "state",
         )
 
 
@@ -419,7 +443,20 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
         encoding="utf-8",
     )
     compose = tmp_path / "compose.yaml"
-    compose.write_text("services: {}\n", encoding="utf-8")
+    compose.write_text("include:\n  - included.yaml\nservices: {}\n", encoding="utf-8")
+    (tmp_path / "included.yaml").write_text("services: {}\n", encoding="utf-8")
+    snapshot = guard.create_compose_snapshot(
+        state_dir=tmp_path / "state",
+        project_dir=tmp_path,
+        compose_files=("compose.yaml", str(image_override), str(environment_override)),
+        live_env_file=live_env,
+        probe_source=probe,
+        probe_source_sha256=probe_sha256,
+        image_override=image_override,
+        image_override_sha256=guard.sha256_file(image_override),
+        environment_override=environment_override,
+        environment_override_sha256=guard.sha256_file(environment_override),
+    )
     calls: list[tuple[list[str], dict[str, str] | None]] = []
 
     def fake_run(
@@ -432,18 +469,21 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
         calls.append((args, env))
         if "config" in args:
             bound_files = {
-                argument
-                for argument in args
-                if argument.startswith("/proc/self/fd/")
+                args[index + 1]
+                for index, argument in enumerate(args[:-1])
+                if argument == "-f"
             }
+            bound_files.add(args[args.index("--env-file") + 1])
             assert len(bound_files) == 4
+            assert all(path.startswith(str(snapshot.root)) for path in bound_files)
+            assert all(Path(path).is_file() for path in bound_files)
             assert str(live_env) not in args
             assert str(compose) not in args
             assert str(image_override) not in args
             assert str(environment_override) not in args
             assert env is not None
             bound_probe = env["UNSTRACT_HEALTHCHECK_SOURCE"]
-            assert bound_probe.startswith("/proc/self/fd/")
+            assert bound_probe == str(snapshot.probe_path)
             bound_paths = {Path(value) for value in bound_files | {bound_probe}}
             assert len(bound_paths) == 5
             originals = {
@@ -466,7 +506,7 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
                 encoding="utf-8"
             )
             assert Path(bound_probe).read_bytes() == originals[probe]
-            assert kwargs["pass_fds"]
+            assert kwargs["pass_fds"] == ()
             return subprocess.CompletedProcess(args, 0, json.dumps({"services": {}}), "")
         return subprocess.CompletedProcess(args, 0, "", "")
 
@@ -484,6 +524,7 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
         settings_file=settings,
         settings_file_sha256=guard.sha256_file(settings),
         probe_source_sha256=probe_sha256,
+        snapshot=snapshot,
     )
     guard.targeted_up(
         tmp_path,
@@ -499,6 +540,7 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
         settings_file=settings,
         settings_file_sha256=guard.sha256_file(settings),
         probe_source_sha256=probe_sha256,
+        snapshot=snapshot,
     )
 
     assert len(calls) == 2
@@ -509,9 +551,9 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
     assert str(settings) not in config_args
     assert str(image_override) not in config_args
     assert str(environment_override) not in config_args
-    assert sum(argument.startswith("/proc/self/fd/") for argument in config_args) == 4
+    assert sum(argument == "-f" for argument in config_args) == 3
     assert config_env and config_env["VERSION"] == "goal09-test"
-    assert config_env["UNSTRACT_HEALTHCHECK_SOURCE"].startswith("/proc/self/fd/")
+    assert config_env["UNSTRACT_HEALTHCHECK_SOURCE"] == str(snapshot.probe_path)
     assert calls[1][0][-1] == "runner"
 
     monkeypatch.setattr(guard, "verify_candidate_source_state", lambda *_: None)
@@ -531,6 +573,7 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
         settings_file=settings,
         settings_file_sha256=guard.sha256_file(settings),
         probe_source_sha256=probe_sha256,
+        snapshot=snapshot,
     )
     assert calls[2][0][-5:] == ["up", "-d", "--no-build", "--pull", "never"]
 
@@ -547,6 +590,122 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
             settings_file_sha256=settings_sha256,
             probe_source_sha256=probe_sha256,
         )
+
+
+def test_compose_snapshot_probe_is_visible_to_a_separate_process(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    (project / "docker").mkdir(parents=True)
+    compose = project / "docker" / "docker-compose.yaml"
+    compose.write_text("include:\n  - docker-compose-dev-essentials.yaml\nservices: {}\n", encoding="utf-8")
+    (project / "docker" / "docker-compose-dev-essentials.yaml").write_text(
+        "services: {}\n", encoding="utf-8"
+    )
+    env_file = project / "docker" / ".env"
+    env_file.write_text("COMPOSE_PROJECT_NAME=snapshot-test\n", encoding="utf-8")
+    probe = tmp_path / "source" / "unstract-services.sh"
+    probe.parent.mkdir()
+    probe.write_text("#!/bin/sh\nprintf immutable-probe\n", encoding="utf-8")
+    snapshot = guard.create_compose_snapshot(
+        state_dir=tmp_path / "state",
+        project_dir=project,
+        compose_files=("docker/docker-compose.yaml",),
+        live_env_file=env_file,
+        probe_source=probe,
+        probe_source_sha256=guard.sha256_file(probe),
+        image_override=None,
+        image_override_sha256=None,
+        environment_override=None,
+        environment_override_sha256=None,
+    )
+
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import pathlib,sys; p=pathlib.Path(sys.argv[1]); "
+            "assert not str(p).startswith('/proc/self/fd/'); print(p.read_text())",
+            str(snapshot.probe_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert child.stdout == "#!/bin/sh\nprintf immutable-probe\n\n"
+    assert (snapshot.root / "docker" / "docker-compose-dev-essentials.yaml").is_file()
+    assert guard.load_compose_snapshot(snapshot.manifest_path).probe_path == snapshot.probe_path
+
+
+def test_compose_snapshot_rejects_tampered_retained_input(tmp_path: Path) -> None:
+    compose = tmp_path / "compose.yaml"
+    compose.write_text("services: {}\n", encoding="utf-8")
+    probe = tmp_path / "probe.sh"
+    probe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    snapshot = guard.create_compose_snapshot(
+        state_dir=tmp_path / "state",
+        project_dir=tmp_path,
+        compose_files=("compose.yaml",),
+        live_env_file=None,
+        probe_source=probe,
+        probe_source_sha256=guard.sha256_file(probe),
+        image_override=None,
+        image_override_sha256=None,
+        environment_override=None,
+        environment_override_sha256=None,
+    )
+    os.chmod(snapshot.probe_path, 0o600)
+    snapshot.probe_path.write_text("tampered\n", encoding="utf-8")
+    with pytest.raises(guard.GuardError, match="writable or not regular|changed"):
+        guard.load_compose_snapshot(snapshot.manifest_path)
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="Docker Compose provider is unavailable")
+def test_real_compose_provider_resolves_snapshot_include(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    (project / "docker").mkdir(parents=True)
+    (project / "docker" / "docker-compose.yaml").write_text(
+        "include:\n  - docker-compose-dev-essentials.yaml\nservices: {}\n",
+        encoding="utf-8",
+    )
+    (project / "docker" / "docker-compose-dev-essentials.yaml").write_text(
+        "services:\n  included:\n    image: busybox:latest\n", encoding="utf-8"
+    )
+    env_file = project / "docker" / ".env"
+    env_file.write_text("COMPOSE_PROJECT_NAME=snapshot-provider-test\n", encoding="utf-8")
+    probe = tmp_path / "probe.sh"
+    probe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    snapshot = guard.create_compose_snapshot(
+        state_dir=tmp_path / "state",
+        project_dir=project,
+        compose_files=("docker/docker-compose.yaml",),
+        live_env_file=env_file,
+        probe_source=probe,
+        probe_source_sha256=guard.sha256_file(probe),
+        image_override=None,
+        image_override_sha256=None,
+        environment_override=None,
+        environment_override_sha256=None,
+    )
+    result = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "--project-directory",
+            str(project),
+            "--env-file",
+            str(snapshot.path_for(str(env_file))),
+            "-f",
+            snapshot.path_for("docker/docker-compose.yaml"),
+            "config",
+            "--format",
+            "json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    rendered = json.loads(result.stdout)
+    assert "included" in rendered["services"]
 
 
 def test_compose_rejects_ignored_live_input_drift(tmp_path: Path) -> None:

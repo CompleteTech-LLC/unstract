@@ -21,7 +21,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
-import errno
 import fcntl
 import hashlib
 import json
@@ -38,7 +37,7 @@ import time
 from collections.abc import Iterator
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 PROJECT = "unstract-etl-home-complete-tech"
 DEFAULT_PROJECT_DIR = Path("/home/completetrain/etl.home.complete.tech")
@@ -107,8 +106,13 @@ COMPOSE_SETTINGS_FILENAME = "compose-settings.env"
 START_CONFIRM_TOKEN = "START_UNSTRACT_HEALTH"
 LIVE_COMPOSE_TRAIN = "docker/compose.train.yaml"
 LIVE_ENV_RELATIVE = "docker/.env"
-REPLAY_MANIFEST_SCHEMA = "unstract-durable-replay/v1"
+REPLAY_MANIFEST_SCHEMA = "unstract-durable-replay/v2"
 REPLAY_MANIFEST_FILENAME = "durable-replay-manifest.json"
+COMPOSE_SNAPSHOT_SCHEMA = "unstract-compose-snapshot/v1"
+COMPOSE_SNAPSHOT_MANIFEST_FILENAME = "compose-snapshot-manifest.json"
+COMPOSE_SNAPSHOT_DIR_PREFIX = "compose-snapshot-"
+COMPOSE_SNAPSHOT_PROBE_RELATIVE = Path("__helper__/unstract-services.sh")
+COMPOSE_SNAPSHOT_PRIVATE_RELATIVE = Path("__private__")
 RUNTIME_GENERATED_ENV_KEYS = frozenset({"HOME", "container"})
 DURATION_TOKEN = re.compile(
     r"(?P<number>(?:\d+(?:\.\d*)?|\.\d+))(?P<unit>ns|us|µs|ms|h|m|s)"
@@ -136,6 +140,22 @@ ALLOWED_ENV_ADDITIONS = {
         "LOG_STREAM_CONSUMER_HEALTH_STALE_SECONDS",
     },
 }
+
+
+class ComposeSnapshot(NamedTuple):
+    """A daemon-visible immutable copy of every Compose launch input."""
+
+    root: Path
+    manifest_path: Path
+    project_dir: Path
+    paths: dict[str, str]
+
+    @property
+    def probe_path(self) -> Path:
+        return Path(self.paths["__probe_source__"])
+
+    def path_for(self, value: str | Path) -> str:
+        return self.paths.get(str(value), str(value))
 
 
 def _probe_test(service: str) -> list[str]:
@@ -338,64 +358,6 @@ def run(
     return result
 
 
-def _read_fd(fd: int) -> bytes:
-    """Read an open input and leave its offset at the beginning."""
-    try:
-        os.lseek(fd, 0, os.SEEK_SET)
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(fd, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        os.lseek(fd, 0, os.SEEK_SET)
-    except OSError as exc:
-        raise GuardError(f"cannot snapshot Compose input: {exc}") from exc
-    return b"".join(chunks)
-
-
-def _immutable_snapshot_fd(data: bytes) -> tuple[int, tempfile.TemporaryFile[bytes] | None]:
-    """Create a sealed descriptor containing one Compose input snapshot."""
-    temporary: tempfile.TemporaryFile[bytes] | None = None
-    try:
-        fd = os.memfd_create(
-            "unstract-compose-input",
-            os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
-        )
-    except AttributeError:
-        # Linux Train hosts provide memfd_create. Keep the guard importable on
-        # other platforms for static checks, while retaining an unlinked
-        # descriptor as the best available private snapshot there.
-        temporary = tempfile.TemporaryFile(mode="w+b")
-        fd = temporary.fileno()
-    try:
-        view = memoryview(data)
-        while view:
-            written = os.write(fd, view)
-            if written <= 0:
-                raise OSError("snapshot write made no progress")
-            view = view[written:]
-        os.lseek(fd, 0, os.SEEK_SET)
-        if temporary is None:
-            fcntl.fcntl(
-                fd,
-                fcntl.F_ADD_SEALS,
-                fcntl.F_SEAL_WRITE
-                | fcntl.F_SEAL_GROW
-                | fcntl.F_SEAL_SHRINK
-                | fcntl.F_SEAL_SEAL,
-            )
-        else:
-            os.fchmod(fd, 0o400)
-    except BaseException:
-        if temporary is not None:
-            temporary.close()
-        else:
-            os.close(fd)
-        raise
-    return fd, temporary
-
-
 def _compose_input_path(project_dir: Path, value: str | Path) -> Path:
     """Resolve a Compose input the same way the explicit project directory does."""
     path = Path(value)
@@ -404,72 +366,531 @@ def _compose_input_path(project_dir: Path, value: str | Path) -> Path:
     return project_dir.resolve() / path
 
 
-def _open_compose_input(path: Path) -> int:
-    """Open a Compose input without following a mutable pathname in place."""
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+def _read_compose_input(path: Path, *, description: str) -> bytes:
+    """Read one Compose input while resolving a symlink only once."""
     try:
-        return os.open(path, flags)
-    except OSError as exc:
-        # A live .env or Compose file may be a symlink. Resolve it once and
-        # snapshot the target; the final source fingerprint check still runs
-        # before the child launch, while the child consumes the bound bytes.
-        if exc.errno != getattr(errno, "ELOOP", 40):
-            raise
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True) if stat.S_ISLNK(metadata.st_mode) else path
+        resolved_metadata = resolved.stat()
+        if not stat.S_ISREG(resolved_metadata.st_mode):
+            raise GuardError(f"{description} is not a regular file: {path}")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
-            return os.open(path.resolve(strict=True), flags)
+            descriptor = os.open(resolved, flags)
         except OSError:
-            raise exc
+            # The fallback is only for platforms without O_NOFOLLOW support.
+            descriptor = os.open(resolved, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        try:
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    except GuardError:
+        raise
+    except OSError as exc:
+        raise GuardError(f"cannot read {description}: {path}") from exc
+
+
+def _snapshot_source_relative(project_dir: Path, source: Path, *, fallback: str) -> Path:
+    """Choose a safe snapshot path while retaining project-relative layout."""
+    project = project_dir.resolve()
+    source = source.resolve()
+    try:
+        relative = source.relative_to(project)
+    except ValueError:
+        digest = sha256_bytes(str(source).encode("utf-8"))[:16]
+        return Path("__external__") / digest / fallback
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise GuardError(f"Compose input has an unsafe relative path: {source}")
+    return relative
+
+
+def _compose_include_paths(path: Path) -> list[Path]:
+    """Find literal Compose ``include`` entries without parsing interpolation."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise GuardError(f"cannot read Compose include source: {path}") from exc
+    result: list[Path] = []
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith("include:"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        tail = stripped[len("include:") :].strip()
+        values: list[str] = []
+        if tail.startswith("[") and tail.endswith("]"):
+            values.extend(part.strip().strip("'\"") for part in tail[1:-1].split(","))
+        elif tail and not tail.startswith("#"):
+            values.append(tail.strip("'\""))
+        for following in lines[index + 1 :]:
+            if following.strip() and len(following) - len(following.lstrip()) <= indent:
+                break
+            candidate = following.strip()
+            if candidate.startswith("-"):
+                value = candidate[1:].split("#", 1)[0].strip().strip("'\"")
+                if value:
+                    values.append(value)
+        for value in values:
+            if value and "${" not in value:
+                result.append((path.parent / value).resolve())
+    return result
+
+
+def _compose_relative_references(path: Path) -> list[tuple[str, bool]]:
+    """Find literal relative env-file and bind-source references.
+
+    Compose files in the guarded stack use the short list syntax for these
+    fields.  Keeping this scanner lexical avoids making the systemd launcher
+    depend on a YAML package while still allowing us to freeze the files the
+    provider opens itself.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise GuardError(f"cannot read Compose reference source: {path}") from exc
+    result: list[tuple[str, bool]] = []
+    section: str | None = None
+    section_indent = -1
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if section is not None and indent <= section_indent and not stripped.startswith("-"):
+            section = None
+        if stripped.startswith("env_file:"):
+            section, section_indent = "env_file", indent
+            tail = stripped[len("env_file:") :].strip()
+            if tail and not tail.startswith("#"):
+                result.append((tail.strip("'\""), True))
+            continue
+        if stripped.startswith("volumes:"):
+            section, section_indent = "volumes", indent
+            continue
+        if section is None or not stripped.startswith("-"):
+            continue
+        value = stripped[1:].split("#", 1)[0].strip().strip("'\"")
+        if section == "env_file":
+            reference = value
+            private = True
+        else:
+            # Long syntax starts with ``type:``/``source:`` and is handled by
+            # the provider directly; the repository's guarded files use the
+            # short ``source:target[:options]`` form.
+            if value.startswith(("type:", "source:")):
+                continue
+            reference = value.split(":", 1)[0]
+            private = False
+        if reference.startswith((".", "..")) and "${" not in reference:
+            result.append((reference, private))
+    return result
+
+
+def _write_snapshot_file(
+    root: Path,
+    relative: Path,
+    data: bytes,
+    *,
+    private: bool,
+) -> str:
+    """Write a snapshot file and return its content digest."""
+    destination = root / relative
+    try:
+        destination.relative_to(root)
+    except ValueError as exc:
+        raise GuardError(f"snapshot path escapes its root: {relative}") from exc
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    mode = 0o400 if private else 0o444
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(destination, flags, mode)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        raise GuardError(f"cannot write Compose snapshot input: {destination}") from exc
+    os.chmod(destination, mode)
+    return sha256_bytes(data)
+
+
+def _write_snapshot_directory_passthrough(
+    root: Path,
+    relative: Path,
+    source: Path,
+) -> str:
+    """Keep a runtime data directory at its original daemon-visible location."""
+    destination = root / relative
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    try:
+        resolved = source.resolve(strict=True)
+        if not resolved.is_dir():
+            raise GuardError(f"Compose directory reference is not a directory: {source}")
+        destination.relative_to(root)
+        if destination.is_symlink():
+            if destination.resolve(strict=True) != resolved:
+                raise GuardError(f"Compose directory reference changed: {destination}")
+            return str(resolved)
+        if destination.exists():
+            raise GuardError(f"Compose directory reference collides with a snapshot file: {destination}")
+        os.symlink(resolved, destination, target_is_directory=True)
+    except GuardError:
+        raise
+    except OSError as exc:
+        raise GuardError(f"cannot preserve Compose directory reference: {source}") from exc
+    return str(resolved)
+
+
+def _freeze_snapshot_tree(root: Path) -> None:
+    """Make every snapshot directory traversable but non-user-writable."""
+    for directory in sorted(
+        (path for path in root.rglob("*") if path.is_dir() and not path.is_symlink()),
+        reverse=True,
+    ):
+        os.chmod(directory, 0o500 if directory.name == COMPOSE_SNAPSHOT_PRIVATE_RELATIVE.name else 0o555)
+    os.chmod(root, 0o555)
+
+
+def materialize_compose_snapshot(
+    *,
+    project_dir: Path,
+    compose_files: tuple[str, ...],
+    live_env_file: Path | None,
+    probe_source: Path,
+    probe_source_sha256: str | None,
+    image_override: Path | None,
+    image_override_sha256: str | None,
+    environment_override: Path | None,
+    environment_override_sha256: str | None,
+    destination: Path,
+) -> ComposeSnapshot:
+    """Create a durable daemon-visible snapshot preserving Compose includes."""
+    if destination.exists():
+        raise GuardError(f"Compose snapshot destination already exists: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.mkdir(mode=0o755)
+    paths: dict[str, str] = {}
+    entries: dict[str, dict[str, Any]] = {}
+    passthroughs: dict[str, str] = {}
+    copied: set[Path] = set()
+    private_sources = {
+        source.resolve()
+        for source in (image_override, environment_override)
+        if source is not None
+    }
+
+    def copy_source(
+        source: Path,
+        relative: Path,
+        *,
+        key: str | None = None,
+        expected_sha256: str | None = None,
+        private: bool = False,
+        description: str = "Compose input",
+    ) -> None:
+        resolved = source.resolve(strict=True)
+        if resolved in copied and (destination / relative).is_file():
+            if key is not None:
+                paths[key] = str((destination / relative).resolve())
+            return
+        data = _read_compose_input(source, description=description)
+        actual = sha256_bytes(data)
+        if expected_sha256 is not None and actual != expected_sha256:
+            raise GuardError(f"{description} changed: {source}")
+        digest = _write_snapshot_file(destination, relative, data, private=private)
+        copied.add(resolved)
+        entries[str(relative)] = {
+            "sha256": digest,
+            "private": private,
+        }
+        if key is not None:
+            paths[key] = str((destination / relative).resolve())
+
+    compose_sources: list[Path] = []
+    pending_includes: list[Path] = []
+    for argument in compose_files:
+        source = _compose_input_path(project_dir, argument)
+        resolved = source.resolve()
+        if resolved in private_sources:
+            relative = COMPOSE_SNAPSHOT_PRIVATE_RELATIVE / source.name
+            copy_source(
+                source,
+                relative,
+                key=argument,
+                private=True,
+                expected_sha256=(
+                    image_override_sha256
+                    if image_override is not None and resolved == image_override.resolve()
+                    else environment_override_sha256
+                ),
+                description="private Compose override",
+            )
+        else:
+            relative = _snapshot_source_relative(
+                project_dir, source, fallback=Path(argument).name
+            )
+            copy_source(source, relative, key=argument, description="Compose file")
+        compose_sources.append(source)
+        pending_includes.extend(_compose_include_paths(source))
+    seen_includes: set[Path] = set()
+    while pending_includes:
+        source = pending_includes.pop(0)
+        source = source.resolve()
+        if source in seen_includes:
+            continue
+        seen_includes.add(source)
+        relative = _snapshot_source_relative(
+            project_dir, source, fallback=source.name
+        )
+        copy_source(source, relative, description="Compose include")
+        compose_sources.append(source)
+        pending_includes.extend(_compose_include_paths(source))
+
+    for compose_source in compose_sources:
+        for reference, private in _compose_relative_references(compose_source):
+            source = (compose_source.parent / reference).resolve()
+            relative = _snapshot_source_relative(
+                project_dir, source, fallback=source.name
+            )
+            if source.is_dir():
+                passthroughs[str(relative)] = _write_snapshot_directory_passthrough(
+                    destination, relative, source
+                )
+                continue
+            copy_source(
+                source,
+                relative,
+                private=private,
+                description="private Compose env file" if private else "Compose bind file",
+            )
+
+    if live_env_file is not None:
+        source = _compose_input_path(project_dir, live_env_file)
+        relative = _snapshot_source_relative(project_dir, source, fallback=source.name)
+        copy_source(
+            source,
+            relative,
+            key=str(live_env_file),
+            private=True,
+            description="Compose environment file",
+        )
+
+    copy_source(
+        probe_source,
+        COMPOSE_SNAPSHOT_PROBE_RELATIVE,
+        key=str(probe_source),
+        expected_sha256=probe_source_sha256,
+        description="health probe source",
+    )
+    paths["__probe_source__"] = paths[str(probe_source)]
+    for source, expected_sha256, description in (
+        (image_override, image_override_sha256, "candidate image override"),
+        (environment_override, environment_override_sha256, "runtime environment override"),
+    ):
+        if source is None:
+            continue
+        relative = COMPOSE_SNAPSHOT_PRIVATE_RELATIVE / source.name
+        copy_source(
+            source,
+            relative,
+            key=str(source),
+            expected_sha256=expected_sha256,
+            private=True,
+            description=description,
+        )
+
+    manifest_path = destination / COMPOSE_SNAPSHOT_MANIFEST_FILENAME
+    manifest = {
+        "schema": COMPOSE_SNAPSHOT_SCHEMA,
+        "root": str(destination.resolve()),
+        "project_dir": str(project_dir.resolve()),
+        "paths": {
+            key: str(Path(value).relative_to(destination.resolve()))
+            for key, value in paths.items()
+        },
+        "entries": entries,
+        "passthroughs": passthroughs,
+    }
+    try:
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        os.chmod(manifest_path, 0o400)
+    except OSError as exc:
+        raise GuardError(f"cannot write Compose snapshot manifest: {manifest_path}") from exc
+    _freeze_snapshot_tree(destination)
+    return ComposeSnapshot(
+        root=destination.resolve(),
+        manifest_path=manifest_path.resolve(),
+        project_dir=project_dir.resolve(),
+        paths={key: str(destination / relative) for key, relative in manifest["paths"].items()},
+    )
+
+
+def _validate_snapshot_file(path: Path, expected_sha256: str, *, private: bool) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise GuardError(f"cannot read Compose snapshot file: {path}") from exc
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o222:
+        raise GuardError(f"Compose snapshot file is writable or not regular: {path}")
+    if hasattr(os, "getuid") and os.getuid() == 0 and metadata.st_uid != 0:
+        raise GuardError(f"Compose snapshot file is not root-owned: {path}")
+    actual = sha256_file(path)
+    if actual != expected_sha256:
+        raise GuardError(f"Compose snapshot file changed: {path}")
+    if private and stat.S_IMODE(metadata.st_mode) != 0o400:
+        raise GuardError(f"private Compose snapshot file has an unsafe mode: {path}")
+
+
+def _validate_snapshot_parents(path: Path, root: Path) -> None:
+    """Ensure no snapshot directory can be replaced by the launching user."""
+    current = path.parent
+    while True:
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            raise GuardError(f"cannot read Compose snapshot directory: {current}") from exc
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o222:
+            raise GuardError(f"Compose snapshot directory is writable or not a directory: {current}")
+        if hasattr(os, "getuid") and os.getuid() == 0 and metadata.st_uid != 0:
+            raise GuardError(f"Compose snapshot directory is not root-owned: {current}")
+        if current == root:
+            return
+        if current.parent == current:
+            raise GuardError("Compose snapshot directory escaped its root")
+        current = current.parent
+
+
+def load_compose_snapshot(path: Path) -> ComposeSnapshot:
+    """Validate a retained snapshot immediately before a Compose launch."""
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o222:
+            raise GuardError(f"Compose snapshot manifest is writable or not regular: {path}")
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except GuardError:
+        raise
+    except (OSError, json.JSONDecodeError) as exc:
+        raise GuardError(f"cannot read Compose snapshot manifest: {path}") from exc
+    if manifest.get("schema") != COMPOSE_SNAPSHOT_SCHEMA:
+        raise GuardError("Compose snapshot manifest has an unsupported schema")
+    root = Path(manifest.get("root", "")).resolve()
+    if root != path.resolve().parent or not root.is_dir():
+        raise GuardError("Compose snapshot root does not match its manifest")
+    root_metadata = root.lstat()
+    if stat.S_IMODE(root_metadata.st_mode) & 0o222:
+        raise GuardError("Compose snapshot root is writable")
+    if hasattr(os, "getuid") and os.getuid() == 0 and root_metadata.st_uid != 0:
+        raise GuardError("Compose snapshot root is not root-owned")
+    entries = manifest.get("entries")
+    paths_manifest = manifest.get("paths")
+    passthroughs = manifest.get("passthroughs") or {}
+    if (
+        not isinstance(entries, dict)
+        or not isinstance(paths_manifest, dict)
+        or not isinstance(passthroughs, dict)
+    ):
+        raise GuardError("Compose snapshot manifest is incomplete")
+    paths: dict[str, str] = {}
+    for relative, entry in entries.items():
+        if not isinstance(relative, str) or not isinstance(entry, dict):
+            raise GuardError("Compose snapshot manifest contains an invalid entry")
+        candidate = (root / relative).resolve()
+        if candidate.parent == root and candidate.name == COMPOSE_SNAPSHOT_MANIFEST_FILENAME:
+            raise GuardError("Compose snapshot manifest lists itself as an input")
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise GuardError("Compose snapshot entry escapes its root") from exc
+        _validate_snapshot_parents(candidate, root)
+        digest = entry.get("sha256")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise GuardError("Compose snapshot entry has an invalid digest")
+        _validate_snapshot_file(candidate, digest, private=bool(entry.get("private")))
+    for relative, target in passthroughs.items():
+        if not isinstance(relative, str) or not isinstance(target, str):
+            raise GuardError("Compose snapshot directory passthrough is invalid")
+        candidate = root / relative
+        try:
+            candidate.relative_to(root)
+            _validate_snapshot_parents(candidate, root)
+            metadata = candidate.lstat()
+            actual_target = candidate.resolve(strict=True)
+        except (OSError, ValueError) as exc:
+            raise GuardError("Compose snapshot directory passthrough is invalid") from exc
+        if not stat.S_ISLNK(metadata.st_mode) or not actual_target.is_dir():
+            raise GuardError("Compose snapshot directory passthrough is not a directory symlink")
+        if str(actual_target) != str(Path(target).resolve()):
+            raise GuardError("Compose snapshot directory passthrough target changed")
+    for key, relative in paths_manifest.items():
+        if not isinstance(key, str) or not isinstance(relative, str):
+            raise GuardError("Compose snapshot path mapping is invalid")
+        candidate = (root / relative).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise GuardError("Compose snapshot path escapes its root") from exc
+        if relative not in entries:
+            raise GuardError("Compose snapshot path mapping has no hashed entry")
+        paths[key] = str(candidate)
+    if "__probe_source__" not in paths:
+        raise GuardError("Compose snapshot lacks the immutable probe source")
+    project_dir_value = manifest.get("project_dir")
+    if not isinstance(project_dir_value, str) or not project_dir_value:
+        raise GuardError("Compose snapshot project directory is invalid")
+    project_dir = Path(project_dir_value).resolve()
+    if not Path(project_dir_value).is_absolute() or not project_dir.exists():
+        raise GuardError("Compose snapshot project directory is invalid")
+    return ComposeSnapshot(
+        root=root,
+        manifest_path=path.resolve(),
+        project_dir=project_dir,
+        paths=paths,
+    )
 
 
 @contextlib.contextmanager
-def bound_compose_file(
-    path: Path,
+def _compose_snapshot_context(
     *,
-    expected_sha256: str | None,
-    description: str,
-    private: bool = False,
-) -> Iterator[tuple[str, int]]:
-    """Bind one Compose input to an immutable child-visible descriptor.
-
-    Hashing the pathname and then passing that pathname to Compose leaves a
-    same-user write window between verification and subprocess open. Read the
-    reviewed bytes first, seal a memfd snapshot, and pass the descriptor to
-    Compose through ``/proc/self/fd``. The original path can change after
-    this point without changing the bytes that the child parses. Private
-    replay files retain their stricter mode and ownership contract.
-    """
-    try:
-        source_fd = _open_compose_input(path)
-    except OSError as exc:
-        raise GuardError(f"cannot read private {description}: {path}") from exc
-    snapshot_fd: int | None = None
-    temporary: tempfile.TemporaryFile[bytes] | None = None
-    try:
-        metadata = os.fstat(source_fd)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise GuardError(f"{description} is not a regular file: {path}")
-        if private and stat.S_IMODE(metadata.st_mode) != 0o600:
-            raise GuardError(f"{description} is not a private regular file: {path}")
-        if private and hasattr(os, "getuid") and metadata.st_uid != os.getuid():
-            raise GuardError(f"{description} has the wrong owner: {path}")
-        data = _read_fd(source_fd)
-        actual_sha256 = sha256_bytes(data)
-        if expected_sha256 is not None and actual_sha256 != expected_sha256:
-            raise GuardError(f"{description} changed: {path}")
-        snapshot_fd, temporary = _immutable_snapshot_fd(data)
-        yield f"/proc/self/fd/{snapshot_fd}", snapshot_fd
-    finally:
-        try:
-            os.close(source_fd)
-        except OSError:
-            pass
-        if temporary is not None:
-            temporary.close()
-        elif snapshot_fd is not None:
-            try:
-                os.close(snapshot_fd)
-            except OSError:
-                pass
+    project_dir: Path,
+    compose_files: tuple[str, ...],
+    live_env_file: Path | None,
+    probe_source: Path,
+    probe_source_sha256: str | None,
+    image_override: Path | None,
+    image_override_sha256: str | None,
+    environment_override: Path | None,
+    environment_override_sha256: str | None,
+    snapshot: ComposeSnapshot | None,
+) -> Iterator[ComposeSnapshot]:
+    if snapshot is not None:
+        validated = load_compose_snapshot(snapshot.manifest_path)
+        if validated != snapshot:
+            raise GuardError("Compose snapshot changed after it was loaded")
+        if snapshot.project_dir != project_dir.resolve():
+            raise GuardError("Compose snapshot project directory changed")
+        yield snapshot
+        return
+    with tempfile.TemporaryDirectory(prefix=".unstract-compose-") as temporary:
+        yield materialize_compose_snapshot(
+            project_dir=project_dir,
+            compose_files=compose_files,
+            live_env_file=live_env_file,
+            probe_source=probe_source,
+            probe_source_sha256=probe_source_sha256,
+            image_override=image_override,
+            image_override_sha256=image_override_sha256,
+            environment_override=environment_override,
+            environment_override_sha256=environment_override_sha256,
+            destination=Path(temporary) / "tree",
+        )
 
 
 @contextlib.contextmanager
@@ -484,73 +905,37 @@ def bound_compose_inputs(
     image_override_sha256: str | None,
     environment_override: Path | None,
     environment_override_sha256: str | None,
+    snapshot: ComposeSnapshot | None = None,
 ) -> Iterator[tuple[dict[str, str], tuple[int, ...]]]:
-    """Snapshot every file Compose and its interpolation environment consume."""
-    replacements: dict[str, str] = {}
-    pass_fds: list[int] = []
-    with contextlib.ExitStack() as stack:
-        inputs: list[tuple[str, Path, str | None, str, bool]] = []
-        for compose_file in compose_files:
-            inputs.append(
-                (
-                    compose_file,
-                    _compose_input_path(project_dir, compose_file),
-                    None,
-                    "Compose file",
-                    False,
-                )
-            )
+    """Bind every Compose input to a daemon-visible immutable snapshot path."""
+    with _compose_snapshot_context(
+        project_dir=project_dir,
+        compose_files=compose_files,
+        live_env_file=live_env_file,
+        probe_source=probe_source,
+        probe_source_sha256=probe_source_sha256,
+        image_override=image_override,
+        image_override_sha256=image_override_sha256,
+        environment_override=environment_override,
+        environment_override_sha256=environment_override_sha256,
+        snapshot=snapshot,
+    ) as active:
+        required = list(compose_files)
         if live_env_file:
-            inputs.append(
-                (
-                    str(live_env_file),
-                    _compose_input_path(project_dir, live_env_file),
-                    None,
-                    "Compose environment file",
-                    False,
-                )
-            )
-        inputs.append(
-            (
-                str(probe_source),
-                _compose_input_path(project_dir, probe_source),
-                probe_source_sha256,
-                "health probe source",
-                False,
-            )
-        )
+            required.append(str(live_env_file))
+        required.append(str(probe_source))
         if image_override:
-            inputs.append(
-                (
-                    str(image_override),
-                    image_override,
-                    image_override_sha256,
-                    "candidate image override",
-                    True,
-                )
-            )
+            required.append(str(image_override))
         if environment_override:
-            inputs.append(
-                (
-                    str(environment_override),
-                    environment_override,
-                    environment_override_sha256,
-                    "runtime environment override",
-                    True,
-                )
+            required.append(str(environment_override))
+        missing = [argument for argument in required if argument not in active.paths]
+        if missing:
+            raise GuardError(
+                "Compose snapshot does not contain every launch input: "
+                + ", ".join(missing)
             )
-        for argument, path, expected_sha256, description, private in inputs:
-            proc_path, fd = stack.enter_context(
-                bound_compose_file(
-                    path,
-                    expected_sha256=expected_sha256,
-                    description=description,
-                    private=private,
-                )
-            )
-            replacements[argument] = proc_path
-            pass_fds.append(fd)
-        yield replacements, tuple(pass_fds)
+        replacements = {argument: active.path_for(argument) for argument in required}
+        yield replacements, ()
 
 
 def parse_json_output(result: subprocess.CompletedProcess[str], description: str) -> Any:
@@ -1504,6 +1889,7 @@ def compose_config(
     settings_file: Path | None = None,
     settings_file_sha256: str | None = None,
     probe_source_sha256: str | None = None,
+    snapshot: ComposeSnapshot | None = None,
     deadline: OperationDeadline | None = None,
 ) -> dict[str, Any]:
     verify_candidate_source_state(candidate_source, candidate_lock)
@@ -1553,6 +1939,7 @@ def compose_config(
         image_override_sha256=image_override_sha256,
         environment_override=environment_override,
         environment_override_sha256=environment_override_sha256,
+        snapshot=snapshot,
     ) as (bound_paths, pass_fds):
         bound_args = [bound_paths.get(argument, argument) for argument in args]
         final_settings = verify_compose_inputs_before_run(
@@ -1735,6 +2122,7 @@ def write_replay_manifest(
     runtime_environment_override: Path,
     probe_source: Path,
     probe_source_sha256: str,
+    snapshot: ComposeSnapshot | None = None,
 ) -> None:
     """Bind every private replay input to a durable, sanitized hash record."""
     validate_candidate_image_override(image_override)
@@ -1745,6 +2133,9 @@ def write_replay_manifest(
         probe_source_sha256=probe_source_sha256,
     )
     validate_private_override(runtime_environment_override)
+    if snapshot is None:
+        raise GuardError("durable replay requires a retained Compose snapshot")
+    load_compose_snapshot(snapshot.manifest_path)
     write_private_json(
         path,
         {
@@ -1772,6 +2163,11 @@ def write_replay_manifest(
                     "UNSTRACT_HEALTHCHECK_SOURCE_SHA256"
                 ],
             },
+            "compose_snapshot": {
+                "schema": COMPOSE_SNAPSHOT_SCHEMA,
+                "manifest": str(snapshot.manifest_path),
+                "manifest_sha256": sha256_file(snapshot.manifest_path),
+            },
         },
         description="durable replay manifest",
     )
@@ -1787,6 +2183,7 @@ def load_replay_manifest(
     runtime_environment_override: Path,
     probe_source: Path,
     probe_source_sha256: str,
+    state_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Verify the persisted private replay files before normal startup."""
     validate_private_file(path, description="durable replay manifest")
@@ -1844,11 +2241,30 @@ def load_replay_manifest(
         if keys
     }:
         raise GuardError("runtime environment contract changed since durable replay was prepared")
+    snapshot_metadata = manifest.get("compose_snapshot")
+    if not isinstance(snapshot_metadata, dict):
+        raise GuardError("durable replay manifest lacks the Compose snapshot")
+    if snapshot_metadata.get("schema") != COMPOSE_SNAPSHOT_SCHEMA:
+        raise GuardError("durable replay Compose snapshot has an unsupported schema")
+    snapshot_manifest_text = snapshot_metadata.get("manifest")
+    snapshot_manifest_sha256 = snapshot_metadata.get("manifest_sha256")
+    if not isinstance(snapshot_manifest_text, str) or not isinstance(snapshot_manifest_sha256, str):
+        raise GuardError("durable replay Compose snapshot metadata is incomplete")
+    snapshot_manifest = Path(snapshot_manifest_text).resolve()
+    if state_dir is not None:
+        try:
+            snapshot_manifest.relative_to(state_dir.resolve())
+        except ValueError as exc:
+            raise GuardError("durable replay Compose snapshot is outside state") from exc
+    if sha256_file(snapshot_manifest) != snapshot_manifest_sha256:
+        raise GuardError("durable replay Compose snapshot manifest changed")
+    snapshot = load_compose_snapshot(snapshot_manifest)
     return {
         "image_override_sha256": image_sha256,
         "settings_sha256": settings_sha256,
         "runtime_environment_sha256": runtime_sha256,
         "settings": settings,
+        "compose_snapshot": snapshot,
     }
 
 
@@ -2636,6 +3052,7 @@ def targeted_up(
     settings_file: Path | None = None,
     settings_file_sha256: str | None = None,
     probe_source_sha256: str | None = None,
+    snapshot: ComposeSnapshot | None = None,
     deadline: OperationDeadline | None = None,
 ) -> None:
     verify_candidate_source_state(candidate_source, candidate_lock)
@@ -2693,6 +3110,7 @@ def targeted_up(
         image_override_sha256=image_override_sha256,
         environment_override=environment_override,
         environment_override_sha256=environment_override_sha256,
+        snapshot=snapshot,
     ) as (bound_paths, pass_fds):
         bound_args = [bound_paths.get(argument, argument) for argument in args]
         final_settings = verify_compose_inputs_before_run(
@@ -2744,6 +3162,7 @@ def compose_start(
     settings_file: Path,
     settings_file_sha256: str,
     probe_source_sha256: str,
+    snapshot: ComposeSnapshot | None = None,
     deadline: OperationDeadline | None = None,
 ) -> None:
     """Start the whole stack through the durable guarded Compose inputs."""
@@ -2782,6 +3201,7 @@ def compose_start(
         image_override_sha256=image_override_sha256,
         environment_override=environment_override,
         environment_override_sha256=environment_override_sha256,
+        snapshot=snapshot,
     ) as (bound_paths, pass_fds):
         bound_args = [bound_paths.get(argument, argument) for argument in args]
         final_settings = verify_compose_inputs_before_run(
@@ -3037,6 +3457,39 @@ def command_capture(args: argparse.Namespace) -> int:
 def resolve_live_env_file(args: argparse.Namespace, project_dir: Path) -> Path:
     configured = getattr(args, "live_env_file", None)
     return Path(configured).resolve() if configured else (project_dir / LIVE_ENV_RELATIVE).resolve()
+
+
+def compose_snapshot_destination(state_dir: Path) -> Path:
+    """Return a fresh retained snapshot directory below guarded state."""
+    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    return state_dir / f"{COMPOSE_SNAPSHOT_DIR_PREFIX}{stamp}-{os.getpid()}"
+
+
+def create_compose_snapshot(
+    *,
+    state_dir: Path,
+    project_dir: Path,
+    compose_files: tuple[str, ...],
+    live_env_file: Path | None,
+    probe_source: Path,
+    probe_source_sha256: str | None,
+    image_override: Path | None,
+    image_override_sha256: str | None,
+    environment_override: Path | None,
+    environment_override_sha256: str | None,
+) -> ComposeSnapshot:
+    return materialize_compose_snapshot(
+        project_dir=project_dir,
+        compose_files=compose_files,
+        live_env_file=live_env_file,
+        probe_source=probe_source,
+        probe_source_sha256=probe_source_sha256,
+        image_override=image_override,
+        image_override_sha256=image_override_sha256,
+        environment_override=environment_override,
+        environment_override_sha256=environment_override_sha256,
+        destination=compose_snapshot_destination(state_dir),
+    )
 
 
 def prepare(
@@ -3327,6 +3780,18 @@ def compensating_rollback(
         runtime_environment_override, expected_sha256=runtime_environment_sha256
     )
     rollback_files = rollback_compose_files(args) + (str(override),)
+    rollback_snapshot = create_compose_snapshot(
+        state_dir=backup_dir,
+        project_dir=project_dir,
+        compose_files=rollback_files,
+        live_env_file=live_env_file,
+        probe_source=Path(args.probe_source),
+        probe_source_sha256=None,
+        image_override=override,
+        image_override_sha256=sha256_file(override),
+        environment_override=runtime_environment_override,
+        environment_override_sha256=runtime_environment_sha256,
+    )
     with advisory_lock(deadline=operation_deadline):
         # Recheck identity and quiescence after acquiring the DB lock.  The
         # process may be disconnected when db itself is recreated; the local
@@ -3346,8 +3811,11 @@ def compensating_rollback(
             probe_source=Path(args.probe_source),
             live_env_file=live_env_file,
             expected_source=baseline["source"],
+            image_override=override,
+            image_override_sha256=sha256_file(override),
             environment_override=runtime_environment_override,
             environment_override_sha256=runtime_environment_sha256,
+            snapshot=rollback_snapshot,
             deadline=operation_deadline,
         )
         wait_running(services, operation_deadline=operation_deadline)
@@ -3384,6 +3852,7 @@ def apply_batch(
     runtime_environment_override: Path,
     runtime_environment_sha256: str,
     reviewed_environment_keys: dict[str, set[str]],
+    snapshot: ComposeSnapshot,
     operation_deadline: OperationDeadline,
 ) -> dict[str, Any]:
     compose_files = tuple(args.compose_file or DEFAULT_COMPOSE_FILES)
@@ -3421,6 +3890,7 @@ def apply_batch(
             settings_file=settings_file,
             settings_file_sha256=settings_file_sha256,
             probe_source_sha256=probe_source_sha256,
+            snapshot=snapshot,
             deadline=operation_deadline,
         )
         authored_baseline = compose_config(
@@ -3435,6 +3905,7 @@ def apply_batch(
             settings_file=settings_file,
             settings_file_sha256=settings_file_sha256,
             probe_source_sha256=probe_source_sha256,
+            snapshot=snapshot,
             deadline=operation_deadline,
         )
         check_candidate_config(
@@ -3506,12 +3977,26 @@ def command_preflight(args: argparse.Namespace) -> int:
         operation_deadline=deadline,
     )
     lock = load_lock(Path(args.candidate_lock))
+    project_dir = Path(args.project_dir)
+    live_env_file = resolve_live_env_file(args, project_dir)
     probe_source = Path(args.probe_source)
     probe_source_sha256 = (lock.get("artifacts") or {}).get(
         "docker/healthchecks/unstract-services.sh"
     )
     if not isinstance(probe_source_sha256, str):
         raise GuardError("candidate lock lacks the guarded probe source digest")
+    snapshot = create_compose_snapshot(
+        state_dir=state_dir,
+        project_dir=project_dir,
+        compose_files=tuple(args.compose_file or DEFAULT_COMPOSE_FILES),
+        live_env_file=live_env_file,
+        probe_source=probe_source,
+        probe_source_sha256=probe_source_sha256,
+        image_override=image_override,
+        image_override_sha256=sha256_file(image_override),
+        environment_override=runtime_environment_override,
+        environment_override_sha256=sha256_file(runtime_environment_override),
+    )
     write_replay_manifest(
         state_dir / REPLAY_MANIFEST_FILENAME,
         lock_path=Path(args.candidate_lock),
@@ -3521,6 +4006,7 @@ def command_preflight(args: argparse.Namespace) -> int:
         runtime_environment_override=runtime_environment_override,
         probe_source=probe_source,
         probe_source_sha256=probe_source_sha256,
+        snapshot=snapshot,
     )
     print(
         "preflight: candidate source, image lock, Compose identity, runtime, "
@@ -3565,7 +4051,9 @@ def command_start(args: argparse.Namespace) -> int:
         runtime_environment_override=runtime_environment_override,
         probe_source=probe_source,
         probe_source_sha256=probe_source_sha256,
+        state_dir=state_dir,
     )
+    snapshot = replay_manifest["compose_snapshot"]
     settings = validate_compose_settings(
         settings_file,
         candidate_version=lock["candidate_version"],
@@ -3596,6 +4084,7 @@ def command_start(args: argparse.Namespace) -> int:
         settings_file=settings_file,
         settings_file_sha256=settings_file_sha256,
         probe_source_sha256=probe_source_sha256,
+        snapshot=snapshot,
         deadline=operation_deadline,
     )
     authored_baseline = compose_config(
@@ -3610,6 +4099,7 @@ def command_start(args: argparse.Namespace) -> int:
         settings_file=settings_file,
         settings_file_sha256=settings_file_sha256,
         probe_source_sha256=probe_source_sha256,
+        snapshot=snapshot,
         deadline=operation_deadline,
     )
     reviewed_keys = reviewed_environment_keys_from_override(runtime_environment_override)
@@ -3636,6 +4126,7 @@ def command_start(args: argparse.Namespace) -> int:
         settings_file=settings_file,
         settings_file_sha256=settings_file_sha256,
         probe_source_sha256=probe_source_sha256,
+        snapshot=snapshot,
         deadline=operation_deadline,
     )
     wait_running(TARGET_SERVICES, operation_deadline=operation_deadline)
@@ -3661,6 +4152,7 @@ def command_apply(args: argparse.Namespace) -> int:
     backup_images: dict[str, Any] | None = None
     runtime_environment_override = backup_dir / RUNTIME_ENVIRONMENT_FILENAME
     runtime_environment_sha256 = ""
+    compose_snapshot: ComposeSnapshot | None = None
     reviewed_environment_keys: dict[str, set[str]] = {}
     replacement_manifest: dict[str, Any] = {
         "schema": REPLACEMENT_SCHEMA,
@@ -3694,6 +4186,18 @@ def command_apply(args: argparse.Namespace) -> int:
             )
             if not isinstance(probe_source_sha256, str):
                 raise GuardError("candidate lock lacks the guarded probe source digest")
+            compose_snapshot = create_compose_snapshot(
+                state_dir=backup_dir,
+                project_dir=project_dir,
+                compose_files=tuple(args.compose_file or DEFAULT_COMPOSE_FILES),
+                live_env_file=live_env_file,
+                probe_source=Path(args.probe_source),
+                probe_source_sha256=probe_source_sha256,
+                image_override=image_override,
+                image_override_sha256=image_override_sha256,
+                environment_override=runtime_environment_override,
+                environment_override_sha256=runtime_environment_sha256,
+            )
             with advisory_lock(deadline=operation_deadline):
                 fresh = capture(
                     project_dir,
@@ -3727,6 +4231,7 @@ def command_apply(args: argparse.Namespace) -> int:
                 runtime_environment_override=runtime_environment_override,
                 probe_source=Path(args.probe_source),
                 probe_source_sha256=probe_source_sha256,
+                snapshot=compose_snapshot,
             )
             rollback_override(backup_images, backup_dir / "rollback.override.yaml")
             write_json(backup_dir / "candidate-images.json", lock["images"])
@@ -3748,6 +4253,7 @@ def command_apply(args: argparse.Namespace) -> int:
                 runtime_environment_override=runtime_environment_override,
                 runtime_environment_sha256=runtime_environment_sha256,
                 reviewed_environment_keys=reviewed_environment_keys,
+                snapshot=compose_snapshot,
                 operation_deadline=operation_deadline,
             )
             replacement_manifest["services"].update(
@@ -3773,6 +4279,7 @@ def command_apply(args: argparse.Namespace) -> int:
                 runtime_environment_override=runtime_environment_override,
                 runtime_environment_sha256=runtime_environment_sha256,
                 reviewed_environment_keys=reviewed_environment_keys,
+                snapshot=compose_snapshot,
                 operation_deadline=operation_deadline,
             )
             replacement_manifest["services"].update(
