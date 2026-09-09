@@ -30,7 +30,6 @@ import shlex
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 from collections.abc import Iterator
 from decimal import Decimal, InvalidOperation
@@ -97,6 +96,10 @@ REPLACEMENT_SCHEMA = "unstract-health-replacements/v1"
 FAILURE_SCHEMA = "unstract-health-failure/v1"
 RUNTIME_ENVIRONMENT_SCHEMA = "unstract-health-runtime-environment/v1"
 RUNTIME_ENVIRONMENT_FILENAME = "runtime-environment.override.yaml"
+CANDIDATE_IMAGE_SCHEMA = "unstract-health-candidate-image/v1"
+CANDIDATE_IMAGE_FILENAME = "candidate-image.override.yaml"
+COMPOSE_SETTINGS_SCHEMA = "unstract-health-compose-settings/v1"
+COMPOSE_SETTINGS_FILENAME = "compose-settings.env"
 RUNTIME_GENERATED_ENV_KEYS = frozenset({"HOME", "container"})
 DURATION_TOKEN = re.compile(
     r"(?P<number>(?:\d+(?:\.\d*)?|\.\d+))(?P<unit>ns|us|µs|ms|h|m|s)"
@@ -1205,18 +1208,46 @@ def compose_config(
     candidate_version: str,
     probe_source: Path,
     image_override: Path | None = None,
+    image_override_sha256: str | None = None,
     environment_override: Path | None = None,
+    environment_override_sha256: str | None = None,
+    settings_file: Path | None = None,
+    settings_file_sha256: str | None = None,
+    probe_source_sha256: str | None = None,
     deadline: OperationDeadline | None = None,
 ) -> dict[str, Any]:
     env = os.environ.copy()
-    env["VERSION"] = candidate_version
-    env["UNSTRACT_HEALTHCHECK_SOURCE"] = str(probe_source)
+    if settings_file:
+        settings = validate_compose_settings(
+            settings_file,
+            candidate_version=candidate_version,
+            probe_source=probe_source,
+            probe_source_sha256=probe_source_sha256,
+            expected_sha256=settings_file_sha256,
+        )
+        env["VERSION"] = settings["VERSION"]
+        env["UNSTRACT_HEALTHCHECK_SOURCE"] = settings["UNSTRACT_HEALTHCHECK_SOURCE"]
+        probe_source_sha256 = settings["UNSTRACT_HEALTHCHECK_SOURCE_SHA256"]
+    else:
+        env["VERSION"] = candidate_version
+        env["UNSTRACT_HEALTHCHECK_SOURCE"] = str(probe_source)
+        validate_probe_source(probe_source, expected_sha256=probe_source_sha256)
     files = compose_files
     if image_override:
+        validate_private_file(
+            image_override,
+            expected_sha256=image_override_sha256,
+            description="candidate image override",
+        )
         files += (str(image_override),)
     if environment_override:
+        validate_private_override(
+            environment_override, expected_sha256=environment_override_sha256
+        )
         files += (str(environment_override),)
     args = ["docker", "compose"]
+    if settings_file:
+        args.extend(["--env-file", str(settings_file)])
     for compose_file in files:
         args.extend(["-f", compose_file])
     args.extend(["config", "--format", "json"])
@@ -1259,6 +1290,106 @@ def candidate_environment_values(
         values["HOSTNAME"] = str(hostname)
     elif "HOSTNAME" not in image_values:
         values.pop("HOSTNAME", None)
+    return values
+
+
+def validate_probe_source(path: Path, *, expected_sha256: str | None = None) -> str:
+    """Require the staged probe to remain the reviewed source artifact."""
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise GuardError(f"cannot read health probe source: {path}") from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise GuardError(f"health probe source is not a regular file: {path}")
+    actual_sha256 = sha256_file(path)
+    if expected_sha256 is not None and actual_sha256 != expected_sha256:
+        raise GuardError(f"health probe source changed: {path}")
+    return actual_sha256
+
+
+def compose_settings_values(
+    candidate_version: str,
+    probe_source: Path,
+    *,
+    probe_source_sha256: str | None = None,
+) -> dict[str, str]:
+    """Return the non-secret Compose interpolation values for a deployment."""
+    if not isinstance(candidate_version, str) or not candidate_version:
+        raise GuardError("candidate version must be a non-empty string")
+    if any(character in candidate_version for character in "\r\n=\x00"):
+        raise GuardError("candidate version contains an invalid character")
+    source = str(probe_source)
+    if any(character in source for character in "\r\n\x00"):
+        raise GuardError("health probe source contains an invalid character")
+    if probe_source_sha256 is None:
+        probe_source_sha256 = validate_probe_source(probe_source)
+    elif not re.fullmatch(r"[0-9a-f]{64}", probe_source_sha256):
+        raise GuardError("health probe source digest is invalid")
+    return {
+        "VERSION": candidate_version,
+        "UNSTRACT_HEALTHCHECK_SOURCE": source,
+        "UNSTRACT_HEALTHCHECK_SOURCE_SHA256": probe_source_sha256,
+    }
+
+
+def parse_compose_settings(path: Path) -> dict[str, str]:
+    """Read the small private interpolation file without exposing its values."""
+    values: dict[str, str] = {}
+    source_digest: str | None = None
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise GuardError(f"cannot read private Compose settings: {path}") from exc
+    for line in lines:
+        if not line or line.startswith("#"):
+            if line.startswith("# probe-source-sha256="):
+                if source_digest is not None:
+                    raise GuardError(
+                        f"private Compose settings contain duplicate probe digests: {path}"
+                    )
+                source_digest = line.split("=", 1)[1]
+            continue
+        key, separator, value = line.partition("=")
+        if not separator or key not in {
+            "VERSION",
+            "UNSTRACT_HEALTHCHECK_SOURCE",
+        }:
+            raise GuardError(f"private Compose settings contain an unsupported entry: {path}")
+        if key in values:
+            raise GuardError(f"private Compose settings contain a duplicate entry: {path}")
+        values[key] = value
+    if set(values) != {"VERSION", "UNSTRACT_HEALTHCHECK_SOURCE"}:
+        raise GuardError(f"private Compose settings are incomplete: {path}")
+    if source_digest is None:
+        raise GuardError(f"private Compose settings lack the probe source digest: {path}")
+    if not re.fullmatch(r"[0-9a-f]{64}", source_digest):
+        raise GuardError(f"private Compose settings have an invalid probe source digest: {path}")
+    values["UNSTRACT_HEALTHCHECK_SOURCE_SHA256"] = source_digest
+    return values
+
+
+def validate_compose_settings(
+    path: Path,
+    *,
+    candidate_version: str,
+    probe_source: Path,
+    probe_source_sha256: str | None = None,
+    expected_sha256: str | None = None,
+) -> dict[str, str]:
+    validate_private_file(path, expected_sha256=expected_sha256, description="Compose settings")
+    values = parse_compose_settings(path)
+    expected = compose_settings_values(
+        candidate_version,
+        probe_source,
+        probe_source_sha256=probe_source_sha256
+        or values["UNSTRACT_HEALTHCHECK_SOURCE_SHA256"],
+    )
+    if values != expected:
+        raise GuardError(f"durable Compose settings drifted: {path}")
+    validate_probe_source(
+        Path(values["UNSTRACT_HEALTHCHECK_SOURCE"]),
+        expected_sha256=values["UNSTRACT_HEALTHCHECK_SOURCE_SHA256"],
+    )
     return values
 
 
@@ -1711,14 +1842,67 @@ def capture_and_write(
     return snapshot
 
 
-def compose_args(compose_files: tuple[str, ...]) -> list[str]:
+def compose_args(
+    compose_files: tuple[str, ...], *, settings_file: Path | None = None
+) -> list[str]:
     args = ["docker", "compose"]
+    if settings_file:
+        args.extend(["--env-file", str(settings_file)])
     for compose_file in compose_files:
         args.extend(["-f", compose_file])
     return args
 
 
-def write_image_override(lock: dict[str, Any], path: Path) -> None:
+def write_private_text(
+    path: Path,
+    text: str,
+    *,
+    replace: bool,
+    description: str,
+    reuse_if_identical: bool = False,
+) -> None:
+    """Write one private state file without creating a transient reference."""
+    if "\x00" in text:
+        raise GuardError(f"{description} contains a NUL byte")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = stat.S_IRUSR | stat.S_IWUSR
+    if path.exists() and not replace and reuse_if_identical:
+        validate_private_file(path, description=description)
+        if sha256_file(path) != sha256_bytes(text.encode("utf-8")):
+            raise GuardError(f"{description} already exists with different contents: {path}")
+        return
+    if replace:
+        staging = path.with_name(f".{path.name}.{os.getpid()}.new")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(staging, flags, mode)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            os.chmod(staging, mode)
+            os.replace(staging, path)
+        except FileExistsError as exc:
+            raise GuardError(f"private state staging file already exists: {staging}") from exc
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                staging.unlink()
+    else:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path, flags, mode)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(text)
+        except FileExistsError as exc:
+            raise GuardError(f"{description} already exists: {path}") from exc
+    os.chmod(path, mode)
+
+
+def write_image_override(
+    lock: dict[str, Any], path: Path, *, replace: bool = False
+) -> None:
     """Pin each target to the exact locked reference without touching source."""
     lines = [
         "# Generated by train_health_deployment_guard.py; do not edit.",
@@ -1729,8 +1913,44 @@ def write_image_override(lock: dict[str, Any], path: Path) -> None:
         if any(character.isspace() for character in reference) or "\n" in reference:
             raise GuardError(f"candidate image reference contains whitespace: {service}")
         lines.extend([f"  {service}:", f"    image: {json.dumps(reference)}"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_private_text(
+        path,
+        "\n".join(lines) + "\n",
+        replace=replace,
+        description="candidate image override",
+        reuse_if_identical=True,
+    )
+
+
+def write_compose_settings(
+    candidate_version: str,
+    probe_source: Path,
+    path: Path,
+    *,
+    probe_source_sha256: str | None = None,
+    replace: bool = False,
+) -> None:
+    values = compose_settings_values(
+        candidate_version,
+        probe_source,
+        probe_source_sha256=probe_source_sha256,
+    )
+    text = "\n".join(
+        [
+            "# Generated by train_health_deployment_guard.py; do not edit.",
+            f"VERSION={values['VERSION']}",
+            f"UNSTRACT_HEALTHCHECK_SOURCE={values['UNSTRACT_HEALTHCHECK_SOURCE']}",
+            f"# probe-source-sha256={values['UNSTRACT_HEALTHCHECK_SOURCE_SHA256']}",
+            "",
+        ]
+    )
+    write_private_text(
+        path,
+        text,
+        replace=replace,
+        description="Compose settings",
+        reuse_if_identical=True,
+    )
 
 
 def write_runtime_environment_override(
@@ -1764,47 +1984,60 @@ def write_runtime_environment_override(
             "# Generated by train_health_deployment_guard.py; do not edit.",
             "services: {}",
         ]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if replace else os.O_EXCL)
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        descriptor = os.open(path, flags, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write("\n".join(lines) + "\n")
-    except FileExistsError as exc:
-        raise GuardError(f"runtime environment override already exists: {path}") from exc
-    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    write_private_text(
+        path,
+        "\n".join(lines) + "\n",
+        replace=replace,
+        description="runtime environment override",
+        reuse_if_identical=True,
+    )
 
 
-def validate_private_override(path: Path, *, expected_sha256: str | None = None) -> None:
+def validate_private_file(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+    description: str,
+) -> None:
     try:
         metadata = path.lstat()
     except OSError as exc:
-        raise GuardError(f"cannot read private runtime environment override: {path}") from exc
+        raise GuardError(f"cannot read private {description}: {path}") from exc
     if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
-        raise GuardError(f"runtime environment override is not a private regular file: {path}")
+        raise GuardError(f"{description} is not a private regular file: {path}")
     if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
-        raise GuardError(f"runtime environment override has the wrong owner: {path}")
+        raise GuardError(f"{description} has the wrong owner: {path}")
     if expected_sha256 is not None:
         actual_sha256 = sha256_file(path)
         if actual_sha256 != expected_sha256:
-            raise GuardError(f"runtime environment override changed: {path}")
+            raise GuardError(f"{description} changed: {path}")
 
 
-@contextlib.contextmanager
-def candidate_image_override(lock: dict[str, Any]) -> Iterator[Path]:
-    handle = tempfile.NamedTemporaryFile(
-        mode="w", prefix="unstract-health-images-", suffix=".yaml", delete=False
+def validate_private_override(path: Path, *, expected_sha256: str | None = None) -> None:
+    validate_private_file(
+        path,
+        expected_sha256=expected_sha256,
+        description="runtime environment override",
     )
-    path = Path(handle.name)
-    handle.close()
-    try:
-        write_image_override(lock, path)
-        yield path
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            path.unlink()
+
+
+def validate_candidate_image_override(
+    path: Path, *, expected_sha256: str | None = None
+) -> None:
+    validate_private_file(
+        path,
+        expected_sha256=expected_sha256,
+        description="candidate image override",
+    )
+
+
+def candidate_image_override(
+    lock: dict[str, Any], path: Path, *, replace: bool = False
+) -> Path:
+    """Materialize a durable private image override for every Compose replay."""
+    write_image_override(lock, path, replace=replace)
+    validate_candidate_image_override(path)
+    return path
 
 
 def targeted_up(
@@ -1815,22 +2048,41 @@ def targeted_up(
     candidate_version: str,
     probe_source: Path,
     image_override: Path | None = None,
+    image_override_sha256: str | None = None,
     environment_override: Path | None = None,
     environment_override_sha256: str | None = None,
+    settings_file: Path | None = None,
+    settings_file_sha256: str | None = None,
+    probe_source_sha256: str | None = None,
     deadline: OperationDeadline | None = None,
 ) -> None:
     env = os.environ.copy()
-    env["VERSION"] = candidate_version
-    env["UNSTRACT_HEALTHCHECK_SOURCE"] = str(probe_source)
+    if settings_file:
+        settings = validate_compose_settings(
+            settings_file,
+            candidate_version=candidate_version,
+            probe_source=probe_source,
+            probe_source_sha256=probe_source_sha256,
+            expected_sha256=settings_file_sha256,
+        )
+        env["VERSION"] = settings["VERSION"]
+        env["UNSTRACT_HEALTHCHECK_SOURCE"] = settings["UNSTRACT_HEALTHCHECK_SOURCE"]
+    else:
+        env["VERSION"] = candidate_version
+        env["UNSTRACT_HEALTHCHECK_SOURCE"] = str(probe_source)
+        validate_probe_source(probe_source, expected_sha256=probe_source_sha256)
     files = compose_files
     if image_override:
+        validate_candidate_image_override(
+            image_override, expected_sha256=image_override_sha256
+        )
         files += (str(image_override),)
     if environment_override:
         validate_private_override(
             environment_override, expected_sha256=environment_override_sha256
         )
         files += (str(environment_override),)
-    args = compose_args(files)
+    args = compose_args(files, settings_file=settings_file)
     args.extend(
         [
             "up",
@@ -1909,11 +2161,25 @@ def commit_backups(
     runtime_environment_override: Path,
     runtime_environment_sha256: str,
     reviewed_environment_keys: dict[str, set[str]],
+    image_override: Path,
+    image_override_sha256: str,
+    settings_file: Path,
+    settings_file_sha256: str,
+    probe_source: Path,
+    probe_source_sha256: str,
     deadline: OperationDeadline | None = None,
 ) -> dict[str, Any]:
     backup_dir.mkdir(parents=True, exist_ok=True)
     validate_private_override(
         runtime_environment_override, expected_sha256=runtime_environment_sha256
+    )
+    validate_candidate_image_override(image_override, expected_sha256=image_override_sha256)
+    validate_compose_settings(
+        settings_file,
+        candidate_version=parse_compose_settings(settings_file)["VERSION"],
+        probe_source=probe_source,
+        probe_source_sha256=probe_source_sha256,
+        expected_sha256=settings_file_sha256,
     )
     write_json(backup_dir / "baseline.json", snapshot)
     tag_prefix = "localhost/unstract-health-backup-"
@@ -1929,6 +2195,19 @@ def commit_backups(
                 for service, keys in reviewed_environment_keys.items()
                 if keys
             },
+        },
+        "candidate_image_override": {
+            "schema": CANDIDATE_IMAGE_SCHEMA,
+            "file": image_override.name,
+            "sha256": image_override_sha256,
+        },
+        "compose_settings": {
+            "schema": COMPOSE_SETTINGS_SCHEMA,
+            "file": settings_file.name,
+            "sha256": settings_file_sha256,
+            "probe_source": str(probe_source),
+            "probe_source_sha256": probe_source_sha256,
+            "candidate_version": parse_compose_settings(settings_file)["VERSION"],
         },
         "services": {},
     }
@@ -2016,8 +2295,12 @@ def rollback_override(
                 '    healthcheck: {test: ["NONE"]}',
             ]
         )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_private_text(
+        path,
+        "\n".join(lines) + "\n",
+        replace=True,
+        description="rollback image override",
+    )
 
 
 def command_capture(args: argparse.Namespace) -> int:
@@ -2033,7 +2316,9 @@ def prepare(
     image_override: Path,
     *,
     runtime_environment_override: Path,
+    settings_file: Path,
     replace_runtime_environment_override: bool = False,
+    replace_settings_file: bool = False,
     operation_deadline: OperationDeadline,
 ) -> tuple[
     dict[str, Any], dict[str, Any], dict[str, Any], dict[str, set[str]], str
@@ -2044,6 +2329,29 @@ def prepare(
         Path(args.candidate_source), lock["source_commit"], lock.get("source_tree")
     )
     verify_artifacts(Path(args.candidate_source), lock)
+    probe_source = Path(args.probe_source)
+    probe_source_sha256 = (lock.get("artifacts") or {}).get(
+        "docker/healthchecks/unstract-services.sh"
+    )
+    if not isinstance(probe_source_sha256, str):
+        raise GuardError("candidate lock lacks the guarded probe source digest")
+    validate_probe_source(probe_source, expected_sha256=probe_source_sha256)
+    write_compose_settings(
+        lock["candidate_version"],
+        probe_source,
+        settings_file,
+        probe_source_sha256=probe_source_sha256,
+        replace=replace_settings_file,
+    )
+    validate_compose_settings(
+        settings_file,
+        candidate_version=lock["candidate_version"],
+        probe_source=probe_source,
+        probe_source_sha256=probe_source_sha256,
+    )
+    validate_candidate_image_override(image_override)
+    image_override_sha256 = sha256_file(image_override)
+    settings_file_sha256 = sha256_file(settings_file)
     candidate_images = candidate_image_snapshot(lock, deadline=operation_deadline)
     if not candidate_images:
         raise GuardError("no candidate images were verified")
@@ -2058,8 +2366,12 @@ def prepare(
         Path(args.project_dir),
         tuple(args.compose_file or DEFAULT_COMPOSE_FILES),
         candidate_version=lock["candidate_version"],
-        probe_source=Path(args.probe_source),
+        probe_source=probe_source,
         image_override=image_override,
+        image_override_sha256=image_override_sha256,
+        settings_file=settings_file,
+        settings_file_sha256=settings_file_sha256,
+        probe_source_sha256=probe_source_sha256,
         deadline=operation_deadline,
     )
     overrides, reviewed_keys = plan_runtime_environment_override(
@@ -2078,16 +2390,23 @@ def prepare(
         Path(args.project_dir),
         tuple(args.compose_file or DEFAULT_COMPOSE_FILES),
         candidate_version=lock["candidate_version"],
-        probe_source=Path(args.probe_source),
+        probe_source=probe_source,
+        settings_file=settings_file,
+        settings_file_sha256=settings_file_sha256,
+        probe_source_sha256=probe_source_sha256,
         image_override=image_override,
         environment_override=runtime_environment_override,
+        environment_override_sha256=sha256_file(runtime_environment_override),
         deadline=operation_deadline,
     )
     authored_baseline = compose_config(
         Path(args.project_dir),
         tuple(args.compose_file or DEFAULT_COMPOSE_FILES),
         candidate_version=lock["candidate_version"],
-        probe_source=Path(args.probe_source),
+        probe_source=probe_source,
+        settings_file=settings_file,
+        settings_file_sha256=settings_file_sha256,
+        probe_source_sha256=probe_source_sha256,
         deadline=operation_deadline,
     )
     check_candidate_config(
@@ -2100,6 +2419,16 @@ def prepare(
     runtime_environment_sha256 = sha256_file(runtime_environment_override)
     validate_private_override(
         runtime_environment_override, expected_sha256=runtime_environment_sha256
+    )
+    validate_candidate_image_override(
+        image_override, expected_sha256=image_override_sha256
+    )
+    validate_compose_settings(
+        settings_file,
+        candidate_version=lock["candidate_version"],
+        probe_source=probe_source,
+        probe_source_sha256=probe_source_sha256,
+        expected_sha256=settings_file_sha256,
     )
     return baseline, lock, current, reviewed_keys, runtime_environment_sha256
 
@@ -2285,6 +2614,10 @@ def apply_batch(
     untouched_services: tuple[str, ...],
     applied_services: tuple[str, ...],
     *,
+    settings_file: Path,
+    settings_file_sha256: str,
+    image_override_sha256: str,
+    probe_source_sha256: str,
     runtime_environment_override: Path,
     runtime_environment_sha256: str,
     reviewed_environment_keys: dict[str, set[str]],
@@ -2308,7 +2641,12 @@ def apply_batch(
             candidate_version=lock["candidate_version"],
             probe_source=Path(args.probe_source),
             image_override=image_override,
+            image_override_sha256=image_override_sha256,
             environment_override=runtime_environment_override,
+            environment_override_sha256=runtime_environment_sha256,
+            settings_file=settings_file,
+            settings_file_sha256=settings_file_sha256,
+            probe_source_sha256=probe_source_sha256,
             deadline=operation_deadline,
         )
         authored_baseline = compose_config(
@@ -2316,6 +2654,9 @@ def apply_batch(
             compose_files,
             candidate_version=lock["candidate_version"],
             probe_source=Path(args.probe_source),
+            settings_file=settings_file,
+            settings_file_sha256=settings_file_sha256,
+            probe_source_sha256=probe_source_sha256,
             deadline=operation_deadline,
         )
         check_candidate_config(
@@ -2337,8 +2678,12 @@ def apply_batch(
             candidate_version=lock["candidate_version"],
             probe_source=Path(args.probe_source),
             image_override=image_override,
+            image_override_sha256=image_override_sha256,
             environment_override=runtime_environment_override,
             environment_override_sha256=runtime_environment_sha256,
+            settings_file=settings_file,
+            settings_file_sha256=settings_file_sha256,
+            probe_source_sha256=probe_source_sha256,
             deadline=operation_deadline,
         )
         observed = capture(Path(args.project_dir), deadline=operation_deadline)
@@ -2355,26 +2700,25 @@ def apply_batch(
 def command_preflight(args: argparse.Namespace) -> int:
     deadline = OperationDeadline(args.operation_timeout)
     lock = load_lock(Path(args.candidate_lock))
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix="unstract-health-environment-", suffix=".yaml"
+    state_dir = Path(args.candidate_lock).resolve().parent
+    image_override = candidate_image_override(
+        lock, state_dir / CANDIDATE_IMAGE_FILENAME, replace=True
     )
-    os.close(descriptor)
-    runtime_environment_override = Path(temporary_name)
-    with candidate_image_override(lock) as image_override:
-        try:
-            prepare(
-                args,
-                image_override,
-                runtime_environment_override=runtime_environment_override,
-                replace_runtime_environment_override=True,
-                operation_deadline=deadline,
-            )
-        finally:
-            with contextlib.suppress(FileNotFoundError):
-                runtime_environment_override.unlink()
+    runtime_environment_override = state_dir / RUNTIME_ENVIRONMENT_FILENAME
+    settings_file = state_dir / COMPOSE_SETTINGS_FILENAME
+    prepare(
+        args,
+        image_override,
+        runtime_environment_override=runtime_environment_override,
+        settings_file=settings_file,
+        replace_runtime_environment_override=True,
+        replace_settings_file=True,
+        operation_deadline=deadline,
+    )
     print(
         "preflight: candidate source, image lock, Compose identity, runtime, "
-        "data, network, environment, queue, and active-job state verified"
+        "data, network, environment, queue, and active-job state verified; "
+        f"durable_artifacts={state_dir}"
     )
     return 0
 
@@ -2383,7 +2727,7 @@ def command_apply(args: argparse.Namespace) -> int:
     if args.confirm != CONFIRM_TOKEN:
         raise GuardError(f"apply requires --confirm {CONFIRM_TOKEN}")
     operation_deadline = OperationDeadline(args.operation_timeout)
-    backup_dir = Path(args.backup_dir)
+    backup_dir = Path(args.backup_dir).resolve()
     attempted: list[str] = []
     applied: list[str] = []
     backup_images: dict[str, Any] | None = None
@@ -2397,139 +2741,164 @@ def command_apply(args: argparse.Namespace) -> int:
     }
     with local_operation_lock(backup_dir / ".guard.lock", deadline=operation_deadline):
         lock_hint = load_lock(Path(args.candidate_lock))
-        with candidate_image_override(lock_hint) as image_override:
+        image_override = candidate_image_override(
+            lock_hint, backup_dir / CANDIDATE_IMAGE_FILENAME
+        )
+        settings_file = backup_dir / COMPOSE_SETTINGS_FILENAME
+        try:
+            (
+                baseline,
+                lock,
+                _,
+                reviewed_environment_keys,
+                runtime_environment_sha256,
+            ) = prepare(
+                args,
+                image_override,
+                runtime_environment_override=runtime_environment_override,
+                settings_file=settings_file,
+                operation_deadline=operation_deadline,
+            )
+            image_override_sha256 = sha256_file(image_override)
+            settings_file_sha256 = sha256_file(settings_file)
+            probe_source_sha256 = (lock.get("artifacts") or {}).get(
+                "docker/healthchecks/unstract-services.sh"
+            )
+            if not isinstance(probe_source_sha256, str):
+                raise GuardError("candidate lock lacks the guarded probe source digest")
+            with advisory_lock(deadline=operation_deadline):
+                fresh = capture(Path(args.project_dir), deadline=operation_deadline)
+                compare_baseline_current(baseline, fresh, allow_new_probe=False)
+                compare_untargeted_runtime(baseline, fresh)
+                compare_source_and_quiescence(baseline, fresh)
+                candidate_image_snapshot(lock, deadline=operation_deadline)
+                backup_images = commit_backups(
+                    fresh,
+                    backup_dir,
+                    runtime_environment_override=runtime_environment_override,
+                    runtime_environment_sha256=runtime_environment_sha256,
+                    reviewed_environment_keys=reviewed_environment_keys,
+                    image_override=image_override,
+                    image_override_sha256=image_override_sha256,
+                    settings_file=settings_file,
+                    settings_file_sha256=settings_file_sha256,
+                    probe_source=Path(args.probe_source),
+                    probe_source_sha256=probe_source_sha256,
+                    deadline=operation_deadline,
+                )
+            rollback_override(backup_images, backup_dir / "rollback.override.yaml")
+            write_json(backup_dir / "candidate-images.json", lock["images"])
+
+            attempted.extend(WORKER_SERVICES)
+            worker_replacements = apply_batch(
+                args,
+                baseline,
+                lock,
+                backup_dir,
+                image_override,
+                WORKER_SERVICES,
+                CORE_SERVICES,
+                (),
+                settings_file=settings_file,
+                settings_file_sha256=settings_file_sha256,
+                image_override_sha256=image_override_sha256,
+                probe_source_sha256=probe_source_sha256,
+                runtime_environment_override=runtime_environment_override,
+                runtime_environment_sha256=runtime_environment_sha256,
+                reviewed_environment_keys=reviewed_environment_keys,
+                operation_deadline=operation_deadline,
+            )
+            replacement_manifest["services"].update(
+                worker_replacements.get("services", {})
+            )
+            applied.extend(WORKER_SERVICES)
+            write_replacement_manifest(backup_dir, replacement_manifest)
+
+            attempted.extend(CORE_SERVICES)
+            core_replacements = apply_batch(
+                args,
+                baseline,
+                lock,
+                backup_dir,
+                image_override,
+                CORE_SERVICES,
+                (),
+                tuple(applied),
+                settings_file=settings_file,
+                settings_file_sha256=settings_file_sha256,
+                image_override_sha256=image_override_sha256,
+                probe_source_sha256=probe_source_sha256,
+                runtime_environment_override=runtime_environment_override,
+                runtime_environment_sha256=runtime_environment_sha256,
+                reviewed_environment_keys=reviewed_environment_keys,
+                operation_deadline=operation_deadline,
+            )
+            replacement_manifest["services"].update(
+                core_replacements.get("services", {})
+            )
+            applied.extend(CORE_SERVICES)
+            write_replacement_manifest(backup_dir, replacement_manifest)
+            final = capture(Path(args.project_dir), deadline=operation_deadline)
+            compare_post_apply(baseline, final, lock, TARGET_SERVICES)
+            compare_untargeted_runtime(baseline, final)
+            compare_source_and_quiescence(baseline, final)
+            write_json(backup_dir / "post-apply.json", final)
+        except Exception as exc:
+            failure_record = {
+                "schema": FAILURE_SCHEMA,
+                "original_error": exception_reason(exc),
+            }
             try:
-                (
-                    baseline,
-                    lock,
-                    _,
-                    reviewed_environment_keys,
-                    runtime_environment_sha256,
-                ) = prepare(
-                    args,
-                    image_override,
-                    runtime_environment_override=runtime_environment_override,
-                    operation_deadline=operation_deadline,
-                )
-                with advisory_lock(deadline=operation_deadline):
-                    fresh = capture(Path(args.project_dir), deadline=operation_deadline)
-                    compare_baseline_current(baseline, fresh, allow_new_probe=False)
-                    compare_untargeted_runtime(baseline, fresh)
-                    compare_source_and_quiescence(baseline, fresh)
-                    candidate_image_snapshot(lock, deadline=operation_deadline)
-                    backup_images = commit_backups(
-                        fresh,
-                        backup_dir,
-                        runtime_environment_override=runtime_environment_override,
-                        runtime_environment_sha256=runtime_environment_sha256,
-                        reviewed_environment_keys=reviewed_environment_keys,
-                        deadline=operation_deadline,
-                    )
-                rollback_override(backup_images, backup_dir / "rollback.override.yaml")
-                write_json(backup_dir / "candidate-images.json", lock["images"])
-
-                attempted.extend(WORKER_SERVICES)
-                worker_replacements = apply_batch(
-                    args,
-                    baseline,
-                    lock,
-                    backup_dir,
-                    image_override,
-                    WORKER_SERVICES,
-                    CORE_SERVICES,
-                    (),
-                    runtime_environment_override=runtime_environment_override,
-                    runtime_environment_sha256=runtime_environment_sha256,
-                    reviewed_environment_keys=reviewed_environment_keys,
-                    operation_deadline=operation_deadline,
-                )
-                replacement_manifest["services"].update(
-                    worker_replacements.get("services", {})
-                )
-                applied.extend(WORKER_SERVICES)
-                write_replacement_manifest(backup_dir, replacement_manifest)
-
-                attempted.extend(CORE_SERVICES)
-                core_replacements = apply_batch(
-                    args,
-                    baseline,
-                    lock,
-                    backup_dir,
-                    image_override,
-                    CORE_SERVICES,
-                    (),
-                    tuple(applied),
-                    runtime_environment_override=runtime_environment_override,
-                    runtime_environment_sha256=runtime_environment_sha256,
-                    reviewed_environment_keys=reviewed_environment_keys,
-                    operation_deadline=operation_deadline,
-                )
-                replacement_manifest["services"].update(
-                    core_replacements.get("services", {})
-                )
-                applied.extend(CORE_SERVICES)
-                write_replacement_manifest(backup_dir, replacement_manifest)
-                final = capture(Path(args.project_dir), deadline=operation_deadline)
-                compare_post_apply(baseline, final, lock, TARGET_SERVICES)
-                compare_untargeted_runtime(baseline, final)
-                compare_source_and_quiescence(baseline, final)
-                write_json(backup_dir / "post-apply.json", final)
-            except Exception as exc:
-                failure_record = {
-                    "schema": FAILURE_SCHEMA,
-                    "original_error": exception_reason(exc),
-                }
+                write_json(backup_dir / "apply-failure.json", failure_record)
+            except OSError:
+                pass
+            if backup_images is not None and attempted:
                 try:
-                    write_json(backup_dir / "apply-failure.json", failure_record)
-                except OSError:
-                    pass
-                if backup_images is not None and attempted:
-                    try:
-                        failed_state = capture(
-                            Path(args.project_dir), deadline=operation_deadline
-                        )
-                        write_json(backup_dir / "failed-state.json", failed_state)
-                        discovered = record_replacements(
+                    failed_state = capture(
+                        Path(args.project_dir), deadline=operation_deadline
+                    )
+                    write_json(backup_dir / "failed-state.json", failed_state)
+                    discovered = record_replacements(
+                        baseline,
+                        failed_state,
+                        lock,
+                        tuple(attempted),
+                        strict=False,
+                    )
+                    replacement_manifest["services"].update(
+                        discovered.get("services", {})
+                    )
+                    replacement_manifest["unresolved"] = sorted(
+                        set(replacement_manifest.get("unresolved", []))
+                        | set(discovered.get("unresolved", []))
+                    )
+                    write_replacement_manifest(
+                        backup_dir, replacement_manifest, name="failed-replacements.json"
+                    )
+                    if replacement_manifest["services"]:
+                        compensating_rollback(
+                            args,
                             baseline,
-                            failed_state,
-                            lock,
-                            tuple(attempted),
-                            strict=False,
+                            backup_images,
+                            replacement_manifest,
+                            backup_dir,
+                            runtime_environment_override=runtime_environment_override,
+                            runtime_environment_sha256=runtime_environment_sha256,
+                            operation_deadline=operation_deadline,
                         )
-                        replacement_manifest["services"].update(
-                            discovered.get("services", {})
-                        )
-                        replacement_manifest["unresolved"] = sorted(
-                            set(replacement_manifest.get("unresolved", []))
-                            | set(discovered.get("unresolved", []))
-                        )
-                        write_replacement_manifest(
-                            backup_dir, replacement_manifest, name="failed-replacements.json"
-                        )
-                        if replacement_manifest["services"]:
-                            compensating_rollback(
-                                args,
-                                baseline,
-                                backup_images,
-                                replacement_manifest,
-                                backup_dir,
-                                runtime_environment_override=runtime_environment_override,
-                                runtime_environment_sha256=runtime_environment_sha256,
-                                operation_deadline=operation_deadline,
-                            )
-                    except Exception as rollback_error:
-                        failure_record["rollback_error"] = exception_reason(rollback_error)
-                        try:
-                            write_json(backup_dir / "apply-failure.json", failure_record)
-                        except OSError:
-                            pass
-                        raise GuardError(
-                            "guarded apply failed and compensating rollback failed; "
-                            "manual recovery is required; "
-                            f"original failure: {failure_record['original_error']}; "
-                            f"recovery failure: {failure_record['rollback_error']}"
-                        ) from exc
-                raise
+                except Exception as rollback_error:
+                    failure_record["rollback_error"] = exception_reason(rollback_error)
+                    try:
+                        write_json(backup_dir / "apply-failure.json", failure_record)
+                    except OSError:
+                        pass
+                    raise GuardError(
+                        "guarded apply failed and compensating rollback failed; "
+                        "manual recovery is required; "
+                        f"original failure: {failure_record['original_error']}; "
+                        f"recovery failure: {failure_record['rollback_error']}"
+                    ) from exc
+            raise
     print(f"apply: verified {len(TARGET_SERVICES)} targeted services; backup={backup_dir}")
     return 0
 

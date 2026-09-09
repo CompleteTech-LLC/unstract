@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import subprocess
 from copy import deepcopy
 from pathlib import Path
 
@@ -266,6 +268,147 @@ def test_runtime_environment_override_is_private(tmp_path: Path) -> None:
     path.write_text(path.read_text(encoding="utf-8") + "# changed\n", encoding="utf-8")
     with pytest.raises(guard.GuardError, match="override changed"):
         guard.validate_private_override(path, expected_sha256=digest)
+
+
+def test_durable_compose_inputs_are_private_and_reusable(tmp_path: Path) -> None:
+    probe = tmp_path / "probe.sh"
+    probe.write_text("#!/bin/sh\nprintf probe\n", encoding="utf-8")
+    probe_sha256 = guard.sha256_file(probe)
+    lock = {
+        "images": {
+            service: {"reference": f"candidate/{service}"}
+            for service in guard.TARGET_SERVICES
+        }
+    }
+    image_override = tmp_path / guard.CANDIDATE_IMAGE_FILENAME
+    settings = tmp_path / guard.COMPOSE_SETTINGS_FILENAME
+
+    guard.candidate_image_override(lock, image_override)
+    guard.candidate_image_override(lock, image_override)
+    guard.write_compose_settings(
+        "goal09-test",
+        probe,
+        settings,
+        probe_source_sha256=probe_sha256,
+    )
+    guard.write_compose_settings(
+        "goal09-test",
+        probe,
+        settings,
+        probe_source_sha256=probe_sha256,
+    )
+
+    assert image_override.stat().st_mode & 0o777 == 0o600
+    assert settings.stat().st_mode & 0o777 == 0o600
+    guard.validate_compose_settings(
+        settings,
+        candidate_version="goal09-test",
+        probe_source=probe,
+        probe_source_sha256=probe_sha256,
+    )
+
+    probe.write_text("#!/bin/sh\nprintf changed\n", encoding="utf-8")
+    with pytest.raises(guard.GuardError, match="health probe source changed"):
+        guard.validate_compose_settings(
+            settings,
+            candidate_version="goal09-test",
+            probe_source=probe,
+            probe_source_sha256=probe_sha256,
+        )
+
+
+def test_compose_replay_consumes_durable_settings_and_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = tmp_path / "probe.sh"
+    probe.write_text("#!/bin/sh\nprintf probe\n", encoding="utf-8")
+    probe_sha256 = guard.sha256_file(probe)
+    lock = {
+        "images": {
+            service: {"reference": f"candidate/{service}"}
+            for service in guard.TARGET_SERVICES
+        }
+    }
+    image_override = guard.candidate_image_override(
+        lock, tmp_path / guard.CANDIDATE_IMAGE_FILENAME
+    )
+    settings = tmp_path / guard.COMPOSE_SETTINGS_FILENAME
+    guard.write_compose_settings(
+        "goal09-test",
+        probe,
+        settings,
+        probe_source_sha256=probe_sha256,
+    )
+    settings_sha256 = guard.sha256_file(settings)
+    environment_override = tmp_path / guard.RUNTIME_ENVIRONMENT_FILENAME
+    guard.write_runtime_environment_override(
+        {"runner": {"APP_MODE": "test"}}, environment_override
+    )
+    calls: list[tuple[list[str], dict[str, str] | None]] = []
+
+    def fake_run(
+        args: list[str],
+        *,
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append((args, env))
+        if "config" in args:
+            return subprocess.CompletedProcess(args, 0, json.dumps({"services": {}}), "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(guard, "run", fake_run)
+    guard.compose_config(
+        tmp_path,
+        ("compose.yaml",),
+        candidate_version="goal09-test",
+        probe_source=probe,
+        image_override=image_override,
+        image_override_sha256=guard.sha256_file(image_override),
+        environment_override=environment_override,
+        environment_override_sha256=guard.sha256_file(environment_override),
+        settings_file=settings,
+        settings_file_sha256=guard.sha256_file(settings),
+        probe_source_sha256=probe_sha256,
+    )
+    guard.targeted_up(
+        tmp_path,
+        ("compose.yaml",),
+        ("runner",),
+        candidate_version="goal09-test",
+        probe_source=probe,
+        image_override=image_override,
+        image_override_sha256=guard.sha256_file(image_override),
+        environment_override=environment_override,
+        environment_override_sha256=guard.sha256_file(environment_override),
+        settings_file=settings,
+        settings_file_sha256=guard.sha256_file(settings),
+        probe_source_sha256=probe_sha256,
+    )
+
+    assert len(calls) == 2
+    config_args, config_env = calls[0]
+    assert config_args[:3] == ["docker", "compose", "--env-file"]
+    assert str(settings) in config_args
+    assert str(image_override) in config_args
+    assert str(environment_override) in config_args
+    assert config_env and config_env["VERSION"] == "goal09-test"
+    assert config_env["UNSTRACT_HEALTHCHECK_SOURCE"] == str(probe)
+    assert calls[1][0][-1] == "runner"
+
+    settings.write_text(settings.read_text(encoding="utf-8").replace("goal09-test", "tampered"), encoding="utf-8")
+    with pytest.raises(guard.GuardError, match="Compose settings changed"):
+        guard.targeted_up(
+            tmp_path,
+            ("compose.yaml",),
+            ("runner",),
+            candidate_version="goal09-test",
+            probe_source=probe,
+            settings_file=settings,
+            settings_file_sha256=settings_sha256,
+            probe_source_sha256=probe_sha256,
+        )
 
 
 def test_core_probe_checks_require_read_only_probe_mount() -> None:

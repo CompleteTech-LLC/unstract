@@ -89,8 +89,12 @@ be the exact names and IDs already captured from the live stack, unless a
 deliberate static image change has separately been reviewed. The lock also
 contains the candidate commit's tree hash and hashes for the two overlays, the
 core and database probes, and the development essentials Compose file. The
-guard writes a temporary image override from this lock, so Compose cannot
-silently resolve a different registry or tag. Only `runner` and the twelve
+guard writes a private mode-600 image override and Compose settings file from
+this lock, so every health, environment, and image replay uses the same
+immutable references, `VERSION`, and staged probe path. These artifacts remain
+in the preflight state directory and apply backup directory for later startup
+or recovery; the guard validates their SHA-256 values before each Compose
+invocation. Only `runner` and the twelve
 worker services point at the new build; backend, frontend, platform-service,
 x2text-service, and the seven core data services point at the captured static
 references.
