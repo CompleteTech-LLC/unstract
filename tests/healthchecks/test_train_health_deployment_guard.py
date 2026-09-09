@@ -163,6 +163,111 @@ def test_exception_reason_is_bounded_and_redacts_secret_assignments() -> None:
     assert len(reason) < 260
 
 
+def test_runtime_environment_plan_preserves_image_drift_and_missing_baseline_keys() -> None:
+    baseline_values = {
+        "qdrant": {"PATH": "/usr/local/bin", "QDRANT_DB": "baseline-db"},
+        "runner": {"PATH": "/usr/local/bin", "UNSTRACT_APPS_VERSION": "old"},
+    }
+    baseline = {
+        "containers": [
+            {
+                "compose": {"com.docker.compose.service": service},
+                "name": f"unstract-{service}",
+                "env_hashes": guard.environment_hashes(values),
+            }
+            for service, values in baseline_values.items()
+        ]
+    }
+    runtime_environment = {
+        service: {"id": f"{service}-id", "values": values}
+        for service, values in baseline_values.items()
+    }
+    candidate_images = {
+        "qdrant": {"environment": {"PATH": "/usr/local/bin"}},
+        "runner": {
+            "environment": {"PATH": "/usr/local/bin", "UNSTRACT_APPS_VERSION": "new"}
+        },
+    }
+    config = {"services": {"qdrant": {}, "runner": {}}}
+
+    overrides, reviewed = guard.plan_runtime_environment_override(
+        baseline,
+        runtime_environment,
+        candidate_images,
+        config,
+        services=("qdrant", "runner"),
+    )
+
+    assert overrides == {
+        "qdrant": {"QDRANT_DB": "baseline-db"},
+        "runner": {"UNSTRACT_APPS_VERSION": "old"},
+    }
+    assert reviewed == {
+        "qdrant": {"QDRANT_DB"},
+        "runner": {"UNSTRACT_APPS_VERSION"},
+    }
+
+
+def test_runtime_environment_plan_rejects_unreviewed_image_default() -> None:
+    baseline = {
+        "containers": [
+            {
+                "compose": {"com.docker.compose.service": "runner"},
+                "name": "unstract-runner",
+                "env_hashes": guard.environment_hashes({"PATH": "/usr/local/bin"}),
+            }
+        ]
+    }
+    runtime_environment = {
+        "runner": {"id": "runner-id", "values": {"PATH": "/usr/local/bin"}}
+    }
+    candidate_images = {
+        "runner": {
+            "environment": {"PATH": "/usr/local/bin", "UNREVIEWED_DEFAULT": "changed"}
+        }
+    }
+
+    with pytest.raises(guard.GuardError, match="added environment"):
+        guard.plan_runtime_environment_override(
+            baseline,
+            runtime_environment,
+            candidate_images,
+            {"services": {"runner": {}}},
+            services=("runner",),
+        )
+
+
+def test_reviewed_environment_override_is_allowed_by_compose_identity_guard() -> None:
+    config, baseline, lock, authored = candidate_fixture()
+    config["services"]["db"]["environment"]["BASELINE_ONLY"] = "preserved"
+
+    guard.check_candidate_config(
+        config,
+        baseline,
+        lock,
+        authored,
+        reviewed_environment_keys={"db": {"BASELINE_ONLY"}},
+    )
+
+
+def test_runtime_environment_override_is_private(tmp_path: Path) -> None:
+    path = tmp_path / "runtime-environment.override.yaml"
+
+    guard.write_runtime_environment_override(
+        {"qdrant": {"QDRANT_DB": "baseline-$DB-${DB_NAME}"}}, path
+    )
+    guard.validate_private_override(path)
+
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert '"baseline-$$DB-$${DB_NAME}"' in path.read_text(encoding="utf-8")
+
+    digest = guard.sha256_file(path)
+    guard.validate_private_override(path, expected_sha256=digest)
+    path.write_text(path.read_text(encoding="utf-8") + "# changed\n", encoding="utf-8")
+    with pytest.raises(guard.GuardError, match="override changed"):
+        guard.validate_private_override(path, expected_sha256=digest)
+
+
 def test_core_probe_checks_require_read_only_probe_mount() -> None:
     config, baseline, lock, authored = candidate_fixture()
     config["services"]["db"]["volumes"] = []

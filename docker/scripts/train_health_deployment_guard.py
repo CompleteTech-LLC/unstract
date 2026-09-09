@@ -27,6 +27,7 @@ import os
 import re
 import select
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -94,6 +95,9 @@ SOURCE_STATE_SCHEMA = "unstract-source-state/v2"
 BACKUP_SCHEMA = "unstract-health-backup/v2"
 REPLACEMENT_SCHEMA = "unstract-health-replacements/v1"
 FAILURE_SCHEMA = "unstract-health-failure/v1"
+RUNTIME_ENVIRONMENT_SCHEMA = "unstract-health-runtime-environment/v1"
+RUNTIME_ENVIRONMENT_FILENAME = "runtime-environment.override.yaml"
+RUNTIME_GENERATED_ENV_KEYS = frozenset({"HOME", "container"})
 DURATION_TOKEN = re.compile(
     r"(?P<number>(?:\d+(?:\.\d*)?|\.\d+))(?P<unit>ns|us|µs|ms|h|m|s)"
 )
@@ -348,6 +352,25 @@ def env_hashes(
     return dict(sorted(result.items()))
 
 
+def environment_values(values: list[str] | None) -> dict[str, str]:
+    """Parse an inspect environment vector without exposing its values."""
+    result: dict[str, str] = {}
+    for item in values or []:
+        if not isinstance(item, str):
+            continue
+        key, separator, value = item.partition("=")
+        result[key] = value if separator else ""
+    return result
+
+
+def environment_hashes(
+    values: dict[str, str], *, container_id: str | None = None
+) -> dict[str, dict[str, Any]]:
+    return env_hashes(
+        [f"{key}={value}" for key, value in values.items()], container_id=container_id
+    )
+
+
 def selected_labels(labels: dict[str, str]) -> dict[str, str]:
     keys = (
         "com.docker.compose.project",
@@ -587,6 +610,37 @@ def inspect_project(
             }
         )
     return containers
+
+
+def inspect_runtime_environment(
+    project: str = PROJECT, *, deadline: OperationDeadline | None = None
+) -> dict[str, dict[str, Any]]:
+    """Read raw environment values privately for reviewed Compose preservation."""
+    ids_result = run(
+        ["podman", "ps", "-aq", "--filter", f"label=com.docker.compose.project={project}"],
+        deadline=deadline,
+    )
+    ids = ids_result.stdout.split()
+    if not ids:
+        return {}
+    raw = parse_json_output(
+        run(["podman", "inspect", *ids], deadline=deadline),
+        "podman inspect runtime environment",
+    )
+    result: dict[str, dict[str, Any]] = {}
+    for item in raw:
+        config = item.get("Config") or {}
+        labels = config.get("Labels") or {}
+        service = labels.get("com.docker.compose.service")
+        if not service:
+            continue
+        if service in result:
+            raise GuardError(f"duplicate Compose service environment: {service}")
+        result[service] = {
+            "id": item.get("Id"),
+            "values": environment_values(config.get("Env")),
+        }
+    return result
 
 
 def source_state(
@@ -1132,6 +1186,7 @@ def candidate_image_snapshot(
             "reference": expected["reference"],
             "id": row.get("Id") or row.get("ID"),
             "digest": image_digest(row),
+            "environment": environment_values((row.get("Config") or {}).get("Env")),
         }
         if actual["id"] != expected["id"] or actual["digest"] != expected["digest"]:
             raise GuardError(
@@ -1150,12 +1205,17 @@ def compose_config(
     candidate_version: str,
     probe_source: Path,
     image_override: Path | None = None,
+    environment_override: Path | None = None,
     deadline: OperationDeadline | None = None,
 ) -> dict[str, Any]:
     env = os.environ.copy()
     env["VERSION"] = candidate_version
     env["UNSTRACT_HEALTHCHECK_SOURCE"] = str(probe_source)
-    files = compose_files + ((str(image_override),) if image_override else ())
+    files = compose_files
+    if image_override:
+        files += (str(image_override),)
+    if environment_override:
+        files += (str(environment_override),)
     args = ["docker", "compose"]
     for compose_file in files:
         args.extend(["-f", compose_file])
@@ -1179,6 +1239,90 @@ def compose_environment(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return {str(key): item for key, item in value.items()}
     raise GuardError("Compose environment is not a mapping")
+
+
+def candidate_environment_values(
+    config: dict[str, Any], service: str, image_values: dict[str, str]
+) -> dict[str, str]:
+    """Merge candidate image defaults with the effective Compose service env."""
+    service_config = (config.get("services") or {}).get(service) or {}
+    values = dict(image_values)
+    for key, value in compose_environment(service_config.get("environment")).items():
+        if value is None:
+            raise GuardError(f"candidate environment inherits host value for {service}: {key}")
+        values[str(key)] = str(value)
+    # Docker/Podman exposes an explicit Compose hostname through HOSTNAME.
+    # When no hostname is authored, the runtime-generated container ID is
+    # normalized out of the baseline and is deliberately omitted here.
+    hostname = service_config.get("hostname")
+    if hostname is not None:
+        values["HOSTNAME"] = str(hostname)
+    elif "HOSTNAME" not in image_values:
+        values.pop("HOSTNAME", None)
+    return values
+
+
+def plan_runtime_environment_override(
+    baseline: dict[str, Any],
+    runtime_environment: dict[str, dict[str, Any]],
+    candidate_images: dict[str, dict[str, Any]],
+    config: dict[str, Any],
+    *,
+    services: tuple[str, ...] = TARGET_SERVICES,
+) -> tuple[dict[str, dict[str, str]], dict[str, set[str]]]:
+    """Plan private Compose values that restore the baseline env contract."""
+    baseline_services = service_map(baseline)
+    overrides: dict[str, dict[str, str]] = {}
+    reviewed_keys: dict[str, set[str]] = {}
+    for service in services:
+        previous = baseline_services.get(service)
+        observed = runtime_environment.get(service)
+        candidate = candidate_images.get(service)
+        if previous is None or observed is None or candidate is None:
+            raise GuardError(f"runtime environment plan is incomplete for {service}")
+        observed_id = observed.get("id")
+        observed_values = observed.get("values") or {}
+        observed_hashes = environment_hashes(observed_values, container_id=observed_id)
+        if observed_hashes != (previous.get("env_hashes") or {}):
+            raise GuardError(f"fresh runtime environment changed for {service}")
+        candidate_values = candidate_environment_values(
+            config, service, candidate.get("environment") or {}
+        )
+        baseline_hashes = {
+            key: value
+            for key, value in (previous.get("env_hashes") or {}).items()
+            if key not in RUNTIME_GENERATED_ENV_KEYS
+        }
+        candidate_hashes = {
+            key: value
+            for key, value in environment_hashes(candidate_values).items()
+            if key not in RUNTIME_GENERATED_ENV_KEYS
+        }
+        service_overrides: dict[str, str] = {}
+        for key, expected_hash in baseline_hashes.items():
+            if candidate_hashes.get(key) == expected_hash:
+                continue
+            if key == "HOSTNAME":
+                raise GuardError(f"candidate hostname changed for {service}")
+            if key not in observed_values:
+                raise GuardError(f"baseline environment value is unavailable for {service}: {key}")
+            service_overrides[key] = observed_values[key]
+        for key in candidate_hashes:
+            if key in baseline_hashes or key in ALLOWED_ENV_ADDITIONS.get(service, set()):
+                continue
+            raise GuardError(f"candidate added environment for {service}: {key}")
+        effective_values = dict(candidate_values)
+        effective_values.update(service_overrides)
+        effective_hashes = {
+            key: value
+            for key, value in environment_hashes(effective_values).items()
+            if key not in RUNTIME_GENERATED_ENV_KEYS
+        }
+        if any(effective_hashes.get(key) != value for key, value in baseline_hashes.items()):
+            raise GuardError(f"candidate environment cannot preserve {service}")
+        overrides[service] = service_overrides
+        reviewed_keys[service] = set(service_overrides)
+    return overrides, reviewed_keys
 
 
 def compose_value_hash(value: Any) -> dict[str, Any]:
@@ -1211,6 +1355,7 @@ def check_candidate_config(
     baseline: dict[str, Any],
     lock: dict[str, Any],
     baseline_config: dict[str, Any] | None = None,
+    reviewed_environment_keys: dict[str, set[str]] | None = None,
 ) -> None:
     services = config.get("services") or {}
     missing = set(TARGET_SERVICES) - set(services)
@@ -1328,12 +1473,18 @@ def check_candidate_config(
         old_authored_environment = compose_environment(
             authored_services[service].get("environment")
         )
-        allowed_additions = ALLOWED_ENV_ADDITIONS.get(service, set())
+        reviewed_keys = (reviewed_environment_keys or {}).get(service, set())
+        allowed_additions = ALLOWED_ENV_ADDITIONS.get(service, set()) | reviewed_keys
         for key, value in old_authored_environment.items():
             if key not in candidate_environment:
-                raise GuardError(f"candidate removed authored environment for {service}: {key}")
+                if key not in reviewed_keys:
+                    raise GuardError(
+                        f"candidate removed authored environment for {service}: {key}"
+                    )
+                continue
             if compose_value_hash(candidate_environment[key]) != compose_value_hash(value):
-                raise GuardError(f"candidate changed environment for {service}: {key}")
+                if key not in reviewed_keys:
+                    raise GuardError(f"candidate changed environment for {service}: {key}")
         for key, value in candidate_environment.items():
             if key not in old_authored_environment and key not in allowed_additions:
                 raise GuardError(f"candidate added environment for {service}: {key}")
@@ -1582,6 +1733,65 @@ def write_image_override(lock: dict[str, Any], path: Path) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def write_runtime_environment_override(
+    overrides: dict[str, dict[str, str]], path: Path, *, replace: bool = False
+) -> None:
+    """Write reviewed baseline values to a private mode-600 Compose override."""
+    lines = [
+        "# Generated by train_health_deployment_guard.py; do not edit.",
+        "services:",
+    ]
+    written_services = 0
+    for service in TARGET_SERVICES:
+        values = overrides.get(service) or {}
+        if not values:
+            continue
+        written_services += 1
+        lines.extend([f"  {service}:", "    environment:"])
+        for key in sorted(values, key=lambda item: str(item)):
+            value = values[key]
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise GuardError(f"runtime environment entry is not a string for {service}")
+            if not key or any(character in key for character in "\r\n=\x00"):
+                raise GuardError(f"runtime environment key is invalid for {service}")
+            if "\x00" in value:
+                raise GuardError(f"runtime environment value is invalid for {service}: {key}")
+            # Compose interpolates ``$VAR`` in YAML values even when they are
+            # quoted.  ``$$`` is Compose's escaped literal dollar sign.
+            lines.append(f"      {json.dumps(key)}: {json.dumps(value.replace('$', '$$'))}")
+    if not written_services:
+        lines = [
+            "# Generated by train_health_deployment_guard.py; do not edit.",
+            "services: {}",
+        ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if replace else os.O_EXCL)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+    except FileExistsError as exc:
+        raise GuardError(f"runtime environment override already exists: {path}") from exc
+    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+
+
+def validate_private_override(path: Path, *, expected_sha256: str | None = None) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise GuardError(f"cannot read private runtime environment override: {path}") from exc
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise GuardError(f"runtime environment override is not a private regular file: {path}")
+    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        raise GuardError(f"runtime environment override has the wrong owner: {path}")
+    if expected_sha256 is not None:
+        actual_sha256 = sha256_file(path)
+        if actual_sha256 != expected_sha256:
+            raise GuardError(f"runtime environment override changed: {path}")
+
+
 @contextlib.contextmanager
 def candidate_image_override(lock: dict[str, Any]) -> Iterator[Path]:
     handle = tempfile.NamedTemporaryFile(
@@ -1605,12 +1815,21 @@ def targeted_up(
     candidate_version: str,
     probe_source: Path,
     image_override: Path | None = None,
+    environment_override: Path | None = None,
+    environment_override_sha256: str | None = None,
     deadline: OperationDeadline | None = None,
 ) -> None:
     env = os.environ.copy()
     env["VERSION"] = candidate_version
     env["UNSTRACT_HEALTHCHECK_SOURCE"] = str(probe_source)
-    files = compose_files + ((str(image_override),) if image_override else ())
+    files = compose_files
+    if image_override:
+        files += (str(image_override),)
+    if environment_override:
+        validate_private_override(
+            environment_override, expected_sha256=environment_override_sha256
+        )
+        files += (str(environment_override),)
     args = compose_args(files)
     args.extend(
         [
@@ -1687,14 +1906,30 @@ def commit_backups(
     snapshot: dict[str, Any],
     backup_dir: Path,
     *,
+    runtime_environment_override: Path,
+    runtime_environment_sha256: str,
+    reviewed_environment_keys: dict[str, set[str]],
     deadline: OperationDeadline | None = None,
 ) -> dict[str, Any]:
     backup_dir.mkdir(parents=True, exist_ok=True)
+    validate_private_override(
+        runtime_environment_override, expected_sha256=runtime_environment_sha256
+    )
     write_json(backup_dir / "baseline.json", snapshot)
     tag_prefix = "localhost/unstract-health-backup-"
     backup_images: dict[str, Any] = {
         "schema": BACKUP_SCHEMA,
         "created_at": utc_now(),
+        "runtime_environment": {
+            "schema": RUNTIME_ENVIRONMENT_SCHEMA,
+            "file": runtime_environment_override.name,
+            "sha256": runtime_environment_sha256,
+            "reviewed_environment_keys": {
+                service: sorted(keys)
+                for service, keys in reviewed_environment_keys.items()
+                if keys
+            },
+        },
         "services": {},
     }
     for service in TARGET_SERVICES:
@@ -1744,6 +1979,24 @@ def backup_service_record(backup_images: dict[str, Any], service: str) -> dict[s
     raise GuardError(f"backup manifest has no service record for {service}")
 
 
+def runtime_environment_backup(
+    backup_images: dict[str, Any], backup_dir: Path
+) -> tuple[Path, str]:
+    metadata = backup_images.get("runtime_environment")
+    if not isinstance(metadata, dict):
+        raise GuardError("backup manifest has no runtime environment metadata")
+    if metadata.get("schema") != RUNTIME_ENVIRONMENT_SCHEMA:
+        raise GuardError("backup runtime environment has an unsupported schema")
+    if metadata.get("file") != RUNTIME_ENVIRONMENT_FILENAME:
+        raise GuardError("backup runtime environment file is not the guarded override")
+    digest = metadata.get("sha256")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise GuardError("backup runtime environment digest is invalid")
+    path = backup_dir / RUNTIME_ENVIRONMENT_FILENAME
+    validate_private_override(path, expected_sha256=digest)
+    return path, digest
+
+
 def rollback_override(
     backup_images: dict[str, Any], path: Path, services: tuple[str, ...] = TARGET_SERVICES
 ) -> None:
@@ -1779,8 +2032,12 @@ def prepare(
     args: argparse.Namespace,
     image_override: Path,
     *,
+    runtime_environment_override: Path,
+    replace_runtime_environment_override: bool = False,
     operation_deadline: OperationDeadline,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+) -> tuple[
+    dict[str, Any], dict[str, Any], dict[str, Any], dict[str, set[str]], str
+]:
     baseline = load_baseline(Path(args.baseline))
     lock = load_lock(Path(args.candidate_lock))
     require_clean_candidate_source(
@@ -1794,12 +2051,36 @@ def prepare(
     compare_baseline_current(baseline, current, allow_new_probe=False)
     compare_untargeted_runtime(baseline, current)
     compare_source_and_quiescence(baseline, current)
+    runtime_environment = inspect_runtime_environment(
+        deadline=operation_deadline
+    )
     config = compose_config(
         Path(args.project_dir),
         tuple(args.compose_file or DEFAULT_COMPOSE_FILES),
         candidate_version=lock["candidate_version"],
         probe_source=Path(args.probe_source),
         image_override=image_override,
+        deadline=operation_deadline,
+    )
+    overrides, reviewed_keys = plan_runtime_environment_override(
+        baseline,
+        runtime_environment,
+        candidate_images,
+        config,
+    )
+    write_runtime_environment_override(
+        overrides,
+        runtime_environment_override,
+        replace=replace_runtime_environment_override,
+    )
+    validate_private_override(runtime_environment_override)
+    config = compose_config(
+        Path(args.project_dir),
+        tuple(args.compose_file or DEFAULT_COMPOSE_FILES),
+        candidate_version=lock["candidate_version"],
+        probe_source=Path(args.probe_source),
+        image_override=image_override,
+        environment_override=runtime_environment_override,
         deadline=operation_deadline,
     )
     authored_baseline = compose_config(
@@ -1809,8 +2090,18 @@ def prepare(
         probe_source=Path(args.probe_source),
         deadline=operation_deadline,
     )
-    check_candidate_config(config, baseline, lock, authored_baseline)
-    return baseline, lock, current
+    check_candidate_config(
+        config,
+        baseline,
+        lock,
+        authored_baseline,
+        reviewed_environment_keys=reviewed_keys,
+    )
+    runtime_environment_sha256 = sha256_file(runtime_environment_override)
+    validate_private_override(
+        runtime_environment_override, expected_sha256=runtime_environment_sha256
+    )
+    return baseline, lock, current, reviewed_keys, runtime_environment_sha256
 
 
 def record_replacements(
@@ -1938,6 +2229,8 @@ def compensating_rollback(
     replacement_manifest: dict[str, Any],
     backup_dir: Path,
     *,
+    runtime_environment_override: Path,
+    runtime_environment_sha256: str,
     operation_deadline: OperationDeadline,
 ) -> None:
     services = tuple((replacement_manifest.get("services") or {}).keys())
@@ -1948,6 +2241,9 @@ def compensating_rollback(
     verify_replacement_ids(current, replacement_manifest)
     override = backup_dir / "compensating-rollback.override.yaml"
     rollback_override(backup_images, override, services)
+    validate_private_override(
+        runtime_environment_override, expected_sha256=runtime_environment_sha256
+    )
     rollback_files = rollback_compose_files(args) + (str(override),)
     with advisory_lock(deadline=operation_deadline):
         # Recheck identity and quiescence after acquiring the DB lock.  The
@@ -1962,6 +2258,8 @@ def compensating_rollback(
             services,
             candidate_version="rollback-unused",
             probe_source=Path(args.probe_source),
+            environment_override=runtime_environment_override,
+            environment_override_sha256=runtime_environment_sha256,
             deadline=operation_deadline,
         )
         wait_running(services, operation_deadline=operation_deadline)
@@ -1987,9 +2285,15 @@ def apply_batch(
     untouched_services: tuple[str, ...],
     applied_services: tuple[str, ...],
     *,
+    runtime_environment_override: Path,
+    runtime_environment_sha256: str,
+    reviewed_environment_keys: dict[str, set[str]],
     operation_deadline: OperationDeadline,
 ) -> dict[str, Any]:
     compose_files = tuple(args.compose_file or DEFAULT_COMPOSE_FILES)
+    validate_private_override(
+        runtime_environment_override, expected_sha256=runtime_environment_sha256
+    )
     with advisory_lock(deadline=operation_deadline):
         fresh = capture(Path(args.project_dir), deadline=operation_deadline)
         compare_untargeted_runtime(baseline, fresh)
@@ -2004,6 +2308,7 @@ def apply_batch(
             candidate_version=lock["candidate_version"],
             probe_source=Path(args.probe_source),
             image_override=image_override,
+            environment_override=runtime_environment_override,
             deadline=operation_deadline,
         )
         authored_baseline = compose_config(
@@ -2013,7 +2318,13 @@ def apply_batch(
             probe_source=Path(args.probe_source),
             deadline=operation_deadline,
         )
-        check_candidate_config(config, baseline, lock, authored_baseline)
+        check_candidate_config(
+            config,
+            baseline,
+            lock,
+            authored_baseline,
+            reviewed_environment_keys=reviewed_environment_keys,
+        )
         # Take the final settled sample after all preflight commands and
         # immediately before the targeted Compose mutation.
         final_quiescence = settled_queue_snapshot(operation_deadline)
@@ -2026,6 +2337,8 @@ def apply_batch(
             candidate_version=lock["candidate_version"],
             probe_source=Path(args.probe_source),
             image_override=image_override,
+            environment_override=runtime_environment_override,
+            environment_override_sha256=runtime_environment_sha256,
             deadline=operation_deadline,
         )
         observed = capture(Path(args.project_dir), deadline=operation_deadline)
@@ -2042,8 +2355,23 @@ def apply_batch(
 def command_preflight(args: argparse.Namespace) -> int:
     deadline = OperationDeadline(args.operation_timeout)
     lock = load_lock(Path(args.candidate_lock))
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix="unstract-health-environment-", suffix=".yaml"
+    )
+    os.close(descriptor)
+    runtime_environment_override = Path(temporary_name)
     with candidate_image_override(lock) as image_override:
-        prepare(args, image_override, operation_deadline=deadline)
+        try:
+            prepare(
+                args,
+                image_override,
+                runtime_environment_override=runtime_environment_override,
+                replace_runtime_environment_override=True,
+                operation_deadline=deadline,
+            )
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                runtime_environment_override.unlink()
     print(
         "preflight: candidate source, image lock, Compose identity, runtime, "
         "data, network, environment, queue, and active-job state verified"
@@ -2059,6 +2387,9 @@ def command_apply(args: argparse.Namespace) -> int:
     attempted: list[str] = []
     applied: list[str] = []
     backup_images: dict[str, Any] | None = None
+    runtime_environment_override = backup_dir / RUNTIME_ENVIRONMENT_FILENAME
+    runtime_environment_sha256 = ""
+    reviewed_environment_keys: dict[str, set[str]] = {}
     replacement_manifest: dict[str, Any] = {
         "schema": REPLACEMENT_SCHEMA,
         "services": {},
@@ -2068,8 +2399,17 @@ def command_apply(args: argparse.Namespace) -> int:
         lock_hint = load_lock(Path(args.candidate_lock))
         with candidate_image_override(lock_hint) as image_override:
             try:
-                baseline, lock, _ = prepare(
-                    args, image_override, operation_deadline=operation_deadline
+                (
+                    baseline,
+                    lock,
+                    _,
+                    reviewed_environment_keys,
+                    runtime_environment_sha256,
+                ) = prepare(
+                    args,
+                    image_override,
+                    runtime_environment_override=runtime_environment_override,
+                    operation_deadline=operation_deadline,
                 )
                 with advisory_lock(deadline=operation_deadline):
                     fresh = capture(Path(args.project_dir), deadline=operation_deadline)
@@ -2078,7 +2418,12 @@ def command_apply(args: argparse.Namespace) -> int:
                     compare_source_and_quiescence(baseline, fresh)
                     candidate_image_snapshot(lock, deadline=operation_deadline)
                     backup_images = commit_backups(
-                        fresh, backup_dir, deadline=operation_deadline
+                        fresh,
+                        backup_dir,
+                        runtime_environment_override=runtime_environment_override,
+                        runtime_environment_sha256=runtime_environment_sha256,
+                        reviewed_environment_keys=reviewed_environment_keys,
+                        deadline=operation_deadline,
                     )
                 rollback_override(backup_images, backup_dir / "rollback.override.yaml")
                 write_json(backup_dir / "candidate-images.json", lock["images"])
@@ -2093,6 +2438,9 @@ def command_apply(args: argparse.Namespace) -> int:
                     WORKER_SERVICES,
                     CORE_SERVICES,
                     (),
+                    runtime_environment_override=runtime_environment_override,
+                    runtime_environment_sha256=runtime_environment_sha256,
+                    reviewed_environment_keys=reviewed_environment_keys,
                     operation_deadline=operation_deadline,
                 )
                 replacement_manifest["services"].update(
@@ -2111,6 +2459,9 @@ def command_apply(args: argparse.Namespace) -> int:
                     CORE_SERVICES,
                     (),
                     tuple(applied),
+                    runtime_environment_override=runtime_environment_override,
+                    runtime_environment_sha256=runtime_environment_sha256,
+                    reviewed_environment_keys=reviewed_environment_keys,
                     operation_deadline=operation_deadline,
                 )
                 replacement_manifest["services"].update(
@@ -2162,6 +2513,8 @@ def command_apply(args: argparse.Namespace) -> int:
                                 backup_images,
                                 replacement_manifest,
                                 backup_dir,
+                                runtime_environment_override=runtime_environment_override,
+                                runtime_environment_sha256=runtime_environment_sha256,
                                 operation_deadline=operation_deadline,
                             )
                     except Exception as rollback_error:
@@ -2210,6 +2563,9 @@ def command_rollback(args: argparse.Namespace) -> int:
     if replacement_manifest.get("schema") != REPLACEMENT_SCHEMA:
         raise GuardError("replacement manifest has an unsupported schema")
     baseline = load_baseline(backup_dir / "baseline.json")
+    runtime_environment_override, runtime_environment_sha256 = runtime_environment_backup(
+        backup_images, backup_dir
+    )
     with local_operation_lock(backup_dir / ".guard.lock", deadline=operation_deadline):
         compensating_rollback(
             args,
@@ -2217,6 +2573,8 @@ def command_rollback(args: argparse.Namespace) -> int:
             backup_images,
             replacement_manifest,
             backup_dir,
+            runtime_environment_override=runtime_environment_override,
+            runtime_environment_sha256=runtime_environment_sha256,
             operation_deadline=operation_deadline,
         )
         final = json.loads(
