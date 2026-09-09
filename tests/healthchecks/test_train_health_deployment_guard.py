@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -9,6 +10,7 @@ import subprocess
 import sys
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -1514,3 +1516,198 @@ def test_named_volume_alias_rejects_wrong_live_name() -> None:
 
     with pytest.raises(guard.GuardError, match="mount source"):
         guard.check_candidate_config(config, baseline, lock, authored)
+
+
+def test_settled_queue_timeout_retains_sanitized_counts_and_phase(monkeypatch) -> None:
+    def non_quiescent_snapshot(_deadline):
+        return {
+            "observed_at": "2026-09-09T17:14:00+00:00",
+            "quiescent": False,
+            "rabbitmq": {"empty": True},
+            "postgres": {
+                "counts": {
+                    "pg_queue_message": 1,
+                    "pg_queue_claimed": 0,
+                    "pg_active_barriers": 0,
+                    "pg_orchestration_claims": 0,
+                }
+            },
+        }
+
+    monkeypatch.setattr(guard, "queue_snapshot", non_quiescent_snapshot)
+
+    with pytest.raises(guard.QuiescenceTimeout) as raised:
+        guard.settled_queue_snapshot(
+            max_wait_seconds=0.001,
+            phase="post-recreation:runner",
+        )
+
+    evidence = raised.value.evidence()
+    assert evidence["reason"] == "bounded settled-quiescence interval elapsed"
+    assert evidence["phase"] == "post-recreation:runner"
+    assert evidence["observations"]
+    assert evidence["observations"][0]["postgres_counts"]["pg_queue_message"] == 1
+
+
+def test_settled_queue_deadline_timeout_retains_counts_and_reason(monkeypatch) -> None:
+    def non_quiescent_snapshot(_deadline):
+        return {
+            "observed_at": "2026-09-09T17:14:00+00:00",
+            "quiescent": False,
+            "rabbitmq": {"empty": True},
+            "postgres": {"counts": {"pg_queue_message": 2}},
+        }
+
+    class ExhaustedDeadline:
+        def remaining(self) -> float:
+            raise guard.GuardError("guarded operation exceeded its total deadline")
+
+    monkeypatch.setattr(guard, "queue_snapshot", non_quiescent_snapshot)
+
+    with pytest.raises(guard.QuiescenceTimeout) as raised:
+        guard.settled_queue_snapshot(
+            ExhaustedDeadline(),
+            max_wait_seconds=120,
+            phase="post-recreation:runner",
+        )
+
+    evidence = raised.value.evidence()
+    assert evidence["reason"] == "guarded operation deadline elapsed before settled quiescence"
+    assert evidence["observations"][-1]["postgres_counts"]["pg_queue_message"] == 2
+
+
+def test_raw_transition_capture_never_substitutes_for_a_settled_capture(monkeypatch) -> None:
+    raw_job_state = {"quiescent": False, "postgres": {"counts": {"pg_queue_message": 1}}}
+    monkeypatch.setattr(guard, "runtime_context", lambda **_kwargs: {"runtime": "ok"})
+    monkeypatch.setattr(guard, "source_state", lambda *_args, **_kwargs: {"source": "ok"})
+    monkeypatch.setattr(guard, "queue_snapshot", lambda _deadline: raw_job_state)
+    monkeypatch.setattr(guard, "inspect_project", lambda **_kwargs: [])
+
+    def settled_must_not_run(*_args, **_kwargs):
+        raise AssertionError("raw transition capture must not claim settled quiescence")
+
+    monkeypatch.setattr(guard, "settled_queue_snapshot", settled_must_not_run)
+    snapshot = guard.capture(
+        Path("/project"),
+        require_settled_quiescence=False,
+    )
+
+    assert snapshot["job_quiescence"] is raw_job_state
+    assert snapshot["job_quiescence"]["quiescent"] is False
+
+
+def test_post_recreation_evidence_is_private_and_contains_only_job_state(tmp_path: Path) -> None:
+    snapshot = {
+        "captured_at": "2026-09-09T17:14:00+00:00",
+        "job_quiescence": {
+            "quiescent": False,
+            "postgres": {"counts": {"pg_queue_message": 1}},
+        },
+    }
+
+    guard.write_post_recreation_quiescence(
+        tmp_path,
+        ("runner",),
+        snapshot,
+        stage="observed",
+    )
+
+    path = tmp_path / "post-recreation-observed-runner.json"
+    evidence = json.loads(path.read_text(encoding="utf-8"))
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert evidence == {
+        "captured_at": "2026-09-09T17:14:00+00:00",
+        "job_quiescence": snapshot["job_quiescence"],
+        "schema": "unstract-health-post-recreation-quiescence/v1",
+        "services": ["runner"],
+        "stage": "observed",
+    }
+
+
+def test_apply_batch_records_raw_transition_then_requires_strict_settlement(monkeypatch) -> None:
+    events: list[str] = []
+    capture_kwargs: list[dict] = []
+    capture_results = [{}, {}, {}]
+    args = SimpleNamespace(
+        compose_file=None,
+        project_dir="/project",
+        candidate_source="/candidate",
+        probe_source="/probe",
+    )
+    baseline = {"source": {}}
+    lock = {"candidate_version": "candidate"}
+
+    def fake_capture(*_args, **kwargs):
+        capture_kwargs.append(kwargs)
+        events.append(
+            "raw-capture"
+            if kwargs.get("require_settled_quiescence") is False
+            else "settled-capture"
+        )
+        return capture_results.pop(0)
+
+    monkeypatch.setattr(guard, "resolve_live_env_file", lambda *_args: Path("/env"))
+    monkeypatch.setattr(guard, "validate_private_override", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(guard, "advisory_lock", lambda **_kwargs: contextlib.nullcontext())
+    monkeypatch.setattr(guard, "capture", fake_capture)
+    monkeypatch.setattr(guard, "compare_untargeted_runtime", lambda *_args: None)
+    monkeypatch.setattr(guard, "compare_source_and_quiescence", lambda *_args: None)
+    monkeypatch.setattr(guard, "verify_untouched_targets", lambda *_args: None)
+    monkeypatch.setattr(guard, "candidate_image_snapshot", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(guard, "compose_config", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(guard, "check_candidate_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        guard,
+        "settled_queue_snapshot",
+        lambda *_args, **_kwargs: {"stability": {"stable": True}},
+    )
+    monkeypatch.setattr(guard, "targeted_up", lambda *_args, **_kwargs: events.append("targeted-up"))
+    monkeypatch.setattr(
+        guard,
+        "write_post_recreation_quiescence",
+        lambda *_args, stage, **_kwargs: events.append(f"evidence-{stage}"),
+    )
+    monkeypatch.setattr(
+        guard,
+        "record_replacements",
+        lambda *_args, **_kwargs: {"services": {"runner": {}}},
+    )
+    monkeypatch.setattr(guard, "write_replacement_manifest", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(guard, "wait_healthy", lambda *_args, **_kwargs: events.append("healthy"))
+    monkeypatch.setattr(guard, "compare_post_apply", lambda *_args: None)
+
+    result = guard.apply_batch(
+        args,
+        baseline,
+        lock,
+        Path("/backup"),
+        Path("/image-override"),
+        ("runner",),
+        (),
+        (),
+        settings_file=Path("/settings"),
+        settings_file_sha256="settings-sha",
+        image_override_sha256="image-sha",
+        probe_source_sha256="probe-sha",
+        runtime_environment_override=Path("/runtime-override"),
+        runtime_environment_sha256="runtime-sha",
+        reviewed_environment_keys={},
+        snapshot=SimpleNamespace(),
+        operation_deadline=guard.OperationDeadline(60),
+    )
+
+    assert result == {"services": {"runner": {}}}
+    assert events == [
+        "settled-capture",
+        "targeted-up",
+        "raw-capture",
+        "evidence-observed",
+        "healthy",
+        "settled-capture",
+        "evidence-settled",
+    ]
+    assert capture_kwargs[1]["require_settled_quiescence"] is False
+    assert capture_kwargs[2]["quiescence_max_wait_seconds"] == (
+        guard.POST_RECREATION_QUIESCENCE_MAX_WAIT_SECONDS
+    )
+    assert capture_kwargs[2]["quiescence_phase"] == "post-recreation:runner"

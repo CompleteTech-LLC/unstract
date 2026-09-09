@@ -59,6 +59,11 @@ EXPECTED_RUNTIME_UID = 1000
 QUIESCENCE_REQUIRED_SAMPLES = 3
 QUIESCENCE_SAMPLE_INTERVAL_SECONDS = 2.0
 QUIESCENCE_MAX_WAIT_SECONDS = 10.0
+# A recreation may need time to settle before the existing strict zero-work
+# predicate is met again.  The longer post-recreation window does not permit
+# work to be consumed, cleared, or ignored: every following mutation still
+# requires three consecutive all-zero samples.
+POST_RECREATION_QUIESCENCE_MAX_WAIT_SECONDS = 120.0
 
 # Compose service names.  Keep this explicit so a typo or a newly added service
 # cannot silently turn a targeted deployment into a project-wide update.
@@ -240,6 +245,39 @@ class OperationDeadline:
 
 class GuardError(RuntimeError):
     """A precondition or postcondition failed."""
+
+
+class QuiescenceTimeout(GuardError):
+    """A bounded zero-work wait that retains only sanitized observations."""
+
+    def __init__(
+        self,
+        *,
+        phase: str,
+        max_wait_seconds: float,
+        observations: list[dict[str, Any]],
+        reason: str = "bounded settled-quiescence interval elapsed",
+    ) -> None:
+        self.phase = phase
+        self.max_wait_seconds = max_wait_seconds
+        self.observations = observations
+        self.reason = reason
+        super().__init__(
+            "queue and active-job state did not remain quiescent for the bounded "
+            f"stability interval (phase={phase})"
+        )
+
+    def evidence(self) -> dict[str, Any]:
+        """Return failure evidence without command output or environment values."""
+        return {
+            "schema": "unstract-health-quiescence-timeout/v1",
+            "reason": self.reason,
+            "phase": self.phase,
+            "max_wait_seconds": self.max_wait_seconds,
+            "required_consecutive_samples": QUIESCENCE_REQUIRED_SAMPLES,
+            "sample_interval_seconds": QUIESCENCE_SAMPLE_INTERVAL_SECONDS,
+            "observations": self.observations,
+        }
 
 
 def exception_reason(error: BaseException, *, limit: int = 240) -> str:
@@ -1747,15 +1785,32 @@ def queue_snapshot(deadline: OperationDeadline | None = None) -> dict[str, Any]:
     }
 
 
-def settled_queue_snapshot(deadline: OperationDeadline | None = None) -> dict[str, Any]:
+def settled_queue_snapshot(
+    deadline: OperationDeadline | None = None,
+    *,
+    max_wait_seconds: float = QUIESCENCE_MAX_WAIT_SECONDS,
+    phase: str = "guarded operation",
+) -> dict[str, Any]:
     """Require consecutive zero-work samples before any destructive change."""
+    if not math.isfinite(max_wait_seconds) or max_wait_seconds <= 0:
+        raise GuardError("quiescence wait must be a positive finite duration")
     started = time.monotonic()
-    end = started + QUIESCENCE_MAX_WAIT_SECONDS
+    end = started + max_wait_seconds
     consecutive = 0
     observations: list[dict[str, Any]] = []
     last: dict[str, Any] | None = None
     while True:
-        last = queue_snapshot(deadline)
+        try:
+            last = queue_snapshot(deadline)
+        except GuardError as exc:
+            if deadline is not None and time.monotonic() >= deadline.ends_at:
+                raise QuiescenceTimeout(
+                    phase=phase,
+                    max_wait_seconds=max_wait_seconds,
+                    observations=observations,
+                    reason="guarded operation deadline elapsed before settled quiescence",
+                ) from exc
+            raise
         observations.append(
             {
                 "observed_at": last.get("observed_at"),
@@ -1778,10 +1833,20 @@ def settled_queue_snapshot(deadline: OperationDeadline | None = None) -> dict[st
             consecutive = 0
         remaining = end - time.monotonic()
         if deadline:
-            remaining = min(remaining, deadline.remaining())
+            try:
+                remaining = min(remaining, deadline.remaining())
+            except GuardError as exc:
+                raise QuiescenceTimeout(
+                    phase=phase,
+                    max_wait_seconds=max_wait_seconds,
+                    observations=observations,
+                    reason="guarded operation deadline elapsed before settled quiescence",
+                ) from exc
         if remaining <= 0:
-            raise GuardError(
-                "queue and active-job state did not remain quiescent for the bounded stability interval"
+            raise QuiescenceTimeout(
+                phase=phase,
+                max_wait_seconds=max_wait_seconds,
+                observations=observations,
             )
         time.sleep(min(QUIESCENCE_SAMPLE_INTERVAL_SECONDS, remaining))
 
@@ -1839,8 +1904,31 @@ def capture(
     *,
     live_env_file: Path | None = None,
     deadline: OperationDeadline | None = None,
+    require_settled_quiescence: bool = True,
+    quiescence_max_wait_seconds: float = QUIESCENCE_MAX_WAIT_SECONDS,
+    quiescence_phase: str = "capture",
 ) -> dict[str, Any]:
+    """Capture sanitized state, optionally retaining one raw transition sample.
+
+    A raw sample is only for recording exact replacement IDs and timeout context
+    after a recreation.  It is never accepted as a precondition for another
+    mutation; callers that could mutate must use the default settled capture.
+    """
     uid = os.getuid() if hasattr(os, "getuid") else None
+    current_runtime_context = runtime_context(deadline=deadline)
+    current_source = source_state(
+        project_dir, live_env_file=live_env_file, deadline=deadline
+    )
+    job_quiescence = (
+        settled_queue_snapshot(
+            deadline,
+            max_wait_seconds=quiescence_max_wait_seconds,
+            phase=quiescence_phase,
+        )
+        if require_settled_quiescence
+        else queue_snapshot(deadline)
+    )
+    containers = inspect_project(deadline=deadline)
     return {
         "schema": "unstract-deployment-prep/v2",
         "captured_at": utc_now(),
@@ -1849,12 +1937,10 @@ def capture(
             "hostname": os.uname().nodename,
             "rootless_project": PROJECT,
         },
-        "runtime_context": runtime_context(deadline=deadline),
-        "source": source_state(
-            project_dir, live_env_file=live_env_file, deadline=deadline
-        ),
-        "job_quiescence": settled_queue_snapshot(deadline),
-        "containers": inspect_project(deadline=deadline),
+        "runtime_context": current_runtime_context,
+        "source": current_source,
+        "job_quiescence": job_quiescence,
+        "containers": containers,
     }
 
 
@@ -1870,6 +1956,34 @@ def write_private_json(path: Path, value: Any, *, description: str) -> None:
         json.dumps(value, indent=2, sort_keys=True) + "\n",
         replace=True,
         description=description,
+    )
+
+
+def write_post_recreation_quiescence(
+    backup_dir: Path,
+    services: tuple[str, ...],
+    snapshot: dict[str, Any],
+    *,
+    stage: str,
+) -> None:
+    """Persist a small, sanitized observation around one recreated batch."""
+    if not services:
+        raise GuardError("post-recreation quiescence evidence needs at least one service")
+    if stage not in {"observed", "settled"}:
+        raise GuardError(f"unsupported post-recreation quiescence stage: {stage}")
+    job_quiescence = snapshot.get("job_quiescence")
+    if not isinstance(job_quiescence, dict):
+        raise GuardError("post-recreation snapshot lacks job quiescence")
+    write_private_json(
+        backup_dir / f"post-recreation-{stage}-{services[0]}.json",
+        {
+            "schema": "unstract-health-post-recreation-quiescence/v1",
+            "stage": stage,
+            "services": list(services),
+            "captured_at": snapshot.get("captured_at"),
+            "job_quiescence": job_quiescence,
+        },
+        description=f"post-recreation {stage} quiescence evidence",
     )
 
 
@@ -4055,6 +4169,8 @@ def compensating_rollback(
         project_dir,
         live_env_file=live_env_file,
         deadline=operation_deadline,
+        quiescence_max_wait_seconds=POST_RECREATION_QUIESCENCE_MAX_WAIT_SECONDS,
+        quiescence_phase=f"pre-compensating-rollback:{services[0]}",
     )
     compare_source_and_quiescence(baseline, current)
     verify_replacement_ids(current, replacement_manifest)
@@ -4084,6 +4200,8 @@ def compensating_rollback(
             project_dir,
             live_env_file=live_env_file,
             deadline=operation_deadline,
+            quiescence_max_wait_seconds=POST_RECREATION_QUIESCENCE_MAX_WAIT_SECONDS,
+            quiescence_phase=f"locked-compensating-rollback:{services[0]}",
         )
         compare_source_and_quiescence(baseline, locked)
         verify_replacement_ids(locked, replacement_manifest)
@@ -4107,6 +4225,8 @@ def compensating_rollback(
         project_dir,
         live_env_file=live_env_file,
         deadline=operation_deadline,
+        quiescence_max_wait_seconds=POST_RECREATION_QUIESCENCE_MAX_WAIT_SECONDS,
+        quiescence_phase=f"post-compensating-rollback:{services[0]}",
     )
     verify_rollback_result(
         baseline,
@@ -4201,7 +4321,10 @@ def apply_batch(
         )
         # Take the final settled sample after all preflight commands and
         # immediately before the targeted Compose mutation.
-        final_quiescence = settled_queue_snapshot(operation_deadline)
+        final_quiescence = settled_queue_snapshot(
+            operation_deadline,
+            phase=f"pre-recreation:{services[0]}",
+        )
         if not final_quiescence.get("stability", {}).get("stable"):
             raise GuardError("queue was not settled immediately before targeted recreation")
         targeted_up(
@@ -4227,6 +4350,10 @@ def apply_batch(
             project_dir,
             live_env_file=live_env_file,
             deadline=operation_deadline,
+            require_settled_quiescence=False,
+        )
+        write_post_recreation_quiescence(
+            backup_dir, services, observed, stage="observed"
         )
         replacements = record_replacements(baseline, observed, lock, services)
         write_replacement_manifest(backup_dir, replacements, name=f"replacements-{services[0]}.json")
@@ -4235,6 +4362,11 @@ def apply_batch(
             project_dir,
             live_env_file=live_env_file,
             deadline=operation_deadline,
+            quiescence_max_wait_seconds=POST_RECREATION_QUIESCENCE_MAX_WAIT_SECONDS,
+            quiescence_phase=f"post-recreation:{services[0]}",
+        )
+        write_post_recreation_quiescence(
+            backup_dir, services, final, stage="settled"
         )
         compare_post_apply(baseline, final, lock, services)
         compare_untargeted_runtime(baseline, final)
@@ -4575,6 +4707,8 @@ def command_apply(args: argparse.Namespace) -> int:
                 project_dir,
                 live_env_file=live_env_file,
                 deadline=operation_deadline,
+                quiescence_max_wait_seconds=POST_RECREATION_QUIESCENCE_MAX_WAIT_SECONDS,
+                quiescence_phase="post-apply",
             )
             compare_post_apply(baseline, final, lock, TARGET_SERVICES)
             compare_untargeted_runtime(baseline, final)
@@ -4585,6 +4719,8 @@ def command_apply(args: argparse.Namespace) -> int:
                 "schema": FAILURE_SCHEMA,
                 "original_error": exception_reason(exc),
             }
+            if isinstance(exc, QuiescenceTimeout):
+                failure_record["quiescence_timeout"] = exc.evidence()
             try:
                 write_json(backup_dir / "apply-failure.json", failure_record)
             except OSError:
@@ -4595,6 +4731,7 @@ def command_apply(args: argparse.Namespace) -> int:
                         project_dir,
                         live_env_file=live_env_file,
                         deadline=operation_deadline,
+                        require_settled_quiescence=False,
                     )
                     write_json(backup_dir / "failed-state.json", failed_state)
                     discovered = record_replacements(
@@ -4627,6 +4764,10 @@ def command_apply(args: argparse.Namespace) -> int:
                         )
                 except Exception as rollback_error:
                     failure_record["rollback_error"] = exception_reason(rollback_error)
+                    if isinstance(rollback_error, QuiescenceTimeout):
+                        failure_record["rollback_quiescence_timeout"] = (
+                            rollback_error.evidence()
+                        )
                     try:
                         write_json(backup_dir / "apply-failure.json", failure_record)
                     except OSError:
