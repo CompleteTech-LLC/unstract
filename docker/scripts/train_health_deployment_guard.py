@@ -108,7 +108,7 @@ LIVE_COMPOSE_TRAIN = "docker/compose.train.yaml"
 LIVE_ENV_RELATIVE = "docker/.env"
 REPLAY_MANIFEST_SCHEMA = "unstract-durable-replay/v2"
 REPLAY_MANIFEST_FILENAME = "durable-replay-manifest.json"
-COMPOSE_SNAPSHOT_SCHEMA = "unstract-compose-snapshot/v1"
+COMPOSE_SNAPSHOT_SCHEMA = "unstract-compose-snapshot/v2"
 COMPOSE_SNAPSHOT_MANIFEST_FILENAME = "compose-snapshot-manifest.json"
 COMPOSE_SNAPSHOT_DIR_PREFIX = "compose-snapshot-"
 COMPOSE_SNAPSHOT_PROBE_RELATIVE = Path("__helper__/unstract-services.sh")
@@ -148,6 +148,12 @@ class ComposeSnapshot(NamedTuple):
     manifest_path: Path
     project_dir: Path
     paths: dict[str, str]
+    # Maps a rendered snapshot-relative bind source back to the authoritative
+    # project-tree path it represented when the snapshot was frozen.  Compose
+    # providers are allowed to retain the snapshot spelling in ``config``
+    # output, but that temporary spelling must never become the mount identity
+    # compared with the running service.
+    bind_sources: dict[str, str]
 
     @property
     def probe_path(self) -> Path:
@@ -618,6 +624,7 @@ def materialize_compose_snapshot(
     paths: dict[str, str] = {}
     entries: dict[str, dict[str, Any]] = {}
     passthroughs: dict[str, str] = {}
+    bind_sources: dict[str, str] = {}
     copied: set[Path] = set()
     private_sources = {
         source.resolve()
@@ -658,6 +665,37 @@ def materialize_compose_snapshot(
         }
         if key is not None:
             paths[key] = str((destination / relative).resolve())
+
+    def register_bind_source(relative: Path, source: Path) -> None:
+        """Bind a rendered snapshot path to one exact project-tree source.
+
+        The snapshot may retain an immutable copy (or a protected symlink) for
+        Compose itself.  Its rendered ``config`` can still spell the temporary
+        snapshot path, so record only ordinary project-relative bind sources
+        that can be mapped back to the authoritative tree without inference.
+        """
+        if (
+            not relative.parts
+            or relative.is_absolute()
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or relative.parts[0].startswith("__")
+        ):
+            raise GuardError(f"Compose bind source has an unsafe snapshot path: {source}")
+        try:
+            authoritative = source.resolve(strict=True)
+            expected = (project_dir.resolve() / relative).resolve(strict=True)
+        except OSError as exc:
+            raise GuardError(f"cannot resolve Compose bind source: {source}") from exc
+        if authoritative != expected:
+            raise GuardError(
+                "Compose bind source does not map to the authoritative project tree: "
+                f"{source}"
+            )
+        key = str(relative)
+        prior = bind_sources.get(key)
+        if prior is not None and prior != str(authoritative):
+            raise GuardError(f"Compose bind source mapping changed: {source}")
+        bind_sources[key] = str(authoritative)
 
     compose_sources: list[Path] = []
     pending_includes: list[Path] = []
@@ -709,13 +747,15 @@ def materialize_compose_snapshot(
                 passthroughs[str(relative)] = _write_snapshot_directory_passthrough(
                     destination, relative, source
                 )
-                continue
-            copy_source(
-                source,
-                relative,
-                private=private,
-                description="private Compose env file" if private else "Compose bind file",
-            )
+            else:
+                copy_source(
+                    source,
+                    relative,
+                    private=private,
+                    description="private Compose env file" if private else "Compose bind file",
+                )
+            if not private:
+                register_bind_source(relative, source)
 
     if live_env_file is not None:
         source = _compose_input_path(project_dir, live_env_file)
@@ -763,6 +803,7 @@ def materialize_compose_snapshot(
         },
         "entries": entries,
         "passthroughs": passthroughs,
+        "bind_sources": bind_sources,
     }
     try:
         manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
@@ -775,6 +816,7 @@ def materialize_compose_snapshot(
         manifest_path=manifest_path.resolve(),
         project_dir=project_dir.resolve(),
         paths={key: str(destination / relative) for key, relative in manifest["paths"].items()},
+        bind_sources=bind_sources,
     )
 
 
@@ -839,10 +881,12 @@ def load_compose_snapshot(path: Path) -> ComposeSnapshot:
     entries = manifest.get("entries")
     paths_manifest = manifest.get("paths")
     passthroughs = manifest.get("passthroughs") or {}
+    bind_sources = manifest.get("bind_sources")
     if (
         not isinstance(entries, dict)
         or not isinstance(paths_manifest, dict)
         or not isinstance(passthroughs, dict)
+        or not isinstance(bind_sources, dict)
     ):
         raise GuardError("Compose snapshot manifest is incomplete")
     paths: dict[str, str] = {}
@@ -895,11 +939,46 @@ def load_compose_snapshot(path: Path) -> ComposeSnapshot:
     project_dir = Path(project_dir_value).resolve()
     if not Path(project_dir_value).is_absolute() or not project_dir.exists():
         raise GuardError("Compose snapshot project directory is invalid")
+    validated_bind_sources: dict[str, str] = {}
+    for relative, target in bind_sources.items():
+        if not isinstance(relative, str) or not isinstance(target, str):
+            raise GuardError("Compose snapshot bind source mapping is invalid")
+        relative_path = Path(relative)
+        if (
+            not relative_path.parts
+            or relative_path.is_absolute()
+            or any(part in {"", ".", ".."} for part in relative_path.parts)
+            or relative_path.parts[0].startswith("__")
+            or relative not in entries and relative not in passthroughs
+        ):
+            raise GuardError("Compose snapshot bind source mapping is unsafe")
+        if relative in entries and bool(entries[relative].get("private")):
+            raise GuardError("Compose snapshot bind source mapping references private input")
+        try:
+            authoritative = Path(target)
+            if not authoritative.is_absolute():
+                raise ValueError("bind source is not absolute")
+            expected = (project_dir / relative_path).resolve(strict=True)
+            actual = authoritative.resolve(strict=True)
+        except (OSError, ValueError) as exc:
+            raise GuardError("Compose snapshot bind source mapping is invalid") from exc
+        if actual != expected:
+            raise GuardError("Compose snapshot bind source no longer matches the project tree")
+        if relative in passthroughs:
+            try:
+                if (root / relative_path).resolve(strict=True) != actual:
+                    raise GuardError(
+                        "Compose snapshot bind source passthrough target changed"
+                    )
+            except OSError as exc:
+                raise GuardError("Compose snapshot bind source passthrough is invalid") from exc
+        validated_bind_sources[relative] = str(actual)
     return ComposeSnapshot(
         root=root,
         manifest_path=path.resolve(),
         project_dir=project_dir,
         paths=paths,
+        bind_sources=validated_bind_sources,
     )
 
 
@@ -983,6 +1062,100 @@ def bound_compose_inputs(
             )
         replacements = {argument: active.path_for(argument) for argument in required}
         yield replacements, (), active
+
+
+def _snapshot_bind_source_relative(value: str, snapshot: ComposeSnapshot) -> str | None:
+    """Return a lexical snapshot-relative bind source, if one was rendered.
+
+    Do not resolve the candidate before deciding whether it belongs to the
+    snapshot: directory passthroughs intentionally resolve to their original
+    host paths.  A provider spelling a source inside the snapshot must match a
+    manifest-authorized bind source exactly; an unrecognized or escaping
+    spelling is a hard error rather than a fallback to the temporary path.
+    """
+    if not os.path.isabs(value):
+        return None
+    root = os.path.abspath(str(snapshot.root))
+    candidate = os.path.abspath(value)
+    claims_snapshot_root = value == root or value.startswith(root + os.sep)
+    try:
+        inside_snapshot = os.path.commonpath((root, candidate)) == root
+        resolves_inside_snapshot = (
+            os.path.commonpath((root, os.path.realpath(value))) == root
+        )
+    except ValueError:
+        return None
+    if claims_snapshot_root and not inside_snapshot:
+        raise GuardError("Compose rendered bind source escapes its snapshot")
+    if not inside_snapshot:
+        if resolves_inside_snapshot:
+            raise GuardError("Compose rendered bind source aliases its snapshot")
+        return None
+    relative = Path(os.path.relpath(candidate, root))
+    if (
+        not relative.parts
+        or relative == Path(".")
+        or relative.is_absolute()
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise GuardError("Compose rendered bind source is not a snapshot input")
+    return str(relative)
+
+
+def normalize_snapshot_bind_sources(
+    config: dict[str, Any], snapshot: ComposeSnapshot
+) -> dict[str, Any]:
+    """Map provider-rendered snapshot bind paths to authoritative host paths.
+
+    Compose still reads all includes, env files, and overrides from the frozen
+    snapshot.  This changes only rendered bind identities used for guard
+    comparison, so a temporary snapshot path cannot be mistaken for a changed
+    persistent mount after its temporary directory is removed.
+    """
+    services = config.get("services")
+    if not isinstance(services, dict):
+        return config
+    for service, definition in services.items():
+        if not isinstance(definition, dict):
+            continue
+        mounts = definition.get("volumes")
+        if mounts is None:
+            continue
+        if not isinstance(mounts, list):
+            raise GuardError(f"Compose rendered volumes are invalid for {service}")
+        for mount in mounts:
+            if not isinstance(mount, dict):
+                raise GuardError(f"Compose rendered mount is invalid for {service}")
+            if mount.get("type") != "bind":
+                continue
+            source = mount.get("source")
+            if mount.get("target") == PROBE_MOUNT_TARGET:
+                expected_probe = os.path.abspath(str(snapshot.probe_path))
+                if (
+                    not isinstance(source, str)
+                    or os.path.abspath(source) != expected_probe
+                ):
+                    raise GuardError(
+                        "Compose rendered trusted probe mount does not use "
+                        "the frozen probe source"
+                    )
+                # The immutable probe deliberately lives inside the snapshot.
+                # It is content-hashed separately and excluded from persistent
+                # mount identity comparison, so do not treat it as project data.
+                continue
+            if not isinstance(source, str) or not source:
+                continue
+            relative = _snapshot_bind_source_relative(source, snapshot)
+            if relative is None:
+                continue
+            authoritative = snapshot.bind_sources.get(relative)
+            if authoritative is None:
+                raise GuardError(
+                    "Compose rendered bind source is not authorized by its snapshot: "
+                    f"{source}"
+                )
+            mount["source"] = authoritative
+    return config
 
 
 def parse_json_output(result: subprocess.CompletedProcess[str], description: str) -> Any:
@@ -2057,7 +2230,10 @@ def compose_config(
             deadline=deadline,
             pass_fds=pass_fds,
         )
-    return parse_json_output(result, "Compose config")
+        rendered = parse_json_output(result, "Compose config")
+        if not isinstance(rendered, dict):
+            raise GuardError("Compose config did not return an object")
+        return normalize_snapshot_bind_sources(rendered, active_snapshot)
 
 
 def compose_environment(value: Any) -> dict[str, Any]:

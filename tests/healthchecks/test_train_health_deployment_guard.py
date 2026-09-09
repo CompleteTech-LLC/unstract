@@ -840,7 +840,9 @@ def test_compose_snapshot_rejects_tampered_retained_input(tmp_path: Path) -> Non
         guard.load_compose_snapshot(snapshot.manifest_path)
 
 
-def test_real_compose_provider_resolves_snapshot_include(tmp_path: Path) -> None:
+def test_real_compose_provider_preserves_snapshot_runner_paths_and_env(
+    tmp_path: Path,
+) -> None:
     project = tmp_path / "project"
     (project / "docker").mkdir(parents=True)
     (project / "docker" / "docker-compose.yaml").write_text(
@@ -850,26 +852,38 @@ def test_real_compose_provider_resolves_snapshot_include(tmp_path: Path) -> None
     (project / "docker" / "docker-compose-dev-essentials.yaml").write_text(
         "services:\n  included:\n    image: busybox:latest\n", encoding="utf-8"
     )
-    relative_env = project / "docker" / "relative.env"
-    relative_env.write_text("SNAPSHOT_MARKER=from-snapshot\n", encoding="utf-8")
-    relative_data = project / "docker" / "relative-data"
-    relative_data.mkdir()
-    (relative_data / "marker").write_text("runtime-data\n", encoding="utf-8")
+    workflow_data = project / "docker" / "workflow_data"
+    workflow_data.mkdir()
+    (workflow_data / "marker").write_text("runtime-data\n", encoding="utf-8")
+    tool_registry = project / "tool-registry"
+    tool_registry.mkdir()
+    (tool_registry / "marker").write_text("registry-data\n", encoding="utf-8")
+    runner_env = project / "runner" / ".env"
+    runner_env.parent.mkdir()
+    runner_env.write_text("RUNNER_ENV_FILE=from-runner-env-file\n", encoding="utf-8")
     (project / "docker" / "docker-compose.yaml").write_text(
         "include:\n"
         "  - docker-compose-dev-essentials.yaml\n"
         "services:\n"
-        "  relative:\n"
+        "  runner:\n"
         "    image: busybox:latest\n"
         "    hostname: source-fixed-hostname\n"
         "    env_file:\n"
-        "      - ./relative.env\n"
+        "      - ../runner/.env\n"
+        "    environment:\n"
+        "      RUNNER_SOURCE_ENV: ${RUNNER_SOURCE_ENV}\n"
         "    volumes:\n"
-        "      - ./relative-data:/data:ro\n",
+        "      - ./workflow_data:/data\n"
+        "      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config\n",
         encoding="utf-8",
     )
     env_file = project / "docker" / ".env"
-    env_file.write_text("COMPOSE_PROJECT_NAME=snapshot-provider-test\n", encoding="utf-8")
+    env_file.write_text(
+        "COMPOSE_PROJECT_NAME=snapshot-provider-test\n"
+        "RUNNER_SOURCE_ENV=from-source-env\n"
+        f"TOOL_REGISTRY_CONFIG_SRC_PATH={tool_registry}\n",
+        encoding="utf-8",
+    )
     probe = tmp_path / "probe.sh"
     probe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     snapshot = guard.create_compose_snapshot(
@@ -911,13 +925,268 @@ def test_real_compose_provider_resolves_snapshot_include(tmp_path: Path) -> None
         else yaml.safe_load(result.stdout)
     )
     assert "included" in rendered["services"]
-    assert rendered["services"]["relative"]["hostname"] == "source-fixed-hostname"
-    assert (
-        rendered["services"]["relative"]["environment"]["SNAPSHOT_MARKER"]
-        == "from-snapshot"
+    runner = rendered["services"]["runner"]
+    assert runner["hostname"] == "source-fixed-hostname"
+    assert runner["environment"]["RUNNER_SOURCE_ENV"] == "from-source-env"
+    assert runner["environment"]["RUNNER_ENV_FILE"] == "from-runner-env-file"
+    normalized = guard.normalize_snapshot_bind_sources(rendered, snapshot)
+    mounts = {mount["target"]: mount for mount in normalized["services"]["runner"]["volumes"]}
+    assert Path(mounts["/data"]["source"]).resolve() == workflow_data.resolve()
+    assert Path(mounts["/data/tool_registry_config"]["source"]).resolve() == tool_registry.resolve()
+
+
+def test_compose_config_maps_temporary_runner_data_bind_to_project_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    docker_dir = project / "docker"
+    docker_dir.mkdir(parents=True)
+    workflow_data = docker_dir / "workflow_data"
+    workflow_data.mkdir()
+    tool_registry = project / "tool-registry"
+    tool_registry.mkdir()
+    compose = docker_dir / "docker-compose.yaml"
+    compose.write_text(
+        "services:\n"
+        "  runner:\n"
+        "    image: busybox:latest\n"
+        "    volumes:\n"
+        "      - ./workflow_data:/data\n"
+        "      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config\n"
+        "  db:\n"
+        "    image: busybox:latest\n"
+        "    volumes:\n"
+        "      - ${UNSTRACT_HEALTHCHECK_SOURCE}:"
+        "/usr/local/bin/unstract-services.sh:ro\n",
+        encoding="utf-8",
     )
-    rendered_source = Path(rendered["services"]["relative"]["volumes"][0]["source"])
-    assert rendered_source.resolve() == relative_data.resolve()
+    (docker_dir / "compose.train.yaml").write_text("services: {}\n", encoding="utf-8")
+    live_env = docker_dir / ".env"
+    live_env.write_text(
+        "TOOL_REGISTRY_CONFIG_SRC_PATH=" + str(tool_registry) + "\n",
+        encoding="utf-8",
+    )
+    probe = tmp_path / "probe.sh"
+    probe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    temporary_roots: list[Path] = []
+
+    def fake_run(
+        args: list[str], *, env: dict[str, str] | None = None, **_: object
+    ) -> subprocess.CompletedProcess[str]:
+        assert env is not None
+        project_directory = Path(args[args.index("--project-directory") + 1])
+        temporary_roots.append(project_directory.parent)
+        bound_env = Path(args[args.index("--env-file") + 1])
+        assert "TOOL_REGISTRY_CONFIG_SRC_PATH=" + str(tool_registry) in bound_env.read_text(
+            encoding="utf-8"
+        )
+        assert env["VERSION"] == "goal09-test"
+        assert env["UNSTRACT_HEALTHCHECK_SOURCE"] == str(
+            project_directory.parent / "__helper__" / "unstract-services.sh"
+        )
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            json.dumps(
+                {
+                    "services": {
+                        "runner": {
+                            "volumes": [
+                                {
+                                    "type": "bind",
+                                    "source": str(project_directory / "workflow_data"),
+                                    "target": "/data",
+                                },
+                                {
+                                    "type": "bind",
+                                    "source": str(tool_registry),
+                                    "target": "/data/tool_registry_config",
+                                },
+                            ]
+                        },
+                        "db": {
+                            "volumes": [
+                                {
+                                    "type": "bind",
+                                    "source": env["UNSTRACT_HEALTHCHECK_SOURCE"],
+                                    "target": guard.PROBE_MOUNT_TARGET,
+                                    "read_only": True,
+                                }
+                            ]
+                        }
+                    }
+                }
+            ),
+            "",
+        )
+
+    monkeypatch.setattr(guard, "run", fake_run)
+    config = guard.compose_config(
+        project,
+        ("docker/docker-compose.yaml",),
+        candidate_version="goal09-test",
+        probe_source=probe,
+        live_env_file=live_env,
+        probe_source_sha256=guard.sha256_file(probe),
+    )
+
+    mounts = {mount["target"]: mount for mount in config["services"]["runner"]["volumes"]}
+    assert mounts["/data"]["source"] == str(workflow_data.resolve())
+    assert mounts["/data/tool_registry_config"]["source"] == str(tool_registry.resolve())
+    assert temporary_roots
+    probe_mount = config["services"]["db"]["volumes"][0]
+    assert probe_mount["source"] == str(
+        temporary_roots[0] / "__helper__" / "unstract-services.sh"
+    )
+    assert not temporary_roots[0].exists()
+
+
+def test_compose_config_rejects_wrong_snapshot_probe_bind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    docker_dir = project / "docker"
+    docker_dir.mkdir(parents=True)
+    compose = docker_dir / "docker-compose.yaml"
+    compose.write_text(
+        "services:\n"
+        "  db:\n"
+        "    image: busybox:latest\n"
+        "    volumes:\n"
+        "      - ${UNSTRACT_HEALTHCHECK_SOURCE}:"
+        "/usr/local/bin/unstract-services.sh:ro\n",
+        encoding="utf-8",
+    )
+    (docker_dir / "compose.train.yaml").write_text("services: {}\n", encoding="utf-8")
+    live_env = docker_dir / ".env"
+    live_env.write_text("COMPOSE_PROJECT_NAME=test\n", encoding="utf-8")
+    probe = tmp_path / "probe.sh"
+    probe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    def fake_run(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        project_directory = Path(args[args.index("--project-directory") + 1])
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            json.dumps(
+                {
+                    "services": {
+                        "db": {
+                            "volumes": [
+                                {
+                                    "type": "bind",
+                                    "source": str(project_directory / "untracked"),
+                                    "target": guard.PROBE_MOUNT_TARGET,
+                                    "read_only": True,
+                                }
+                            ]
+                        }
+                    }
+                }
+            ),
+            "",
+        )
+
+    monkeypatch.setattr(guard, "run", fake_run)
+    with pytest.raises(
+        guard.GuardError, match="trusted probe mount does not use the frozen probe source"
+    ):
+        guard.compose_config(
+            project,
+            ("docker/docker-compose.yaml",),
+            candidate_version="goal09-test",
+            probe_source=probe,
+            live_env_file=live_env,
+            probe_source_sha256=guard.sha256_file(probe),
+        )
+
+
+def test_compose_config_rejects_unrecognized_snapshot_bind_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    docker_dir = project / "docker"
+    docker_dir.mkdir(parents=True)
+    (docker_dir / "workflow_data").mkdir()
+    compose = docker_dir / "docker-compose.yaml"
+    compose.write_text(
+        "services:\n  runner:\n    image: busybox:latest\n    volumes:\n      - ./workflow_data:/data\n",
+        encoding="utf-8",
+    )
+    (docker_dir / "compose.train.yaml").write_text("services: {}\n", encoding="utf-8")
+    live_env = docker_dir / ".env"
+    live_env.write_text("COMPOSE_PROJECT_NAME=test\n", encoding="utf-8")
+    probe = tmp_path / "probe.sh"
+    probe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    def fake_run(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        project_directory = Path(args[args.index("--project-directory") + 1])
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            json.dumps(
+                {
+                    "services": {
+                        "runner": {
+                            "volumes": [
+                                {
+                                    "type": "bind",
+                                    "source": str(project_directory / "untracked"),
+                                    "target": "/data",
+                                }
+                            ]
+                        }
+                    }
+                }
+            ),
+            "",
+        )
+
+    monkeypatch.setattr(guard, "run", fake_run)
+    with pytest.raises(guard.GuardError, match="not authorized by its snapshot"):
+        guard.compose_config(
+            project,
+            ("docker/docker-compose.yaml",),
+            candidate_version="goal09-test",
+            probe_source=probe,
+            live_env_file=live_env,
+            probe_source_sha256=guard.sha256_file(probe),
+        )
+
+
+def test_compose_snapshot_reloads_authoritative_bind_source_mapping(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    docker_dir = project / "docker"
+    docker_dir.mkdir(parents=True)
+    workflow_data = docker_dir / "workflow_data"
+    workflow_data.mkdir()
+    compose = docker_dir / "docker-compose.yaml"
+    compose.write_text(
+        "services:\n  runner:\n    image: busybox:latest\n    volumes:\n      - ./workflow_data:/data\n",
+        encoding="utf-8",
+    )
+    probe = tmp_path / "probe.sh"
+    probe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    snapshot = guard.create_compose_snapshot(
+        state_dir=tmp_path / "state",
+        project_dir=project,
+        compose_files=("docker/docker-compose.yaml",),
+        live_env_file=None,
+        probe_source=probe,
+        probe_source_sha256=guard.sha256_file(probe),
+        image_override=None,
+        image_override_sha256=None,
+        environment_override=None,
+        environment_override_sha256=None,
+    )
+
+    loaded = guard.load_compose_snapshot(snapshot.manifest_path)
+    assert loaded.bind_sources == {
+        "docker/workflow_data": str(workflow_data.resolve())
+    }
 
 
 def test_compose_rejects_ignored_live_input_drift(tmp_path: Path) -> None:
