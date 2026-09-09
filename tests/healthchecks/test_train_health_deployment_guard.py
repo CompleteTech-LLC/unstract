@@ -145,14 +145,140 @@ def test_healthcheck_none_is_equivalent_to_no_healthcheck() -> None:
 def test_generated_hostname_is_excluded_but_custom_hostname_is_retained() -> None:
     container_id = "abcdef0123456789"
     generated = guard.env_hashes(
-        ["HOSTNAME=abcdef012345", "APP_MODE=prod"], container_id=container_id
+        ["HOSTNAME=abcdef012345", "APP_MODE=prod"],
+        container_id=container_id,
+        config_hostname="abcdef012345",
     )
     custom = guard.env_hashes(
-        ["HOSTNAME=worker-custom", "APP_MODE=prod"], container_id=container_id
+        ["HOSTNAME=worker-custom", "APP_MODE=prod"],
+        container_id=container_id,
+        config_hostname="abcdef012345",
     )
 
     assert "HOSTNAME" not in generated
     assert "HOSTNAME" in custom
+
+
+def test_hostname_normalization_requires_the_current_container_id() -> None:
+    old_id = "abcdef0123456789"
+    new_id = "fedcba9876543210"
+
+    old = guard.env_hashes(
+        ["HOSTNAME=abcdef012345"],
+        container_id=old_id,
+        config_hostname="abcdef012345",
+    )
+    new = guard.env_hashes(
+        ["HOSTNAME=fedcba987654"],
+        container_id=new_id,
+        config_hostname="fedcba987654",
+    )
+    fixed_old_value = guard.env_hashes(
+        ["HOSTNAME=abcdef012345"],
+        container_id=new_id,
+        config_hostname="fedcba987654",
+    )
+    mismatched_config_hostname = guard.env_hashes(
+        ["HOSTNAME=fedcba987654"],
+        container_id=new_id,
+        config_hostname="source-fixed",
+    )
+
+    assert old == new == {}
+    assert "HOSTNAME" in fixed_old_value
+    assert "HOSTNAME" in mismatched_config_hostname
+
+
+def test_runtime_environment_rejects_duplicate_keys() -> None:
+    with pytest.raises(guard.GuardError, match="duplicate key: APP_MODE"):
+        guard.env_hashes(["APP_MODE=first", "APP_MODE=second"])
+    with pytest.raises(guard.GuardError, match="duplicate key: HOSTNAME"):
+        guard.env_hashes(
+            ["HOSTNAME=abcdef012345", "HOSTNAME=abcdef012345"],
+            container_id="abcdef0123456789",
+            config_hostname="abcdef012345",
+        )
+    with pytest.raises(guard.GuardError, match="duplicate key: APP_MODE"):
+        guard.environment_values(["APP_MODE=first", "APP_MODE=second"])
+    with pytest.raises(guard.GuardError, match="duplicate key: APP_MODE"):
+        guard.compose_environment(["APP_MODE=first", "APP_MODE=second"])
+    with pytest.raises(guard.GuardError, match="non-string or empty key"):
+        guard.compose_environment({1: "first", "1": "second"})
+
+
+@pytest.mark.parametrize("key", ["HOME", "container"])
+def test_runtime_environment_plan_preserves_every_non_hostname_key(key: str) -> None:
+    baseline = {
+        "containers": [
+            {
+                "compose": {"com.docker.compose.service": "runner"},
+                "name": "unstract-runner",
+                "env_hashes": guard.environment_hashes({key: "baseline"}),
+            }
+        ]
+    }
+    runtime_environment = {"runner": {"id": "runner-id", "values": {key: "baseline"}}}
+    candidate_images = {"runner": {"environment": {key: "candidate"}}}
+
+    overrides, reviewed = guard.plan_runtime_environment_override(
+        baseline,
+        runtime_environment,
+        candidate_images,
+        {"services": {"runner": {}}},
+        services=("runner",),
+    )
+
+    assert overrides == {"runner": {key: "baseline"}}
+    assert reviewed == {"runner": {key}}
+
+
+def test_runtime_environment_plan_rejects_hostname_without_both_generated_fields() -> None:
+    container_id = "abcdef0123456789"
+    baseline = {
+        "containers": [
+            {
+                "compose": {"com.docker.compose.service": "runner"},
+                "name": "unstract-runner",
+                "env_hashes": guard.environment_hashes(
+                    {"HOSTNAME": "abcdef012345"},
+                    container_id=container_id,
+                    config_hostname="abcdef012345",
+                ),
+            }
+        ]
+    }
+    runtime_environment = {
+        "runner": {
+            "id": container_id,
+            "hostname": "source-fixed",
+            "values": {"HOSTNAME": "abcdef012345"},
+        }
+    }
+
+    with pytest.raises(guard.GuardError, match="fresh runtime environment changed"):
+        guard.plan_runtime_environment_override(
+            baseline,
+            runtime_environment,
+            {"runner": {"environment": {}}},
+            {"services": {"runner": {}}},
+            services=("runner",),
+        )
+
+
+def test_candidate_environment_keeps_explicit_hostname_override() -> None:
+    config = {"services": {"runner": {"environment": {"HOSTNAME": "source-fixed"}}}}
+
+    values = guard.candidate_environment_values(config, "runner", {})
+
+    assert values == {"HOSTNAME": "source-fixed"}
+
+    fixed_hostname = guard.candidate_environment_values(
+        {"services": {"runner": {"hostname": "fixed-source-hostname"}}},
+        "runner",
+        {},
+    )
+
+    assert fixed_hostname == {"HOSTNAME": "fixed-source-hostname"}
 
 
 def test_generated_network_alias_is_excluded_but_explicit_alias_is_retained() -> None:
@@ -735,6 +861,7 @@ def test_real_compose_provider_resolves_snapshot_include(tmp_path: Path) -> None
         "services:\n"
         "  relative:\n"
         "    image: busybox:latest\n"
+        "    hostname: source-fixed-hostname\n"
         "    env_file:\n"
         "      - ./relative.env\n"
         "    volumes:\n"
@@ -784,6 +911,7 @@ def test_real_compose_provider_resolves_snapshot_include(tmp_path: Path) -> None
         else yaml.safe_load(result.stdout)
     )
     assert "included" in rendered["services"]
+    assert rendered["services"]["relative"]["hostname"] == "source-fixed-hostname"
     assert (
         rendered["services"]["relative"]["environment"]["SNAPSHOT_MARKER"]
         == "from-snapshot"

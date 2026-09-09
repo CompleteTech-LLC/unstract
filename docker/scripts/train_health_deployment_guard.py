@@ -113,7 +113,6 @@ COMPOSE_SNAPSHOT_MANIFEST_FILENAME = "compose-snapshot-manifest.json"
 COMPOSE_SNAPSHOT_DIR_PREFIX = "compose-snapshot-"
 COMPOSE_SNAPSHOT_PROBE_RELATIVE = Path("__helper__/unstract-services.sh")
 COMPOSE_SNAPSHOT_PRIVATE_RELATIVE = Path("__private__")
-RUNTIME_GENERATED_ENV_KEYS = frozenset({"HOME", "container"})
 DURATION_TOKEN = re.compile(
     r"(?P<number>(?:\d+(?:\.\d*)?|\.\d+))(?P<unit>ns|us|µs|ms|h|m|s)"
 )
@@ -998,17 +997,36 @@ def image_digest(image: dict[str, Any]) -> str | None:
 
 
 def env_hashes(
-    values: list[str] | None, *, container_id: str | None = None
+    values: list[str] | None,
+    *,
+    container_id: str | None = None,
+    config_hostname: Any = None,
 ) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
+    seen: set[str] = set()
     for item in values or []:
+        if not isinstance(item, str):
+            raise GuardError("runtime environment contains a non-string entry")
         key, separator, value = item.partition("=")
         if not separator:
             value = ""
-        # Podman injects HOSTNAME from the container ID. Recreated containers
-        # therefore receive a new value even when the application environment
-        # is unchanged. Keep an explicit custom HOSTNAME in the contract.
-        if key == "HOSTNAME" and container_id and value == container_id[:12]:
+        if not key:
+            raise GuardError("runtime environment contains an empty key")
+        if key in seen:
+            raise GuardError(f"runtime environment contains a duplicate key: {key}")
+        seen.add(key)
+        # Podman injects HOSTNAME from the container ID only when both inspect
+        # fields have the current ID prefix.  Recreated containers then receive
+        # a new value even when the application environment is unchanged.  An
+        # authored image/Compose environment or fixed hostname remains part of
+        # the contract, including a HOSTNAME value that merely resembles an ID.
+        if (
+            key == "HOSTNAME"
+            and isinstance(container_id, str)
+            and len(container_id) >= 12
+            and value == container_id[:12]
+            and config_hostname == container_id[:12]
+        ):
             continue
         result[key] = {"length": len(value), "sha256": sha256_bytes(value.encode())}
     return dict(sorted(result.items()))
@@ -1019,17 +1037,26 @@ def environment_values(values: list[str] | None) -> dict[str, str]:
     result: dict[str, str] = {}
     for item in values or []:
         if not isinstance(item, str):
-            continue
+            raise GuardError("runtime environment contains a non-string entry")
         key, separator, value = item.partition("=")
+        if not key:
+            raise GuardError("runtime environment contains an empty key")
+        if key in result:
+            raise GuardError(f"runtime environment contains a duplicate key: {key}")
         result[key] = value if separator else ""
     return result
 
 
 def environment_hashes(
-    values: dict[str, str], *, container_id: str | None = None
+    values: dict[str, str],
+    *,
+    container_id: str | None = None,
+    config_hostname: Any = None,
 ) -> dict[str, dict[str, Any]]:
     return env_hashes(
-        [f"{key}={value}" for key, value in values.items()], container_id=container_id
+        [f"{key}={value}" for key, value in values.items()],
+        container_id=container_id,
+        config_hostname=config_hostname,
     )
 
 
@@ -1256,7 +1283,11 @@ def inspect_project(
                     "configured": health_config(config.get("Healthcheck")),
                     "runtime": health_runtime(state.get("Health")),
                 },
-                "env_hashes": env_hashes(config.get("Env"), container_id=item.get("Id")),
+                "env_hashes": env_hashes(
+                    config.get("Env"),
+                    container_id=item.get("Id"),
+                    config_hostname=config.get("Hostname"),
+                ),
                 "mounts": [normalize_mount(mount) for mount in item.get("Mounts") or []],
                 "options": runtime_options(item, config),
                 "graphdriver": {
@@ -1300,6 +1331,7 @@ def inspect_runtime_environment(
             raise GuardError(f"duplicate Compose service environment: {service}")
         result[service] = {
             "id": item.get("Id"),
+            "hostname": config.get("Hostname"),
             "values": environment_values(config.get("Env")),
         }
     return result
@@ -2037,10 +2069,21 @@ def compose_environment(value: Any) -> dict[str, Any]:
             if not isinstance(item, str):
                 raise GuardError("Compose environment contains a non-string entry")
             key, separator, item_value = item.partition("=")
+            if not key:
+                raise GuardError("Compose environment contains an empty key")
+            if key in result:
+                raise GuardError(f"Compose environment contains a duplicate key: {key}")
             result[key] = item_value if separator else None
         return result
     if isinstance(value, dict):
-        return {str(key): item for key, item in value.items()}
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not key:
+                raise GuardError("Compose environment contains a non-string or empty key")
+            if key in result:
+                raise GuardError(f"Compose environment contains a duplicate key: {key}")
+            result[key] = item
+        return result
     raise GuardError("Compose environment is not a mapping")
 
 
@@ -2050,17 +2093,19 @@ def candidate_environment_values(
     """Merge candidate image defaults with the effective Compose service env."""
     service_config = (config.get("services") or {}).get(service) or {}
     values = dict(image_values)
-    for key, value in compose_environment(service_config.get("environment")).items():
+    compose_values = compose_environment(service_config.get("environment"))
+    for key, value in compose_values.items():
         if value is None:
             raise GuardError(f"candidate environment inherits host value for {service}: {key}")
         values[str(key)] = str(value)
     # Docker/Podman exposes an explicit Compose hostname through HOSTNAME.
-    # When no hostname is authored, the runtime-generated container ID is
-    # normalized out of the baseline and is deliberately omitted here.
+    # When neither `hostname:` nor an image/Compose HOSTNAME is authored, the
+    # runtime-generated container ID is normalized out of the baseline and is
+    # deliberately omitted here.
     hostname = service_config.get("hostname")
     if hostname is not None:
         values["HOSTNAME"] = str(hostname)
-    elif "HOSTNAME" not in image_values:
+    elif "HOSTNAME" not in image_values and "HOSTNAME" not in compose_values:
         values.pop("HOSTNAME", None)
     return values
 
@@ -2341,22 +2386,18 @@ def plan_runtime_environment_override(
             raise GuardError(f"runtime environment plan is incomplete for {service}")
         observed_id = observed.get("id")
         observed_values = observed.get("values") or {}
-        observed_hashes = environment_hashes(observed_values, container_id=observed_id)
+        observed_hashes = environment_hashes(
+            observed_values,
+            container_id=observed_id,
+            config_hostname=observed.get("hostname"),
+        )
         if observed_hashes != (previous.get("env_hashes") or {}):
             raise GuardError(f"fresh runtime environment changed for {service}")
         candidate_values = candidate_environment_values(
             config, service, candidate.get("environment") or {}
         )
-        baseline_hashes = {
-            key: value
-            for key, value in (previous.get("env_hashes") or {}).items()
-            if key not in RUNTIME_GENERATED_ENV_KEYS
-        }
-        candidate_hashes = {
-            key: value
-            for key, value in environment_hashes(candidate_values).items()
-            if key not in RUNTIME_GENERATED_ENV_KEYS
-        }
+        baseline_hashes = previous.get("env_hashes") or {}
+        candidate_hashes = environment_hashes(candidate_values)
         service_overrides: dict[str, str] = {}
         for key, expected_hash in baseline_hashes.items():
             if candidate_hashes.get(key) == expected_hash:
@@ -2372,11 +2413,7 @@ def plan_runtime_environment_override(
             raise GuardError(f"candidate added environment for {service}: {key}")
         effective_values = dict(candidate_values)
         effective_values.update(service_overrides)
-        effective_hashes = {
-            key: value
-            for key, value in environment_hashes(effective_values).items()
-            if key not in RUNTIME_GENERATED_ENV_KEYS
-        }
+        effective_hashes = environment_hashes(effective_values)
         if any(effective_hashes.get(key) != value for key, value in baseline_hashes.items()):
             raise GuardError(f"candidate environment cannot preserve {service}")
         overrides[service] = service_overrides
