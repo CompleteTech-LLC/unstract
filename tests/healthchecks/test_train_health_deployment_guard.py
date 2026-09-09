@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import subprocess
 from copy import deepcopy
 from pathlib import Path
@@ -344,6 +345,12 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
     guard.write_runtime_environment_override(
         {"runner": {"APP_MODE": "test"}}, environment_override
     )
+    live_env = tmp_path / "docker" / ".env"
+    live_env.parent.mkdir()
+    live_env.write_text(
+        "TOOL_REGISTRY_CONFIG_SRC_PATH=/srv/tool-registry\nCOMPOSE_PROJECT_NAME=test\n",
+        encoding="utf-8",
+    )
     calls: list[tuple[list[str], dict[str, str] | None]] = []
 
     def fake_run(
@@ -355,6 +362,10 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
     ) -> subprocess.CompletedProcess[str]:
         calls.append((args, env))
         if "config" in args:
+            env_file = Path(args[args.index("--env-file") + 1])
+            assert "TOOL_REGISTRY_CONFIG_SRC_PATH=/srv/tool-registry" in env_file.read_text(
+                encoding="utf-8"
+            )
             return subprocess.CompletedProcess(args, 0, json.dumps({"services": {}}), "")
         return subprocess.CompletedProcess(args, 0, "", "")
 
@@ -364,6 +375,7 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
         ("compose.yaml",),
         candidate_version="goal09-test",
         probe_source=probe,
+        live_env_file=live_env,
         image_override=image_override,
         image_override_sha256=guard.sha256_file(image_override),
         environment_override=environment_override,
@@ -378,6 +390,7 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
         ("runner",),
         candidate_version="goal09-test",
         probe_source=probe,
+        live_env_file=live_env,
         image_override=image_override,
         image_override_sha256=guard.sha256_file(image_override),
         environment_override=environment_override,
@@ -390,12 +403,33 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
     assert len(calls) == 2
     config_args, config_env = calls[0]
     assert config_args[:3] == ["docker", "compose", "--env-file"]
-    assert str(settings) in config_args
+    assert str(live_env) in config_args
+    assert str(settings) not in config_args
     assert str(image_override) in config_args
     assert str(environment_override) in config_args
     assert config_env and config_env["VERSION"] == "goal09-test"
     assert config_env["UNSTRACT_HEALTHCHECK_SOURCE"] == str(probe)
     assert calls[1][0][-1] == "runner"
+
+    monkeypatch.setattr(guard, "verify_candidate_source_state", lambda *_: None)
+    guard.compose_start(
+        tmp_path,
+        ("compose.yaml",),
+        candidate_version="goal09-test",
+        probe_source=probe,
+        live_env_file=live_env,
+        expected_source=None,
+        candidate_source=tmp_path,
+        candidate_lock=lock,
+        image_override=image_override,
+        image_override_sha256=guard.sha256_file(image_override),
+        environment_override=environment_override,
+        environment_override_sha256=guard.sha256_file(environment_override),
+        settings_file=settings,
+        settings_file_sha256=guard.sha256_file(settings),
+        probe_source_sha256=probe_sha256,
+    )
+    assert calls[2][0][-5:] == ["up", "-d", "--no-build", "--pull", "never"]
 
     settings.write_text(settings.read_text(encoding="utf-8").replace("goal09-test", "tampered"), encoding="utf-8")
     with pytest.raises(guard.GuardError, match="Compose settings changed"):
@@ -405,10 +439,102 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
             ("runner",),
             candidate_version="goal09-test",
             probe_source=probe,
+            live_env_file=live_env,
             settings_file=settings,
             settings_file_sha256=settings_sha256,
             probe_source_sha256=probe_sha256,
         )
+
+
+def test_compose_rejects_ignored_live_input_drift(tmp_path: Path) -> None:
+    project_dir = tmp_path
+    (project_dir / "docker").mkdir()
+    train_compose = project_dir / guard.LIVE_COMPOSE_TRAIN
+    live_env = project_dir / guard.LIVE_ENV_RELATIVE
+    train_compose.write_text("services: {}\n", encoding="utf-8")
+    live_env.write_text("TOOL_REGISTRY_CONFIG_SRC_PATH=/srv/tool-registry\n", encoding="utf-8")
+    expected = {"live_inputs": guard.live_compose_inputs(project_dir, live_env_file=live_env)}
+    live_env.write_text("TOOL_REGISTRY_CONFIG_SRC_PATH=/changed\n", encoding="utf-8")
+    probe = tmp_path / "probe.sh"
+    probe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    with pytest.raises(guard.GuardError, match="ignored live Compose input drifted"):
+        guard.compose_config(
+            project_dir,
+            ("compose.yaml",),
+            candidate_version="goal09-test",
+            probe_source=probe,
+            live_env_file=live_env,
+            expected_source=expected,
+            probe_source_sha256=guard.sha256_file(probe),
+        )
+
+
+def test_compose_rechecks_candidate_artifacts_before_each_config(tmp_path: Path) -> None:
+    source = tmp_path / "candidate"
+    source.mkdir()
+    source_root = GUARD_PATH.parents[2]
+    for relative in (
+        "docker/healthchecks/unstract-services.sh",
+        "docker/healthchecks/http-readiness.sh",
+        "docker/healthchecks/postgres-readiness.sh",
+        "docker/docker-compose-dev-essentials.yaml",
+        "docker/compose.train.healthchecks.yaml",
+        "docker/compose.train.worker-healthchecks.yaml",
+    ):
+        destination = source / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_root / relative, destination)
+    subprocess.run(["git", "init", "-q"], cwd=source, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=source, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=source, check=True)
+    subprocess.run(["git", "add", "."], cwd=source, check=True)
+    subprocess.run(["git", "commit", "-qm", "candidate"], cwd=source, check=True)
+    lock = {
+        "source_commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=source, text=True
+        ).strip(),
+        "source_tree": subprocess.check_output(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=source, text=True
+        ).strip(),
+        "artifacts": guard.artifact_hashes(source),
+    }
+    probe = source / "docker/healthchecks/unstract-services.sh"
+
+    real_run = guard.run
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if args and args[0] == "git":
+            return real_run(args, **kwargs)
+        return subprocess.CompletedProcess(args, 0, json.dumps({"services": {}}), "")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(guard, "run", fake_run)
+    try:
+        guard.compose_config(
+            tmp_path,
+            ("compose.yaml",),
+            candidate_version="goal09-test",
+            probe_source=probe,
+            candidate_source=source,
+            candidate_lock=lock,
+            probe_source_sha256=guard.sha256_file(probe),
+        )
+        (source / "docker/compose.train.healthchecks.yaml").write_text(
+            "services: {}\n", encoding="utf-8"
+        )
+        with pytest.raises(guard.GuardError, match="candidate source must be clean"):
+            guard.compose_config(
+                tmp_path,
+                ("compose.yaml",),
+                candidate_version="goal09-test",
+                probe_source=probe,
+                candidate_source=source,
+                candidate_lock=lock,
+                probe_source_sha256=guard.sha256_file(probe),
+            )
+    finally:
+        monkeypatch.undo()
 
 
 def test_core_probe_checks_require_read_only_probe_mount() -> None:

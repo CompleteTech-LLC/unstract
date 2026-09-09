@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Guarded, targeted deployment helper for the Train Unstract health checks.
 
-The default operation is read-only.  ``capture`` records a sanitized runtime
-snapshot and ``preflight`` refuses to continue when the dirty live checkout,
-container identity, mounts, networks, or environment hashes drift.  The
-mutating ``apply`` and ``rollback`` phases require an explicit confirmation
-token and an external candidate image lock.  They recreate only the 24
-health-covered workloads in two bounded batches; they never build, pull,
-delete source files, reset the checkout, or run project-wide Compose commands.
+``capture`` records a sanitized runtime snapshot. ``preflight`` refuses to
+continue when the dirty live checkout, ignored Compose inputs, container
+identity, mounts, networks, or environment hashes drift, and refreshes the
+private durable replay files beside the candidate lock. The mutating ``start``,
+``apply``, and ``rollback`` phases require explicit confirmation tokens and an
+external candidate image lock. ``start`` is the authoritative whole-project
+startup path; ``apply`` and ``rollback`` recreate only the 24 health-covered
+workloads in two bounded batches. They never build, pull, delete source files,
+reset the checkout, or run project-wide destructive Compose commands.
 
 The script deliberately keeps secret values out of all output.  Environment
 values are represented by length and SHA-256 digest only, and health log
@@ -100,6 +102,9 @@ CANDIDATE_IMAGE_SCHEMA = "unstract-health-candidate-image/v1"
 CANDIDATE_IMAGE_FILENAME = "candidate-image.override.yaml"
 COMPOSE_SETTINGS_SCHEMA = "unstract-health-compose-settings/v1"
 COMPOSE_SETTINGS_FILENAME = "compose-settings.env"
+START_CONFIRM_TOKEN = "START_UNSTRACT_HEALTH"
+LIVE_COMPOSE_TRAIN = "docker/compose.train.yaml"
+LIVE_ENV_RELATIVE = "docker/.env"
 RUNTIME_GENERATED_ENV_KEYS = frozenset({"HOME", "container"})
 DURATION_TOKEN = re.compile(
     r"(?P<number>(?:\d+(?:\.\d*)?|\.\d+))(?P<unit>ns|us|µs|ms|h|m|s)"
@@ -646,8 +651,48 @@ def inspect_runtime_environment(
     return result
 
 
+def source_file_fingerprint(path: Path) -> dict[str, Any]:
+    """Hash one ignored Compose input without retaining its contents."""
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return {"missing": True}
+    except OSError as exc:
+        raise GuardError(f"cannot stat live Compose input {path}: {exc}") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        target = os.readlink(path)
+        resolved = path.resolve()
+        target_metadata = resolved.lstat()
+        if not stat.S_ISREG(target_metadata.st_mode):
+            raise GuardError(f"live Compose input does not resolve to a regular file: {path}")
+        return {
+            "symlink": target,
+            "target_bytes": target_metadata.st_size,
+            "target_sha256": sha256_file(resolved),
+        }
+    if not stat.S_ISREG(metadata.st_mode):
+        return {"special": True, "mode": stat.S_IFMT(metadata.st_mode)}
+    return {"bytes": metadata.st_size, "sha256": sha256_file(path)}
+
+
+def live_compose_inputs(
+    project_dir: Path, *, live_env_file: Path | None = None
+) -> dict[str, dict[str, Any]]:
+    env_path = live_env_file or (project_dir / LIVE_ENV_RELATIVE)
+    return {
+        LIVE_COMPOSE_TRAIN: source_file_fingerprint(project_dir / LIVE_COMPOSE_TRAIN),
+        "live_env_file": {
+            "path": str(env_path.resolve()),
+            **source_file_fingerprint(env_path),
+        },
+    }
+
+
 def source_state(
-    project_dir: Path, *, deadline: OperationDeadline | None = None
+    project_dir: Path,
+    *,
+    live_env_file: Path | None = None,
+    deadline: OperationDeadline | None = None,
 ) -> dict[str, Any]:
     head = run(
         ["git", "-C", str(project_dir), "rev-parse", "HEAD"], deadline=deadline
@@ -698,6 +743,7 @@ def source_state(
         "status_paths": paths,
         "status_hashes": status_hashes,
         "tracked_dirty_or_untracked_count": len(paths),
+        "live_inputs": live_compose_inputs(project_dir, live_env_file=live_env_file),
     }
 
 
@@ -930,7 +976,10 @@ def runtime_context(*, deadline: OperationDeadline | None = None) -> dict[str, A
 
 
 def capture(
-    project_dir: Path, *, deadline: OperationDeadline | None = None
+    project_dir: Path,
+    *,
+    live_env_file: Path | None = None,
+    deadline: OperationDeadline | None = None,
 ) -> dict[str, Any]:
     uid = os.getuid() if hasattr(os, "getuid") else None
     return {
@@ -942,7 +991,9 @@ def capture(
             "rootless_project": PROJECT,
         },
         "runtime_context": runtime_context(deadline=deadline),
-        "source": source_state(project_dir, deadline=deadline),
+        "source": source_state(
+            project_dir, live_env_file=live_env_file, deadline=deadline
+        ),
         "job_quiescence": settled_queue_snapshot(deadline),
         "containers": inspect_project(deadline=deadline),
     }
@@ -1114,6 +1165,10 @@ def load_baseline(path: Path) -> dict[str, Any]:
         raise GuardError("baseline has an unsupported schema; capture a fresh baseline")
     if baseline.get("source", {}).get("schema") != SOURCE_STATE_SCHEMA:
         raise GuardError("baseline source state is incomplete; capture a fresh baseline")
+    if not isinstance(baseline.get("source", {}).get("live_inputs"), dict):
+        raise GuardError(
+            "baseline live Compose input hashes are missing; capture a fresh baseline"
+        )
     if not isinstance(baseline.get("containers"), list):
         raise GuardError("baseline container snapshot is missing")
     if not isinstance(baseline.get("runtime_context"), dict):
@@ -1207,6 +1262,10 @@ def compose_config(
     *,
     candidate_version: str,
     probe_source: Path,
+    live_env_file: Path | None = None,
+    expected_source: dict[str, Any] | None = None,
+    candidate_source: Path | None = None,
+    candidate_lock: dict[str, Any] | None = None,
     image_override: Path | None = None,
     image_override_sha256: str | None = None,
     environment_override: Path | None = None,
@@ -1216,6 +1275,12 @@ def compose_config(
     probe_source_sha256: str | None = None,
     deadline: OperationDeadline | None = None,
 ) -> dict[str, Any]:
+    verify_candidate_source_state(candidate_source, candidate_lock)
+    verify_live_compose_inputs(
+        project_dir,
+        live_env_file=live_env_file,
+        expected_source=expected_source,
+    )
     env = os.environ.copy()
     if settings_file:
         settings = validate_compose_settings(
@@ -1246,8 +1311,8 @@ def compose_config(
         )
         files += (str(environment_override),)
     args = ["docker", "compose"]
-    if settings_file:
-        args.extend(["--env-file", str(settings_file)])
+    if live_env_file:
+        args.extend(["--env-file", str(live_env_file)])
     for compose_file in files:
         args.extend(["-f", compose_file])
     args.extend(["config", "--format", "json"])
@@ -1747,6 +1812,36 @@ def verify_artifacts(root: Path, lock: dict[str, Any]) -> None:
             raise GuardError(f"candidate artifact hash mismatch: {name}")
 
 
+def verify_candidate_source_state(
+    candidate_source: Path | None, lock: dict[str, Any] | None
+) -> None:
+    if candidate_source is None or lock is None:
+        return
+    require_clean_candidate_source(
+        candidate_source, lock["source_commit"], lock.get("source_tree")
+    )
+    verify_artifacts(candidate_source, lock)
+
+
+def verify_live_compose_inputs(
+    project_dir: Path,
+    *,
+    live_env_file: Path | None,
+    expected_source: dict[str, Any] | None,
+) -> None:
+    """Recheck ignored live inputs before each Compose invocation."""
+    actual = live_compose_inputs(project_dir, live_env_file=live_env_file)
+    if expected_source is None:
+        return
+    expected = expected_source.get("live_inputs")
+    if not isinstance(expected, dict):
+        raise GuardError(
+            "baseline source state lacks live Compose input hashes; capture a fresh baseline"
+        )
+    if expected != actual:
+        raise GuardError("ignored live Compose input drifted since baseline capture")
+
+
 @contextlib.contextmanager
 def advisory_lock(
     *,
@@ -1835,19 +1930,24 @@ def capture_and_write(
     project_dir: Path,
     output: Path,
     *,
+    live_env_file: Path | None = None,
     operation_deadline: OperationDeadline | None = None,
 ) -> dict[str, Any]:
-    snapshot = capture(project_dir, deadline=operation_deadline)
+    snapshot = capture(
+        project_dir,
+        live_env_file=live_env_file,
+        deadline=operation_deadline,
+    )
     write_json(output, snapshot)
     return snapshot
 
 
 def compose_args(
-    compose_files: tuple[str, ...], *, settings_file: Path | None = None
+    compose_files: tuple[str, ...], *, live_env_file: Path | None = None
 ) -> list[str]:
     args = ["docker", "compose"]
-    if settings_file:
-        args.extend(["--env-file", str(settings_file)])
+    if live_env_file:
+        args.extend(["--env-file", str(live_env_file)])
     for compose_file in compose_files:
         args.extend(["-f", compose_file])
     return args
@@ -1993,6 +2093,41 @@ def write_runtime_environment_override(
     )
 
 
+def reviewed_environment_keys_from_override(path: Path) -> dict[str, set[str]]:
+    """Recover reviewed key names from durable YAML without reading values aloud."""
+    validate_private_override(path)
+    result: dict[str, set[str]] = {}
+    current_service: str | None = None
+    in_environment = False
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise GuardError(f"cannot read runtime environment override: {path}") from exc
+    for line in lines:
+        if line.startswith("  ") and not line.startswith("    ") and line.endswith(":"):
+            current_service = line[2:-1]
+            in_environment = False
+            continue
+        if current_service and line == "    environment:":
+            in_environment = True
+            result.setdefault(current_service, set())
+            continue
+        if current_service and in_environment and line.startswith("      "):
+            key_text, separator, _ = line[6:].partition(":")
+            if not separator:
+                raise GuardError(f"runtime environment override has invalid YAML: {path}")
+            try:
+                key = json.loads(key_text.strip())
+            except json.JSONDecodeError as exc:
+                raise GuardError(
+                    f"runtime environment override has an invalid key: {path}"
+                ) from exc
+            if not isinstance(key, str):
+                raise GuardError(f"runtime environment override key is not a string: {path}")
+            result[current_service].add(key)
+    return result
+
+
 def validate_private_file(
     path: Path,
     *,
@@ -2047,6 +2182,10 @@ def targeted_up(
     *,
     candidate_version: str,
     probe_source: Path,
+    live_env_file: Path | None = None,
+    expected_source: dict[str, Any] | None = None,
+    candidate_source: Path | None = None,
+    candidate_lock: dict[str, Any] | None = None,
     image_override: Path | None = None,
     image_override_sha256: str | None = None,
     environment_override: Path | None = None,
@@ -2056,6 +2195,12 @@ def targeted_up(
     probe_source_sha256: str | None = None,
     deadline: OperationDeadline | None = None,
 ) -> None:
+    verify_candidate_source_state(candidate_source, candidate_lock)
+    verify_live_compose_inputs(
+        project_dir,
+        live_env_file=live_env_file,
+        expected_source=expected_source,
+    )
     env = os.environ.copy()
     if settings_file:
         settings = validate_compose_settings(
@@ -2082,7 +2227,7 @@ def targeted_up(
             environment_override, expected_sha256=environment_override_sha256
         )
         files += (str(environment_override),)
-    args = compose_args(files, settings_file=settings_file)
+    args = compose_args(files, live_env_file=live_env_file)
     args.extend(
         [
             "up",
@@ -2095,6 +2240,54 @@ def targeted_up(
             *services,
         ]
     )
+    run(args, cwd=project_dir, env=env, deadline=deadline)
+
+
+def compose_start(
+    project_dir: Path,
+    compose_files: tuple[str, ...],
+    *,
+    candidate_version: str,
+    probe_source: Path,
+    live_env_file: Path,
+    expected_source: dict[str, Any] | None,
+    candidate_source: Path,
+    candidate_lock: dict[str, Any],
+    image_override: Path,
+    image_override_sha256: str,
+    environment_override: Path,
+    environment_override_sha256: str,
+    settings_file: Path,
+    settings_file_sha256: str,
+    probe_source_sha256: str,
+    deadline: OperationDeadline | None = None,
+) -> None:
+    """Start the whole stack through the durable guarded Compose inputs."""
+    verify_candidate_source_state(candidate_source, candidate_lock)
+    verify_live_compose_inputs(
+        project_dir,
+        live_env_file=live_env_file,
+        expected_source=expected_source,
+    )
+    env = os.environ.copy()
+    settings = validate_compose_settings(
+        settings_file,
+        candidate_version=candidate_version,
+        probe_source=probe_source,
+        probe_source_sha256=probe_source_sha256,
+        expected_sha256=settings_file_sha256,
+    )
+    env["VERSION"] = settings["VERSION"]
+    env["UNSTRACT_HEALTHCHECK_SOURCE"] = settings["UNSTRACT_HEALTHCHECK_SOURCE"]
+    validate_candidate_image_override(
+        image_override, expected_sha256=image_override_sha256
+    )
+    validate_private_override(
+        environment_override, expected_sha256=environment_override_sha256
+    )
+    files = compose_files + (str(image_override), str(environment_override))
+    args = compose_args(files, live_env_file=live_env_file)
+    args.extend(["up", "-d", "--no-build", "--pull", "never"])
     run(args, cwd=project_dir, env=env, deadline=deadline)
 
 
@@ -2305,10 +2498,20 @@ def rollback_override(
 
 def command_capture(args: argparse.Namespace) -> int:
     deadline = OperationDeadline(args.operation_timeout)
+    project_dir = Path(args.project_dir)
+    live_env_file = resolve_live_env_file(args, project_dir)
     capture_and_write(
-        Path(args.project_dir), Path(args.output), operation_deadline=deadline
+        project_dir,
+        Path(args.output),
+        live_env_file=live_env_file,
+        operation_deadline=deadline,
     )
     return 0
+
+
+def resolve_live_env_file(args: argparse.Namespace, project_dir: Path) -> Path:
+    configured = getattr(args, "live_env_file", None)
+    return Path(configured).resolve() if configured else (project_dir / LIVE_ENV_RELATIVE).resolve()
 
 
 def prepare(
@@ -2329,6 +2532,9 @@ def prepare(
         Path(args.candidate_source), lock["source_commit"], lock.get("source_tree")
     )
     verify_artifacts(Path(args.candidate_source), lock)
+    project_dir = Path(args.project_dir)
+    candidate_source = Path(args.candidate_source)
+    live_env_file = resolve_live_env_file(args, project_dir)
     probe_source = Path(args.probe_source)
     probe_source_sha256 = (lock.get("artifacts") or {}).get(
         "docker/healthchecks/unstract-services.sh"
@@ -2355,7 +2561,11 @@ def prepare(
     candidate_images = candidate_image_snapshot(lock, deadline=operation_deadline)
     if not candidate_images:
         raise GuardError("no candidate images were verified")
-    current = capture(Path(args.project_dir), deadline=operation_deadline)
+    current = capture(
+        project_dir,
+        live_env_file=live_env_file,
+        deadline=operation_deadline,
+    )
     compare_baseline_current(baseline, current, allow_new_probe=False)
     compare_untargeted_runtime(baseline, current)
     compare_source_and_quiescence(baseline, current)
@@ -2363,10 +2573,14 @@ def prepare(
         deadline=operation_deadline
     )
     config = compose_config(
-        Path(args.project_dir),
+        project_dir,
         tuple(args.compose_file or DEFAULT_COMPOSE_FILES),
         candidate_version=lock["candidate_version"],
         probe_source=probe_source,
+        live_env_file=live_env_file,
+        expected_source=baseline["source"],
+        candidate_source=candidate_source,
+        candidate_lock=lock,
         image_override=image_override,
         image_override_sha256=image_override_sha256,
         settings_file=settings_file,
@@ -2387,10 +2601,14 @@ def prepare(
     )
     validate_private_override(runtime_environment_override)
     config = compose_config(
-        Path(args.project_dir),
+        project_dir,
         tuple(args.compose_file or DEFAULT_COMPOSE_FILES),
         candidate_version=lock["candidate_version"],
         probe_source=probe_source,
+        live_env_file=live_env_file,
+        expected_source=baseline["source"],
+        candidate_source=candidate_source,
+        candidate_lock=lock,
         settings_file=settings_file,
         settings_file_sha256=settings_file_sha256,
         probe_source_sha256=probe_source_sha256,
@@ -2400,10 +2618,14 @@ def prepare(
         deadline=operation_deadline,
     )
     authored_baseline = compose_config(
-        Path(args.project_dir),
+        project_dir,
         tuple(args.compose_file or DEFAULT_COMPOSE_FILES),
         candidate_version=lock["candidate_version"],
         probe_source=probe_source,
+        live_env_file=live_env_file,
+        expected_source=baseline["source"],
+        candidate_source=candidate_source,
+        candidate_lock=lock,
         settings_file=settings_file,
         settings_file_sha256=settings_file_sha256,
         probe_source_sha256=probe_source_sha256,
@@ -2565,7 +2787,13 @@ def compensating_rollback(
     services = tuple((replacement_manifest.get("services") or {}).keys())
     if not services:
         raise GuardError("no exact replacement IDs were recorded for compensating rollback")
-    current = capture(Path(args.project_dir), deadline=operation_deadline)
+    project_dir = Path(args.project_dir)
+    live_env_file = resolve_live_env_file(args, project_dir)
+    current = capture(
+        project_dir,
+        live_env_file=live_env_file,
+        deadline=operation_deadline,
+    )
     compare_source_and_quiescence(baseline, current)
     verify_replacement_ids(current, replacement_manifest)
     override = backup_dir / "compensating-rollback.override.yaml"
@@ -2578,21 +2806,31 @@ def compensating_rollback(
         # Recheck identity and quiescence after acquiring the DB lock.  The
         # process may be disconnected when db itself is recreated; the local
         # operation lock remains held for that bounded transaction.
-        locked = capture(Path(args.project_dir), deadline=operation_deadline)
+        locked = capture(
+            project_dir,
+            live_env_file=live_env_file,
+            deadline=operation_deadline,
+        )
         compare_source_and_quiescence(baseline, locked)
         verify_replacement_ids(locked, replacement_manifest)
         targeted_up(
-            Path(args.project_dir),
+            project_dir,
             rollback_files,
             services,
             candidate_version="rollback-unused",
             probe_source=Path(args.probe_source),
+            live_env_file=live_env_file,
+            expected_source=baseline["source"],
             environment_override=runtime_environment_override,
             environment_override_sha256=runtime_environment_sha256,
             deadline=operation_deadline,
         )
         wait_running(services, operation_deadline=operation_deadline)
-    final = capture(Path(args.project_dir), deadline=operation_deadline)
+    final = capture(
+        project_dir,
+        live_env_file=live_env_file,
+        deadline=operation_deadline,
+    )
     verify_rollback_result(
         baseline,
         final,
@@ -2624,11 +2862,18 @@ def apply_batch(
     operation_deadline: OperationDeadline,
 ) -> dict[str, Any]:
     compose_files = tuple(args.compose_file or DEFAULT_COMPOSE_FILES)
+    project_dir = Path(args.project_dir)
+    candidate_source = Path(args.candidate_source)
+    live_env_file = resolve_live_env_file(args, project_dir)
     validate_private_override(
         runtime_environment_override, expected_sha256=runtime_environment_sha256
     )
     with advisory_lock(deadline=operation_deadline):
-        fresh = capture(Path(args.project_dir), deadline=operation_deadline)
+        fresh = capture(
+            project_dir,
+            live_env_file=live_env_file,
+            deadline=operation_deadline,
+        )
         compare_untargeted_runtime(baseline, fresh)
         compare_source_and_quiescence(baseline, fresh)
         verify_untouched_targets(baseline, fresh, untouched_services)
@@ -2636,10 +2881,14 @@ def apply_batch(
             compare_post_apply(baseline, fresh, lock, applied_services)
         candidate_image_snapshot(lock, deadline=operation_deadline)
         config = compose_config(
-            Path(args.project_dir),
+            project_dir,
             compose_files,
             candidate_version=lock["candidate_version"],
             probe_source=Path(args.probe_source),
+            live_env_file=live_env_file,
+            expected_source=baseline["source"],
+            candidate_source=candidate_source,
+            candidate_lock=lock,
             image_override=image_override,
             image_override_sha256=image_override_sha256,
             environment_override=runtime_environment_override,
@@ -2650,10 +2899,14 @@ def apply_batch(
             deadline=operation_deadline,
         )
         authored_baseline = compose_config(
-            Path(args.project_dir),
+            project_dir,
             compose_files,
             candidate_version=lock["candidate_version"],
             probe_source=Path(args.probe_source),
+            live_env_file=live_env_file,
+            expected_source=baseline["source"],
+            candidate_source=candidate_source,
+            candidate_lock=lock,
             settings_file=settings_file,
             settings_file_sha256=settings_file_sha256,
             probe_source_sha256=probe_source_sha256,
@@ -2672,11 +2925,15 @@ def apply_batch(
         if not final_quiescence.get("stability", {}).get("stable"):
             raise GuardError("queue was not settled immediately before targeted recreation")
         targeted_up(
-            Path(args.project_dir),
+            project_dir,
             compose_files,
             services,
             candidate_version=lock["candidate_version"],
             probe_source=Path(args.probe_source),
+            live_env_file=live_env_file,
+            expected_source=baseline["source"],
+            candidate_source=candidate_source,
+            candidate_lock=lock,
             image_override=image_override,
             image_override_sha256=image_override_sha256,
             environment_override=runtime_environment_override,
@@ -2686,11 +2943,19 @@ def apply_batch(
             probe_source_sha256=probe_source_sha256,
             deadline=operation_deadline,
         )
-        observed = capture(Path(args.project_dir), deadline=operation_deadline)
+        observed = capture(
+            project_dir,
+            live_env_file=live_env_file,
+            deadline=operation_deadline,
+        )
         replacements = record_replacements(baseline, observed, lock, services)
         write_replacement_manifest(backup_dir, replacements, name=f"replacements-{services[0]}.json")
         wait_healthy(services, operation_deadline=operation_deadline)
-        final = capture(Path(args.project_dir), deadline=operation_deadline)
+        final = capture(
+            project_dir,
+            live_env_file=live_env_file,
+            deadline=operation_deadline,
+        )
         compare_post_apply(baseline, final, lock, services)
         compare_untargeted_runtime(baseline, final)
         compare_source_and_quiescence(baseline, final)
@@ -2718,8 +2983,117 @@ def command_preflight(args: argparse.Namespace) -> int:
     print(
         "preflight: candidate source, image lock, Compose identity, runtime, "
         "data, network, environment, queue, and active-job state verified; "
-        f"durable_artifacts={state_dir}"
+        f"durable replay state refreshed at {state_dir}"
     )
+    return 0
+
+
+def command_start(args: argparse.Namespace) -> int:
+    """Replay the durable state through the normal whole-project startup path."""
+    if args.confirm != START_CONFIRM_TOKEN:
+        raise GuardError(f"start requires --confirm {START_CONFIRM_TOKEN}")
+    operation_deadline = OperationDeadline(args.operation_timeout)
+    project_dir = Path(args.project_dir)
+    live_env_file = resolve_live_env_file(args, project_dir)
+    state_dir = Path(args.state_dir).resolve()
+    image_override = state_dir / CANDIDATE_IMAGE_FILENAME
+    settings_file = state_dir / COMPOSE_SETTINGS_FILENAME
+    runtime_environment_override = state_dir / RUNTIME_ENVIRONMENT_FILENAME
+    baseline = load_baseline(Path(args.baseline))
+    lock = load_lock(Path(args.candidate_lock))
+    candidate_source = Path(args.candidate_source)
+    probe_source = Path(args.probe_source)
+    require_clean_candidate_source(
+        candidate_source, lock["source_commit"], lock.get("source_tree")
+    )
+    verify_artifacts(candidate_source, lock)
+    probe_source_sha256 = (lock.get("artifacts") or {}).get(
+        "docker/healthchecks/unstract-services.sh"
+    )
+    if not isinstance(probe_source_sha256, str):
+        raise GuardError("candidate lock lacks the guarded probe source digest")
+    validate_probe_source(probe_source, expected_sha256=probe_source_sha256)
+    validate_candidate_image_override(image_override)
+    validate_private_override(runtime_environment_override)
+    settings = validate_compose_settings(
+        settings_file,
+        candidate_version=lock["candidate_version"],
+        probe_source=probe_source,
+        probe_source_sha256=probe_source_sha256,
+    )
+    image_override_sha256 = sha256_file(image_override)
+    settings_file_sha256 = sha256_file(settings_file)
+    runtime_environment_sha256 = sha256_file(runtime_environment_override)
+    candidate_images = candidate_image_snapshot(lock, deadline=operation_deadline)
+    if not candidate_images:
+        raise GuardError("no candidate images were verified")
+    compose_files = tuple(args.compose_file or DEFAULT_COMPOSE_FILES)
+    config = compose_config(
+        project_dir,
+        compose_files,
+        candidate_version=lock["candidate_version"],
+        probe_source=probe_source,
+        live_env_file=live_env_file,
+        expected_source=baseline["source"],
+        candidate_source=candidate_source,
+        candidate_lock=lock,
+        image_override=image_override,
+        image_override_sha256=image_override_sha256,
+        environment_override=runtime_environment_override,
+        environment_override_sha256=runtime_environment_sha256,
+        settings_file=settings_file,
+        settings_file_sha256=settings_file_sha256,
+        probe_source_sha256=probe_source_sha256,
+        deadline=operation_deadline,
+    )
+    authored_baseline = compose_config(
+        project_dir,
+        compose_files,
+        candidate_version=lock["candidate_version"],
+        probe_source=probe_source,
+        live_env_file=live_env_file,
+        expected_source=baseline["source"],
+        candidate_source=candidate_source,
+        candidate_lock=lock,
+        settings_file=settings_file,
+        settings_file_sha256=settings_file_sha256,
+        probe_source_sha256=probe_source_sha256,
+        deadline=operation_deadline,
+    )
+    reviewed_keys = reviewed_environment_keys_from_override(runtime_environment_override)
+    check_candidate_config(
+        config,
+        baseline,
+        lock,
+        authored_baseline,
+        reviewed_environment_keys=reviewed_keys,
+    )
+    compose_start(
+        project_dir,
+        compose_files,
+        candidate_version=settings["VERSION"],
+        probe_source=probe_source,
+        live_env_file=live_env_file,
+        expected_source=baseline["source"],
+        candidate_source=candidate_source,
+        candidate_lock=lock,
+        image_override=image_override,
+        image_override_sha256=image_override_sha256,
+        environment_override=runtime_environment_override,
+        environment_override_sha256=runtime_environment_sha256,
+        settings_file=settings_file,
+        settings_file_sha256=settings_file_sha256,
+        probe_source_sha256=probe_source_sha256,
+        deadline=operation_deadline,
+    )
+    wait_running(TARGET_SERVICES, operation_deadline=operation_deadline)
+    post = capture(
+        project_dir,
+        live_env_file=live_env_file,
+        deadline=operation_deadline,
+    )
+    write_json(state_dir / "post-start.json", post)
+    print(f"start: verified durable Compose replay; state={state_dir}")
     return 0
 
 
@@ -2728,6 +3102,8 @@ def command_apply(args: argparse.Namespace) -> int:
         raise GuardError(f"apply requires --confirm {CONFIRM_TOKEN}")
     operation_deadline = OperationDeadline(args.operation_timeout)
     backup_dir = Path(args.backup_dir).resolve()
+    project_dir = Path(args.project_dir)
+    live_env_file = resolve_live_env_file(args, project_dir)
     attempted: list[str] = []
     applied: list[str] = []
     backup_images: dict[str, Any] | None = None
@@ -2767,7 +3143,11 @@ def command_apply(args: argparse.Namespace) -> int:
             if not isinstance(probe_source_sha256, str):
                 raise GuardError("candidate lock lacks the guarded probe source digest")
             with advisory_lock(deadline=operation_deadline):
-                fresh = capture(Path(args.project_dir), deadline=operation_deadline)
+                fresh = capture(
+                    project_dir,
+                    live_env_file=live_env_file,
+                    deadline=operation_deadline,
+                )
                 compare_baseline_current(baseline, fresh, allow_new_probe=False)
                 compare_untargeted_runtime(baseline, fresh)
                 compare_source_and_quiescence(baseline, fresh)
@@ -2838,7 +3218,11 @@ def command_apply(args: argparse.Namespace) -> int:
             )
             applied.extend(CORE_SERVICES)
             write_replacement_manifest(backup_dir, replacement_manifest)
-            final = capture(Path(args.project_dir), deadline=operation_deadline)
+            final = capture(
+                project_dir,
+                live_env_file=live_env_file,
+                deadline=operation_deadline,
+            )
             compare_post_apply(baseline, final, lock, TARGET_SERVICES)
             compare_untargeted_runtime(baseline, final)
             compare_source_and_quiescence(baseline, final)
@@ -2855,7 +3239,9 @@ def command_apply(args: argparse.Namespace) -> int:
             if backup_images is not None and attempted:
                 try:
                     failed_state = capture(
-                        Path(args.project_dir), deadline=operation_deadline
+                        project_dir,
+                        live_env_file=live_env_file,
+                        deadline=operation_deadline,
                     )
                     write_json(backup_dir / "failed-state.json", failed_state)
                     discovered = record_replacements(
@@ -2961,6 +3347,11 @@ def command_rollback(args: argparse.Namespace) -> int:
 def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project-dir", default=str(DEFAULT_PROJECT_DIR))
     parser.add_argument("--compose-file", action="append", default=None)
+    parser.add_argument(
+        "--live-env-file",
+        default=None,
+        help="the existing private Compose .env; its values are read but never printed or copied",
+    )
     parser.add_argument("--baseline", required=True)
     parser.add_argument("--candidate-source", required=True)
     parser.add_argument("--candidate-lock", required=True)
@@ -2985,14 +3376,25 @@ def parser() -> argparse.ArgumentParser:
     lock_parser.add_argument("--output", required=True)
     capture_parser = sub.add_parser("capture", help="read-only sanitized runtime snapshot")
     capture_parser.add_argument("--project-dir", default=str(DEFAULT_PROJECT_DIR))
+    capture_parser.add_argument("--live-env-file", default=None)
     capture_parser.add_argument("--output", required=True)
     capture_parser.add_argument(
         "--operation-timeout",
         type=float,
         default=DEFAULT_COMMAND_TIMEOUT_SECONDS,
     )
-    preflight_parser = sub.add_parser("preflight", help="read-only candidate and drift checks")
+    preflight_parser = sub.add_parser(
+        "preflight",
+        help="candidate and drift checks; refreshes private durable replay state",
+    )
     add_common(preflight_parser)
+    start_parser = sub.add_parser(
+        "start",
+        help="guarded whole-project startup using durable candidate/settings/environment state",
+    )
+    add_common(start_parser)
+    start_parser.add_argument("--state-dir", required=True)
+    start_parser.add_argument("--confirm", required=True)
     apply_parser = sub.add_parser("apply", help="explicit targeted recreation")
     add_common(apply_parser)
     apply_parser.add_argument("--backup-dir", required=True)
@@ -3000,6 +3402,7 @@ def parser() -> argparse.ArgumentParser:
     rollback_parser = sub.add_parser("rollback", help="explicit targeted compensating rollback")
     rollback_parser.add_argument("--project-dir", default=str(DEFAULT_PROJECT_DIR))
     rollback_parser.add_argument("--rollback-compose-file", action="append", default=None)
+    rollback_parser.add_argument("--live-env-file", default=None)
     rollback_parser.add_argument("--probe-source", required=True)
     rollback_parser.add_argument("--backup-dir", required=True)
     rollback_parser.add_argument("--confirm", required=True)
@@ -3020,6 +3423,8 @@ def main() -> int:
             return command_lock(args)
         if args.command == "preflight":
             return command_preflight(args)
+        if args.command == "start":
+            return command_start(args)
         if args.command == "apply":
             return command_apply(args)
         if args.command == "rollback":
