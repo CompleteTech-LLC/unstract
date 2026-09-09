@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -10,12 +11,31 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
+import yaml
 
 GUARD_PATH = Path(__file__).parents[2] / "docker/scripts/train_health_deployment_guard.py"
 SPEC = importlib.util.spec_from_file_location("train_health_deployment_guard", GUARD_PATH)
 assert SPEC and SPEC.loader
 guard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(guard)
+
+
+def _real_compose_provider() -> list[str]:
+    """Return a locally installed Docker/Podman Compose provider for config-only tests."""
+    configured = os.environ.get("UNSTRACT_COMPOSE_PROVIDER")
+    if configured:
+        provider = shlex.split(configured)
+        if provider and shutil.which(provider[0]):
+            return provider
+        pytest.fail("UNSTRACT_COMPOSE_PROVIDER is not executable")
+    for provider in (
+        ("docker", "compose"),
+        ("podman", "compose"),
+        ("docker-compose",),
+    ):
+        if shutil.which(provider[0]):
+            return list(provider)
+    pytest.skip("Docker or Podman Compose provider is unavailable")
 
 
 def candidate_fixture() -> tuple[dict, dict, dict, dict]:
@@ -546,7 +566,7 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
     assert len(calls) == 2
     config_args, config_env = calls[0]
     assert config_args[:3] == ["docker", "compose", "--project-directory"]
-    assert str(tmp_path.resolve()) in config_args
+    assert str(snapshot.root) in config_args
     assert str(live_env) not in config_args
     assert str(settings) not in config_args
     assert str(image_override) not in config_args
@@ -605,6 +625,7 @@ def test_compose_snapshot_probe_is_visible_to_a_separate_process(tmp_path: Path)
     probe = tmp_path / "source" / "unstract-services.sh"
     probe.parent.mkdir()
     probe.write_text("#!/bin/sh\nprintf immutable-probe\n", encoding="utf-8")
+    os.chmod(probe, 0o755)
     snapshot = guard.create_compose_snapshot(
         state_dir=tmp_path / "state",
         project_dir=project,
@@ -631,6 +652,14 @@ def test_compose_snapshot_probe_is_visible_to_a_separate_process(tmp_path: Path)
         text=True,
     )
     assert child.stdout == "#!/bin/sh\nprintf immutable-probe\n\n"
+    executed = subprocess.run(
+        [str(snapshot.probe_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert executed.stdout == "immutable-probe"
+    assert snapshot.probe_path.stat().st_mode & 0o777 == 0o555
     assert (snapshot.root / "docker" / "docker-compose-dev-essentials.yaml").is_file()
     assert guard.load_compose_snapshot(snapshot.manifest_path).probe_path == snapshot.probe_path
 
@@ -658,7 +687,6 @@ def test_compose_snapshot_rejects_tampered_retained_input(tmp_path: Path) -> Non
         guard.load_compose_snapshot(snapshot.manifest_path)
 
 
-@pytest.mark.skipif(shutil.which("docker") is None, reason="Docker Compose provider is unavailable")
 def test_real_compose_provider_resolves_snapshot_include(tmp_path: Path) -> None:
     project = tmp_path / "project"
     (project / "docker").mkdir(parents=True)
@@ -668,6 +696,23 @@ def test_real_compose_provider_resolves_snapshot_include(tmp_path: Path) -> None
     )
     (project / "docker" / "docker-compose-dev-essentials.yaml").write_text(
         "services:\n  included:\n    image: busybox:latest\n", encoding="utf-8"
+    )
+    relative_env = project / "docker" / "relative.env"
+    relative_env.write_text("SNAPSHOT_MARKER=from-snapshot\n", encoding="utf-8")
+    relative_data = project / "docker" / "relative-data"
+    relative_data.mkdir()
+    (relative_data / "marker").write_text("runtime-data\n", encoding="utf-8")
+    (project / "docker" / "docker-compose.yaml").write_text(
+        "include:\n"
+        "  - docker-compose-dev-essentials.yaml\n"
+        "services:\n"
+        "  relative:\n"
+        "    image: busybox:latest\n"
+        "    env_file:\n"
+        "      - ./relative.env\n"
+        "    volumes:\n"
+        "      - ./relative-data:/data:ro\n",
+        encoding="utf-8",
     )
     env_file = project / "docker" / ".env"
     env_file.write_text("COMPOSE_PROJECT_NAME=snapshot-provider-test\n", encoding="utf-8")
@@ -685,27 +730,36 @@ def test_real_compose_provider_resolves_snapshot_include(tmp_path: Path) -> None
         environment_override=None,
         environment_override_sha256=None,
     )
+    provider = _real_compose_provider()
     result = subprocess.run(
         [
-            "docker",
-            "compose",
+            *provider,
             "--project-directory",
-            str(project),
+            str(snapshot.root),
             "--env-file",
             str(snapshot.path_for(str(env_file))),
             "-f",
             snapshot.path_for("docker/docker-compose.yaml"),
             "config",
-            "--format",
-            "json",
+            *( ["--format", "json"] if provider[0] == "docker" else []),
         ],
         check=False,
         capture_output=True,
         text=True,
     )
     assert result.returncode == 0, result.stderr
-    rendered = json.loads(result.stdout)
+    rendered = (
+        json.loads(result.stdout)
+        if provider[0] == "docker"
+        else yaml.safe_load(result.stdout)
+    )
     assert "included" in rendered["services"]
+    assert (
+        rendered["services"]["relative"]["environment"]["SNAPSHOT_MARKER"]
+        == "from-snapshot"
+    )
+    rendered_source = Path(rendered["services"]["relative"]["volumes"][0]["source"])
+    assert rendered_source.resolve() == relative_data.resolve()
 
 
 def test_compose_rejects_ignored_live_input_drift(tmp_path: Path) -> None:

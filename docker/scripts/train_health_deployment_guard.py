@@ -498,8 +498,15 @@ def _write_snapshot_file(
     data: bytes,
     *,
     private: bool,
+    executable: bool = False,
 ) -> str:
-    """Write a snapshot file and return its content digest."""
+    """Write a snapshot file and return its content digest.
+
+    Snapshot inputs are immutable after materialization, but executable
+    helpers still need their execute bits when Compose runs them in a
+    container.  Preserve only execute bits from the reviewed source while
+    stripping every write bit.
+    """
     destination = root / relative
     try:
         destination.relative_to(root)
@@ -507,6 +514,8 @@ def _write_snapshot_file(
         raise GuardError(f"snapshot path escapes its root: {relative}") from exc
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
     mode = 0o400 if private else 0o444
+    if executable and not private:
+        mode |= 0o111
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -605,7 +614,14 @@ def materialize_compose_snapshot(
         actual = sha256_bytes(data)
         if expected_sha256 is not None and actual != expected_sha256:
             raise GuardError(f"{description} changed: {source}")
-        digest = _write_snapshot_file(destination, relative, data, private=private)
+        source_mode = resolved.stat().st_mode
+        digest = _write_snapshot_file(
+            destination,
+            relative,
+            data,
+            private=private,
+            executable=bool(source_mode & 0o111),
+        )
         copied.add(resolved)
         entries[str(relative)] = {
             "sha256": digest,
@@ -774,6 +790,8 @@ def load_compose_snapshot(path: Path) -> ComposeSnapshot:
         metadata = path.lstat()
         if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o222:
             raise GuardError(f"Compose snapshot manifest is writable or not regular: {path}")
+        if hasattr(os, "getuid") and os.getuid() == 0 and metadata.st_uid != 0:
+            raise GuardError(f"Compose snapshot manifest is not root-owned: {path}")
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except GuardError:
         raise
@@ -906,7 +924,7 @@ def bound_compose_inputs(
     environment_override: Path | None,
     environment_override_sha256: str | None,
     snapshot: ComposeSnapshot | None = None,
-) -> Iterator[tuple[dict[str, str], tuple[int, ...]]]:
+) -> Iterator[tuple[dict[str, str], tuple[int, ...], ComposeSnapshot]]:
     """Bind every Compose input to a daemon-visible immutable snapshot path."""
     with _compose_snapshot_context(
         project_dir=project_dir,
@@ -935,7 +953,7 @@ def bound_compose_inputs(
                 + ", ".join(missing)
             )
         replacements = {argument: active.path_for(argument) for argument in required}
-        yield replacements, ()
+        yield replacements, (), active
 
 
 def parse_json_output(result: subprocess.CompletedProcess[str], description: str) -> Any:
@@ -1927,8 +1945,6 @@ def compose_config(
             environment_override, expected_sha256=environment_override_sha256
         )
         files += (str(environment_override),)
-    args = compose_args(project_dir, files, live_env_file=live_env_file)
-    args.extend(["config", "--format", "json"])
     with bound_compose_inputs(
         project_dir=project_dir,
         compose_files=files,
@@ -1940,7 +1956,14 @@ def compose_config(
         environment_override=environment_override,
         environment_override_sha256=environment_override_sha256,
         snapshot=snapshot,
-    ) as (bound_paths, pass_fds):
+    ) as (bound_paths, pass_fds, active_snapshot):
+        args = compose_args(
+            project_dir,
+            files,
+            live_env_file=live_env_file,
+            snapshot=active_snapshot,
+        )
+        args.extend(["config", "--format", "json"])
         bound_args = [bound_paths.get(argument, argument) for argument in args]
         final_settings = verify_compose_inputs_before_run(
             project_dir=project_dir,
@@ -1967,7 +1990,7 @@ def compose_config(
         )
         result = run(
             bound_args,
-            cwd=project_dir,
+            cwd=active_snapshot.root,
             env=env,
             deadline=deadline,
             pass_fds=pass_fds,
@@ -2803,8 +2826,15 @@ def compose_args(
     compose_files: tuple[str, ...],
     *,
     live_env_file: Path | None = None,
+    snapshot: ComposeSnapshot | None = None,
 ) -> list[str]:
-    args = ["docker", "compose", "--project-directory", str(project_dir.resolve())]
+    # Compose resolves includes, relative env files, and relative bind sources
+    # from this explicit project directory.  Once inputs are frozen, all of
+    # those paths must resolve inside the retained snapshot tree; pointing the
+    # provider at the live checkout would re-open mutable files after the
+    # guard's final verification.
+    effective_project_dir = snapshot.root if snapshot is not None else project_dir.resolve()
+    args = ["docker", "compose", "--project-directory", str(effective_project_dir)]
     if live_env_file:
         args.extend(["--env-file", str(live_env_file)])
     for compose_file in compose_files:
@@ -3087,19 +3117,6 @@ def targeted_up(
             environment_override, expected_sha256=environment_override_sha256
         )
         files += (str(environment_override),)
-    args = compose_args(project_dir, files, live_env_file=live_env_file)
-    args.extend(
-        [
-            "up",
-            "-d",
-            "--no-deps",
-            "--force-recreate",
-            "--no-build",
-            "--pull",
-            "never",
-            *services,
-        ]
-    )
     with bound_compose_inputs(
         project_dir=project_dir,
         compose_files=files,
@@ -3111,7 +3128,25 @@ def targeted_up(
         environment_override=environment_override,
         environment_override_sha256=environment_override_sha256,
         snapshot=snapshot,
-    ) as (bound_paths, pass_fds):
+    ) as (bound_paths, pass_fds, active_snapshot):
+        args = compose_args(
+            project_dir,
+            files,
+            live_env_file=live_env_file,
+            snapshot=active_snapshot,
+        )
+        args.extend(
+            [
+                "up",
+                "-d",
+                "--no-deps",
+                "--force-recreate",
+                "--no-build",
+                "--pull",
+                "never",
+                *services,
+            ]
+        )
         bound_args = [bound_paths.get(argument, argument) for argument in args]
         final_settings = verify_compose_inputs_before_run(
             project_dir=project_dir,
@@ -3138,7 +3173,7 @@ def targeted_up(
         )
         run(
             bound_args,
-            cwd=project_dir,
+            cwd=active_snapshot.root,
             env=env,
             deadline=deadline,
             pass_fds=pass_fds,
@@ -3189,8 +3224,6 @@ def compose_start(
         environment_override, expected_sha256=environment_override_sha256
     )
     files = compose_files + (str(image_override), str(environment_override))
-    args = compose_args(project_dir, files, live_env_file=live_env_file)
-    args.extend(["up", "-d", "--no-build", "--pull", "never"])
     with bound_compose_inputs(
         project_dir=project_dir,
         compose_files=files,
@@ -3202,7 +3235,14 @@ def compose_start(
         environment_override=environment_override,
         environment_override_sha256=environment_override_sha256,
         snapshot=snapshot,
-    ) as (bound_paths, pass_fds):
+    ) as (bound_paths, pass_fds, active_snapshot):
+        args = compose_args(
+            project_dir,
+            files,
+            live_env_file=live_env_file,
+            snapshot=active_snapshot,
+        )
+        args.extend(["up", "-d", "--no-build", "--pull", "never"])
         bound_args = [bound_paths.get(argument, argument) for argument in args]
         final_settings = verify_compose_inputs_before_run(
             project_dir=project_dir,
@@ -3229,7 +3269,7 @@ def compose_start(
         )
         run(
             bound_args,
-            cwd=project_dir,
+            cwd=active_snapshot.root,
             env=env,
             deadline=deadline,
             pass_fds=pass_fds,
