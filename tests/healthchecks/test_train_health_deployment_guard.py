@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import http.server
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 import yaml
@@ -691,7 +695,7 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
         snapshot=snapshot,
     )
 
-    assert len(calls) == 2
+    assert len(calls) == 3
     config_args, config_env = calls[0]
     assert config_args[:3] == ["docker", "compose", "--project-directory"]
     assert str(snapshot.root) in config_args
@@ -702,7 +706,8 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
     assert sum(argument == "-f" for argument in config_args) == 3
     assert config_env and config_env["VERSION"] == "goal09-test"
     assert config_env["UNSTRACT_HEALTHCHECK_SOURCE"] == str(snapshot.probe_path)
-    assert calls[1][0][-1] == "runner"
+    assert calls[1][0][-3:] == ["config", "--format", "json"]
+    assert calls[2][0][-1] == "runner"
 
     monkeypatch.setattr(guard, "verify_candidate_source_state", lambda *_: None)
     guard.compose_start(
@@ -723,7 +728,8 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
         probe_source_sha256=probe_sha256,
         snapshot=snapshot,
     )
-    assert calls[2][0][-5:] == ["up", "-d", "--no-build", "--pull", "never"]
+    assert calls[3][0][-3:] == ["config", "--format", "json"]
+    assert calls[4][0][-5:] == ["up", "-d", "--no-build", "--pull", "never"]
 
     settings.write_text(settings.read_text(encoding="utf-8").replace("goal09-test", "tampered"), encoding="utf-8")
     with pytest.raises(guard.GuardError, match="Compose settings changed"):
@@ -937,6 +943,298 @@ def test_real_compose_provider_preserves_snapshot_runner_paths_and_env(
     assert Path(mounts["/data/tool_registry_config"]["source"]).resolve() == tool_registry.resolve()
 
 
+@contextlib.contextmanager
+def _recording_docker_api():
+    """Record real Compose create requests without connecting to any daemon."""
+    created: dict[str, dict] = {}
+    creation_lock = threading.Lock()
+    started: set[str] = set()
+    unexpected: list[tuple[str, str]] = []
+    image_id = "sha256:" + "1" * 64
+
+    class Engine(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_args):
+            pass
+
+        def do_HEAD(self):
+            self.respond()
+
+        def do_GET(self):
+            self.respond()
+
+        def do_POST(self):
+            self.respond()
+
+        def do_DELETE(self):
+            self.respond()
+
+        def respond(self):
+            url = urlsplit(self.path)
+            path = re.sub(r"^/v[0-9.]+", "", url.path)
+            query = parse_qs(url.query)
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length)) if length else None
+            code, headers = 200, {}
+            if path == "/_ping":
+                payload = b"OK"
+                headers = {"API-Version": "1.47", "OSType": "linux"}
+            elif path == "/version":
+                payload = {"ApiVersion": "1.47", "Version": "27.0.0", "Os": "linux", "Arch": "amd64"}
+            elif path.startswith("/images/") and path.endswith("/json"):
+                payload = {
+                    "Id": image_id,
+                    "Architecture": "amd64",
+                    "Os": "linux",
+                    "Config": {"Env": ["IMAGE_FIXTURE=present"], "Labels": {}},
+                    "RootFS": {"Type": "layers", "Layers": []},
+                    "Size": 1,
+                }
+            elif path == "/containers/json":
+                filters = json.loads(query.get("filters", ["{}"])[0])
+                payload = []
+                for identifier, record in created.copy().items():
+                    labels = record["request"]["Labels"]
+                    if any(
+                        (labels.get(key) != value if separator else key not in labels)
+                        for key, separator, value in (
+                            expression.partition("=")
+                            for expression in filters.get("label", [])
+                        )
+                    ):
+                        continue
+                    payload.append({
+                        "Id": identifier,
+                        "Names": ["/" + record["name"]],
+                        "Image": record["request"]["Image"],
+                        "ImageID": image_id,
+                        "State": "running" if identifier in started else "created",
+                        "Labels": labels,
+                        "HostConfig": {"NetworkMode": "none"},
+                        "NetworkSettings": {"Networks": {}},
+                        "Mounts": [],
+                    })
+            elif path == "/containers/create" and self.command == "POST":
+                with creation_lock:
+                    identifier = f"{len(created) + 1:064x}"
+                    created[identifier] = {"name": query["name"][0], "request": body}
+                code, payload = 201, {"Id": identifier, "Warnings": []}
+            elif path.startswith("/containers/") and path.endswith("/json"):
+                identifier = path.split("/")[2]
+                request = created[identifier]["request"]
+                payload = {
+                    "Id": identifier,
+                    "Name": "/" + created[identifier]["name"],
+                    "Image": image_id,
+                    "Config": {key: value for key, value in request.items() if key not in ("HostConfig", "NetworkingConfig")},
+                    "HostConfig": request.get("HostConfig", {}),
+                    "State": {"Status": "running" if identifier in started else "created", "Running": identifier in started, "ExitCode": 0},
+                    "Mounts": [],
+                    "NetworkSettings": {"Networks": {}},
+                }
+            elif path.startswith("/containers/") and path.endswith("/start"):
+                started.add(path.split("/")[2])
+                code, payload = 204, None
+            else:
+                unexpected.append((self.command, path))
+                code, payload = 404, {"message": "unexpected isolated fixture endpoint"}
+            raw = payload if isinstance(payload, bytes) else json.dumps(payload).encode() if payload is not None else b""
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.end_headers()
+            if self.command != "HEAD" and raw:
+                self.wfile.write(raw)
+
+    class RecordingServer(http.server.ThreadingHTTPServer):
+        # Compose may open requests for every target together even when its
+        # dependency traversal is serial. Keep the local fixture backlog large
+        # enough for all 24 without dropping a creation request.
+        request_queue_size = 128
+
+    server = RecordingServer(("127.0.0.1", 0), Engine)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"tcp://127.0.0.1:{server.server_port}", created, unexpected
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("action", ["targeted_up", "compose_start"])
+def test_real_compose_creation_uses_stable_sources_for_all_24_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    provider = _real_compose_provider()
+    project = tmp_path / "project-$literal"
+    docker = project / "docker"
+    data = docker / "workflow_data"
+    data.mkdir(parents=True)
+    registry = project / "tool-registry"
+    registry.mkdir()
+    socket = docker / "runtime.sock"
+    socket.touch()
+    bind_files = {
+        "db": ("./scripts/db-setup/db_setup.sh", "/docker-entrypoint-initdb.d/db_setup.sh"),
+        "reverse-proxy": ("./proxy_overrides.yaml", "/proxy_overrides.yaml"),
+    }
+    for relative, _ in bind_files.values():
+        path = docker / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("fixture bind file\n")
+    runner_env = project / "runner" / ".env"
+    runner_env.parent.mkdir()
+    runner_env.write_text("ENV_FILE_VALUE=from-frozen-env-file\n")
+
+    def service_lines(service: str) -> list[str]:
+        result = [
+            f"  {service}:",
+            f"    image: fixture/{service}:original",
+            "    network_mode: none",
+            "    command: [sleep, '600']",
+            "    env_file:",
+            "      - ../runner/.env",
+            "    environment:",
+            "      DOTENV_VALUE: ${SOURCE_VALUE}",
+            "      PRIVATE_VALUE: source-value",
+            "    volumes:",
+            "      - ./workflow_data:/data:rw",
+            "      - ./workflow_data:/literal-$$target:ro",
+            "      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config:ro",
+            "      - ${SOCKET_SOURCE}:/var/run/docker.sock:ro",
+        ]
+        if service in bind_files:
+            relative, target = bind_files[service]
+            result.append(f"      - {relative}:{target}:ro")
+        return result
+
+    main = ["include:", "  - docker-compose-dev-essentials.yaml", "services:"]
+    included = ["services:"]
+    for service in guard.TARGET_SERVICES:
+        (included if service in guard.CORE_SERVICES else main).extend(service_lines(service))
+    (docker / "docker-compose.yaml").write_text("\n".join(main) + "\n")
+    (docker / "docker-compose-dev-essentials.yaml").write_text("\n".join(included) + "\n")
+    (docker / "compose.train.yaml").write_text("services: {}\n")
+    shutil.copy2(GUARD_PATH.parents[1] / "compose.train.healthchecks.yaml", docker / "health.yaml")
+    env_file = docker / ".env"
+    env_file.write_text(
+        "COMPOSE_PROJECT_NAME=stable-bind-fixture\n"
+        "SOURCE_VALUE=from-frozen-dotenv\n"
+        "TOOL_REGISTRY_CONFIG_SRC_PATH=${PWD}/../tool-registry\n"
+        "SOCKET_SOURCE=${PWD}/runtime.sock\n"
+    )
+    probe = tmp_path / "probe.sh"
+    probe.write_text("#!/bin/sh\nexit 0\n")
+    probe.chmod(0o755)
+    lock = {"images": {service: {"reference": f"fixture/{service}:locked"} for service in guard.TARGET_SERVICES}}
+    image_override = guard.candidate_image_override(lock, tmp_path / guard.CANDIDATE_IMAGE_FILENAME)
+    private_value = "opaque-$value ${literal} # fixture\nsecond line"
+    environment_override = tmp_path / guard.RUNTIME_ENVIRONMENT_FILENAME
+    guard.write_runtime_environment_override(
+        {service: {"PRIVATE_VALUE": private_value} for service in guard.TARGET_SERVICES},
+        environment_override,
+    )
+    settings = tmp_path / guard.COMPOSE_SETTINGS_FILENAME
+    guard.write_compose_settings("fixture", probe, settings, probe_source_sha256=guard.sha256_file(probe))
+    docker_config = tmp_path / "docker-config"
+    docker_config.mkdir()
+    snapshots: set[Path] = set()
+    launch_paths: list[Path] = []
+    with _recording_docker_api() as (endpoint, created, unexpected):
+        def provider_run(args: list[str], *, cwd: Path, env: dict[str, str], **kwargs) -> subprocess.CompletedProcess[str]:
+            assert args[:2] == ["docker", "compose"]
+            assert (cwd / "docker" / "workflow_data").is_symlink()
+            snapshots.add(cwd)
+            frozen_env = Path(args[args.index("--env-file") + 1])
+            assert frozen_env.is_relative_to(cwd)
+            assert frozen_env.read_bytes() == env_file.read_bytes()
+            if "up" in args:
+                override = next(
+                    (Path(value) for value in args if value.endswith("bind-sources.override.json")),
+                    None,
+                )
+                if override is not None:
+                    assert override.stat().st_mode & 0o777 == 0o400
+                    assert override.parent.stat().st_mode & 0o777 == 0o500
+                    assert all(set(value) == {"volumes"} for value in json.loads(override.read_text())["services"].values())
+                    launch_paths.append(override)
+            # The actual provider can reach only the isolated recording API.
+            # Its environment contains no ambient Docker context or secrets.
+            isolated_env = {
+                "PATH": os.defpath,
+                "DOCKER_HOST": endpoint,
+                "DOCKER_API_VERSION": "1.47",
+                "DOCKER_CONFIG": str(docker_config),
+                "COMPOSE_PARALLEL_LIMIT": "1",
+                "COMPOSE_ANSI": "never",
+                "COMPOSE_PROGRESS": "plain",
+                "PWD": str(docker),
+                "VERSION": env["VERSION"],
+                "UNSTRACT_HEALTHCHECK_SOURCE": env["UNSTRACT_HEALTHCHECK_SOURCE"],
+            }
+            result = subprocess.run([*provider, "--parallel", "1", *args[2:]], cwd=cwd, env=isolated_env, text=True, capture_output=True, timeout=45)
+            assert result.returncode == 0, result.stderr
+            return result
+
+        monkeypatch.setattr(guard, "run", provider_run)
+        monkeypatch.setattr(guard, "verify_candidate_source_state", lambda *_: None)
+        common = dict(
+            candidate_version="fixture",
+            probe_source=probe,
+            probe_source_sha256=guard.sha256_file(probe),
+            live_env_file=env_file,
+            image_override=image_override,
+            image_override_sha256=guard.sha256_file(image_override),
+            environment_override=environment_override,
+            environment_override_sha256=guard.sha256_file(environment_override),
+            settings_file=settings,
+            settings_file_sha256=guard.sha256_file(settings),
+        )
+        files = ("docker/docker-compose.yaml", "docker/health.yaml")
+        if action == "targeted_up":
+            guard.targeted_up(project, files, guard.TARGET_SERVICES, **common)
+        else:
+            guard.compose_start(project, files, expected_source=None, candidate_source=project, candidate_lock=lock, **common)
+
+    assert not unexpected
+    assert len(created) == 24
+    observed = {}
+    for record in created.values():
+        request = record["request"]
+        service = request["Labels"]["com.docker.compose.service"]
+        assert service not in observed
+        observed[service] = request
+        assert request["Image"] == lock["images"][service]["reference"]
+        assert request["HostConfig"]["NetworkMode"] == "none"
+        environment = dict(value.split("=", 1) for value in request["Env"])
+        assert environment["DOTENV_VALUE"] == "from-frozen-dotenv"
+        assert environment["ENV_FILE_VALUE"] == "from-frozen-env-file"
+        assert environment["PRIVATE_VALUE"] == private_value
+        # Compare raw provider creation strings. Resolving symlinks here would
+        # hide precisely the snapshot alias that caused the real failure.
+        mounts = {value.split(":")[1]: value.split(":") for value in request["HostConfig"]["Binds"]}
+        assert mounts["/data"] == [str(data), "/data", "rw"]
+        assert mounts["/literal-$target"] == [str(data), "/literal-$target", "ro"]
+        assert mounts["/data/tool_registry_config"] == [str(docker / ".." / "tool-registry"), "/data/tool_registry_config", "ro"]
+        assert mounts["/var/run/docker.sock"] == [str(socket), "/var/run/docker.sock", "ro"]
+        if service in bind_files:
+            relative, target = bind_files[service]
+            assert mounts[target] == [str(docker / relative), target, "ro"]
+        if service in guard.CORE_SERVICES:
+            source, target, mode = mounts[guard.PROBE_MOUNT_TARGET]
+            assert Path(source).is_relative_to(next(iter(snapshots)))
+            assert target == guard.PROBE_MOUNT_TARGET and mode == "ro"
+            assert request["Healthcheck"]["Test"] == guard._probe_test(service)
+    assert set(observed) == set(guard.TARGET_SERVICES)
+    assert len(launch_paths) == 1
+    assert all(not path.exists() for path in snapshots | set(launch_paths))
+
+
 def test_compose_config_maps_temporary_runner_data_bind_to_project_tree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -986,6 +1284,22 @@ def test_compose_config_maps_temporary_runner_data_bind_to_project_tree(
         assert env["UNSTRACT_HEALTHCHECK_SOURCE"] == str(
             project_directory.parent / "__helper__" / "unstract-services.sh"
         )
+        override = next(
+            (Path(value) for value in args if value.endswith("bind-sources.override.json")),
+            None,
+        )
+        if override:
+            assert json.loads(override.read_text()) == {
+                "services": {
+                    "runner": {
+                        "volumes": [{
+                            "type": "bind",
+                            "source": str(workflow_data),
+                            "target": "/data",
+                        }]
+                    }
+                }
+            }
         return subprocess.CompletedProcess(
             args,
             0,
@@ -996,7 +1310,7 @@ def test_compose_config_maps_temporary_runner_data_bind_to_project_tree(
                             "volumes": [
                                 {
                                     "type": "bind",
-                                    "source": str(project_directory / "workflow_data"),
+                                    "source": str(workflow_data if override else project_directory / "workflow_data"),
                                     "target": "/data",
                                 },
                                 {
@@ -1101,6 +1415,101 @@ def test_compose_config_rejects_wrong_snapshot_probe_bind(
             live_env_file=live_env,
             probe_source_sha256=guard.sha256_file(probe),
         )
+
+
+@pytest.mark.parametrize("failure", [None, "temporary-source", "options", "environment", "tamper"])
+def test_creation_bind_override_preserves_24_targets_and_rejects_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None
+) -> None:
+    root = tmp_path / "snapshot"
+    root.mkdir()
+    live_data = tmp_path / "project-$literal" / "docker" / "workflow_data"
+    live_data.mkdir(parents=True)
+    snapshot = guard.ComposeSnapshot(
+        root=root,
+        manifest_path=root / "manifest.json",
+        project_dir=live_data.parents[1],
+        paths={"__probe_source__": str(root / "probe.sh")},
+        bind_sources={"docker/workflow_data": str(live_data)},
+    )
+    original = {
+        "services": {
+            service: {
+                "image": f"fixture/{service}:locked",
+                "environment": {"PRIVATE_VALUE": "literal-${untouched}"},
+                "volumes": [
+                    {
+                        "type": "bind",
+                        "source": str(root / "docker" / "workflow_data"),
+                        "target": "/data",
+                        "read_only": False,
+                        "bind": {"propagation": "rshared", "create_host_path": False},
+                    },
+                    {"type": "volume", "source": "persistent", "target": "/named"},
+                ],
+            }
+            for service in guard.TARGET_SERVICES
+        }
+    }
+    expected = deepcopy(original)
+    for definition in expected["services"].values():
+        definition["volumes"][0]["source"] = str(live_data)
+    overrides: list[Path] = []
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert args[-3:] == ["config", "--format", "json"]
+        override = next(
+            (Path(value) for value in args if value.endswith("bind-sources.override.json")),
+            None,
+        )
+        if override is None:
+            return subprocess.CompletedProcess(args, 0, json.dumps(original), "")
+        overrides.append(override)
+        assert override.stat().st_mode & 0o777 == 0o400
+        assert override.parent.stat().st_mode & 0o777 == 0o500
+        # This file carries only changed typed bind mounts, never private env
+        # values, images, named volumes, or the separately frozen probe mount.
+        written = json.loads(override.read_text())
+        assert set(written) == {"services"}
+        assert set(written["services"]) == set(guard.TARGET_SERVICES)
+        for service, definition in written["services"].items():
+            mount = deepcopy(expected["services"][service]["volumes"][0])
+            mount["source"] = mount["source"].replace("$", "$$")
+            assert definition == {"volumes": [mount]}
+        rendered = deepcopy(expected)
+        for definition in rendered["services"].values():
+            definition["volumes"][0]["source"] = str(live_data).replace("$", "$$")
+        if failure == "temporary-source":
+            rendered = original
+        elif failure == "options":
+            rendered["services"]["runner"]["volumes"][0]["read_only"] = True
+        elif failure == "environment":
+            rendered["services"]["runner"]["environment"]["PRIVATE_VALUE"] = "changed"
+        elif failure == "tamper":
+            os.chmod(override, 0o600)
+            override.write_text("{}")
+            os.chmod(override, 0o400)
+        return subprocess.CompletedProcess(args, 0, json.dumps(rendered), "")
+
+    monkeypatch.setattr(guard, "run", fake_run)
+    manager = guard.stable_bind_compose_config(
+        ["docker", "compose", "-f", str(root / "compose.yaml")],
+        snapshot,
+        env={},
+        deadline=None,
+        pass_fds=(),
+    )
+    if failure:
+        with pytest.raises(guard.GuardError, match="effective config|snapshot file changed"):
+            with manager:
+                pytest.fail("invalid creation input was made available to up")
+    else:
+        with manager as (creation_args, config):
+            assert config == expected
+            assert creation_args[-2:] == ["-f", str(overrides[0])]
+            assert overrides[0].is_file()
+    assert len(overrides) == 1
+    assert not overrides[0].exists()
 
 
 def test_compose_config_rejects_unrecognized_snapshot_bind_source(

@@ -35,6 +35,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterator
+from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -156,8 +157,8 @@ class ComposeSnapshot(NamedTuple):
     # Maps a rendered snapshot-relative bind source back to the authoritative
     # project-tree path it represented when the snapshot was frozen.  Compose
     # providers are allowed to retain the snapshot spelling in ``config``
-    # output, but that temporary spelling must never become the mount identity
-    # compared with the running service.
+    # output, but creation must receive the authoritative source in an explicit
+    # bind override as well as use it for comparison with the running service.
     bind_sources: dict[str, str]
 
     @property
@@ -1146,9 +1147,8 @@ def normalize_snapshot_bind_sources(
     """Map provider-rendered snapshot bind paths to authoritative host paths.
 
     Compose still reads all includes, env files, and overrides from the frozen
-    snapshot.  This changes only rendered bind identities used for guard
-    comparison, so a temporary snapshot path cannot be mistaken for a changed
-    persistent mount after its temporary directory is removed.
+    snapshot.  The normalized model supplies both guard comparison and the
+    explicit bind-source override passed to container creation.
     """
     services = config.get("services")
     if not isinstance(services, dict):
@@ -1194,6 +1194,88 @@ def normalize_snapshot_bind_sources(
                 )
             mount["source"] = authoritative
     return config
+
+
+@contextlib.contextmanager
+def stable_bind_compose_config(
+    args: list[str],
+    snapshot: ComposeSnapshot,
+    *,
+    env: dict[str, str],
+    deadline: OperationDeadline | None,
+    pass_fds: tuple[int, ...],
+) -> Iterator[tuple[list[str], dict[str, Any]]]:
+    """Give Compose the same stable bind sources that the guard compares.
+
+    Frozen includes and env files must retain their snapshot path base.  A
+    provider can retain that base in a bind source even when it names a
+    symlink to live data, so resolving only the comparison model is not enough.
+    Override only manifest-authorized bind sources, preserve every mount
+    option, and require a second provider render to match the intended model
+    exactly before the caller can use these same files for ``up``.
+    """
+
+    def render(launch_args: list[str]) -> dict[str, Any]:
+        result = run(
+            [*launch_args, "config", "--format", "json"],
+            cwd=snapshot.root,
+            env=env,
+            deadline=deadline,
+            pass_fds=pass_fds,
+        )
+        model = parse_json_output(result, "Compose config")
+        if not isinstance(model, dict):
+            raise GuardError("Compose config did not return an object")
+        return model
+
+    original = render(args)
+    normalized = normalize_snapshot_bind_sources(deepcopy(original), snapshot)
+    provider_model = deepcopy(normalized)
+    services: dict[str, Any] = {}
+    definitions = normalized.get("services")
+    if not isinstance(definitions, dict):
+        raise GuardError("Compose config services are invalid")
+    for service, definition in definitions.items():
+        if not isinstance(definition, dict):
+            continue
+        original_mounts = original["services"][service].get("volumes") or []
+        mounts = definition.get("volumes") or []
+        changed = []
+        for index, (before, mount) in enumerate(zip(original_mounts, mounts)):
+            if before.get("source") == mount.get("source"):
+                continue
+            override = deepcopy(mount)
+            # Compose's JSON config retains replay escaping for literal dollar
+            # signs; its create request decodes that escaping. Only the new
+            # authoritative source is an unescaped runtime value. Every other
+            # mount field was already serialized by the provider, so preserve
+            # it exactly instead of escaping it a second time.
+            override["source"] = mount["source"].replace("$", "$$")
+            provider_model["services"][service]["volumes"][index]["source"] = override["source"]
+            changed.append(override)
+        if changed:
+            services[service] = {"volumes": changed}
+    if not services:
+        yield args, normalized
+        return
+
+    with tempfile.TemporaryDirectory(prefix=".unstract-compose-binds-") as temporary:
+        root = Path(temporary)
+        relative = Path("bind-sources.override.json")
+        digest = _write_snapshot_file(
+            root,
+            relative,
+            json.dumps({"services": services}).encode("utf-8"),
+            private=True,
+        )
+        os.chmod(root, 0o500)
+        launch_args = [*args, "-f", str(root / relative)]
+        rendered = render(launch_args)
+        if rendered != provider_model:
+            raise GuardError("Compose bind-source override changed the effective config")
+        _validate_snapshot_file(root / relative, digest, private=True)
+        _validate_snapshot_parents(root / relative, root)
+        yield launch_args, normalized
 
 
 def parse_json_output(result: subprocess.CompletedProcess[str], description: str) -> Any:
@@ -2312,7 +2394,6 @@ def compose_config(
             live_env_file=live_env_file,
             snapshot=active_snapshot,
         )
-        args.extend(["config", "--format", "json"])
         bound_args = [bound_paths.get(argument, argument) for argument in args]
         final_settings = verify_compose_inputs_before_run(
             project_dir=project_dir,
@@ -2337,17 +2418,14 @@ def compose_config(
             if final_settings
             else env["UNSTRACT_HEALTHCHECK_SOURCE"]
         )
-        result = run(
+        with stable_bind_compose_config(
             bound_args,
-            cwd=active_snapshot.root,
+            active_snapshot,
             env=env,
             deadline=deadline,
             pass_fds=pass_fds,
-        )
-        rendered = parse_json_output(result, "Compose config")
-        if not isinstance(rendered, dict):
-            raise GuardError("Compose config did not return an object")
-        return normalize_snapshot_bind_sources(rendered, active_snapshot)
+        ) as (_, rendered):
+            return rendered
 
 
 def compose_environment(value: Any) -> dict[str, Any]:
@@ -3493,20 +3571,8 @@ def targeted_up(
             live_env_file=live_env_file,
             snapshot=active_snapshot,
         )
-        args.extend(
-            [
-                "up",
-                "-d",
-                "--no-deps",
-                "--force-recreate",
-                "--no-build",
-                "--pull",
-                "never",
-                *services,
-            ]
-        )
         bound_args = [bound_paths.get(argument, argument) for argument in args]
-        final_settings = verify_compose_inputs_before_run(
+        verification = dict(
             project_dir=project_dir,
             live_env_file=live_env_file,
             expected_source=expected_source,
@@ -3522,6 +3588,7 @@ def targeted_up(
             settings_file_sha256=settings_file_sha256,
             candidate_version=candidate_version,
         )
+        final_settings = verify_compose_inputs_before_run(**verification)
         if final_settings:
             env["VERSION"] = final_settings["VERSION"]
         env["UNSTRACT_HEALTHCHECK_SOURCE"] = bound_paths.get(
@@ -3529,13 +3596,31 @@ def targeted_up(
             if final_settings
             else env["UNSTRACT_HEALTHCHECK_SOURCE"]
         )
-        run(
+        with stable_bind_compose_config(
             bound_args,
-            cwd=active_snapshot.root,
+            active_snapshot,
             env=env,
             deadline=deadline,
             pass_fds=pass_fds,
-        )
+        ) as (launch_args, _):
+            verify_compose_inputs_before_run(**verification)
+            run(
+                [
+                    *launch_args,
+                    "up",
+                    "-d",
+                    "--no-deps",
+                    "--force-recreate",
+                    "--no-build",
+                    "--pull",
+                    "never",
+                    *services,
+                ],
+                cwd=active_snapshot.root,
+                env=env,
+                deadline=deadline,
+                pass_fds=pass_fds,
+            )
 
 
 def compose_start(
@@ -3600,9 +3685,8 @@ def compose_start(
             live_env_file=live_env_file,
             snapshot=active_snapshot,
         )
-        args.extend(["up", "-d", "--no-build", "--pull", "never"])
         bound_args = [bound_paths.get(argument, argument) for argument in args]
-        final_settings = verify_compose_inputs_before_run(
+        verification = dict(
             project_dir=project_dir,
             live_env_file=live_env_file,
             expected_source=expected_source,
@@ -3618,6 +3702,7 @@ def compose_start(
             settings_file_sha256=settings_file_sha256,
             candidate_version=candidate_version,
         )
+        final_settings = verify_compose_inputs_before_run(**verification)
         if final_settings:
             env["VERSION"] = final_settings["VERSION"]
         env["UNSTRACT_HEALTHCHECK_SOURCE"] = bound_paths.get(
@@ -3625,13 +3710,21 @@ def compose_start(
             if final_settings
             else env["UNSTRACT_HEALTHCHECK_SOURCE"]
         )
-        run(
+        with stable_bind_compose_config(
             bound_args,
-            cwd=active_snapshot.root,
+            active_snapshot,
             env=env,
             deadline=deadline,
             pass_fds=pass_fds,
-        )
+        ) as (launch_args, _):
+            verify_compose_inputs_before_run(**verification)
+            run(
+                [*launch_args, "up", "-d", "--no-build", "--pull", "never"],
+                cwd=active_snapshot.root,
+                env=env,
+                deadline=deadline,
+                pass_fds=pass_fds,
+            )
 
 
 def wait_healthy(
