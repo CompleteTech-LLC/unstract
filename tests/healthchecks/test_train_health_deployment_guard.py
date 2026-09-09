@@ -661,7 +661,34 @@ def test_compose_snapshot_probe_is_visible_to_a_separate_process(tmp_path: Path)
     assert executed.stdout == "immutable-probe"
     assert snapshot.probe_path.stat().st_mode & 0o777 == 0o555
     assert (snapshot.root / "docker" / "docker-compose-dev-essentials.yaml").is_file()
-    assert guard.load_compose_snapshot(snapshot.manifest_path).probe_path == snapshot.probe_path
+    source_args = guard.compose_args(
+        project,
+        ("docker/docker-compose.yaml",),
+        live_env_file=env_file,
+    )
+    assert source_args[:4] == [
+        "docker",
+        "compose",
+        "--project-directory",
+        str(project / "docker"),
+    ]
+    snapshot_args = guard.compose_args(
+        project,
+        ("docker/docker-compose.yaml",),
+        live_env_file=env_file,
+        snapshot=snapshot,
+    )
+    assert snapshot_args[:4] == [
+        "docker",
+        "compose",
+        "--project-directory",
+        str(snapshot.root / "docker"),
+    ]
+    assert snapshot_args[-2:] == ["-f", "docker/docker-compose.yaml"]
+    assert (
+        guard.load_compose_snapshot(snapshot.manifest_path).probe_path
+        == snapshot.probe_path
+    )
 
 
 def test_compose_snapshot_rejects_tampered_retained_input(tmp_path: Path) -> None:
@@ -731,17 +758,20 @@ def test_real_compose_provider_resolves_snapshot_include(tmp_path: Path) -> None
         environment_override_sha256=None,
     )
     provider = _real_compose_provider()
+    launch_args = guard.compose_args(
+        project,
+        ("docker/docker-compose.yaml",),
+        live_env_file=env_file,
+        snapshot=snapshot,
+    )
+    bound_args = [snapshot.path_for(argument) for argument in launch_args[2:]]
+    assert bound_args[:2] == ["--project-directory", str(snapshot.root / "docker")]
     result = subprocess.run(
         [
             *provider,
-            "--project-directory",
-            str(snapshot.root),
-            "--env-file",
-            str(snapshot.path_for(str(env_file))),
-            "-f",
-            snapshot.path_for("docker/docker-compose.yaml"),
+            *bound_args,
             "config",
-            *( ["--format", "json"] if provider[0] == "docker" else []),
+            *(["--format", "json"] if provider[0] == "docker" else []),
         ],
         check=False,
         capture_output=True,

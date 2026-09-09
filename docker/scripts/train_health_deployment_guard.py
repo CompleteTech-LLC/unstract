@@ -366,6 +366,36 @@ def _compose_input_path(project_dir: Path, value: str | Path) -> Path:
     return project_dir.resolve() / path
 
 
+def _compose_project_directory(
+    project_dir: Path,
+    compose_files: tuple[str, ...],
+    *,
+    snapshot: ComposeSnapshot | None = None,
+) -> Path:
+    """Return Compose's path base for the first launch file.
+
+    Compose uses the first ``-f`` file's parent directory as its default
+    project directory. An explicit ``--project-directory`` overrides that
+    default for includes and merged-file relative paths, so a frozen snapshot
+    must preserve the first file's parent rather than promote the snapshot
+    root to the path base.
+    """
+    if not compose_files:
+        raise GuardError("Compose launch requires at least one Compose file")
+    first = str(compose_files[0])
+    if snapshot is None:
+        return _compose_input_path(project_dir, first).resolve().parent
+    frozen = snapshot.paths.get(first)
+    if frozen is None:
+        raise GuardError("Compose snapshot does not contain the base Compose file")
+    frozen_path = Path(frozen).resolve()
+    try:
+        frozen_path.relative_to(snapshot.root)
+    except ValueError as exc:
+        raise GuardError("Compose snapshot base file escapes its root") from exc
+    return frozen_path.parent
+
+
 def _read_compose_input(path: Path, *, description: str) -> bytes:
     """Read one Compose input while resolving a symlink only once."""
     try:
@@ -2828,12 +2858,13 @@ def compose_args(
     live_env_file: Path | None = None,
     snapshot: ComposeSnapshot | None = None,
 ) -> list[str]:
-    # Compose resolves includes, relative env files, and relative bind sources
-    # from this explicit project directory.  Once inputs are frozen, all of
-    # those paths must resolve inside the retained snapshot tree; pointing the
-    # provider at the live checkout would re-open mutable files after the
-    # guard's final verification.
-    effective_project_dir = snapshot.root if snapshot is not None else project_dir.resolve()
+    # Compose resolves the base file's includes and merged-file relative
+    # references from --project-directory. The snapshot retains the original
+    # layout, so selecting its frozen base file parent keeps those resolutions
+    # inside the snapshot without changing their meaning.
+    effective_project_dir = _compose_project_directory(
+        project_dir, compose_files, snapshot=snapshot
+    )
     args = ["docker", "compose", "--project-directory", str(effective_project_dir)]
     if live_env_file:
         args.extend(["--env-file", str(live_env_file)])
