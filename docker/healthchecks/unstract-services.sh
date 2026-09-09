@@ -77,6 +77,28 @@ terminate_process_group() {
     kill -KILL "$terminate_process_pid" >/dev/null 2>&1 || :
 }
 
+# A trapped signal can remain pending while a POSIX shell is blocked in a
+# foreground `wait`. Poll the child instead, so the shell gets a chance to run
+# its cleanup trap between short sleeps. The final wait only runs after the
+# child has exited and is therefore bounded even when a healthcheck is
+# terminated while its client owns one of the capture FIFOs.
+wait_for_child() {
+    wait_for_child_pid=$1
+    wait_for_child_ticks=0
+    wait_for_child_limit=$((timeout_seconds * 20 + 40))
+    while kill -0 "$wait_for_child_pid" >/dev/null 2>&1; do
+        wait_for_child_ticks=$((wait_for_child_ticks + 1))
+        if [ "$wait_for_child_ticks" -ge "$wait_for_child_limit" ]; then
+            terminate_process_group "$wait_for_child_pid"
+            return 124
+        fi
+        # GNU and BusyBox sleep both support sub-second intervals; keeping the
+        # interval short bounds signal latency without a busy loop.
+        sleep 0.05
+    done
+    wait "$wait_for_child_pid"
+}
+
 # BusyBox wget has no max-filesize or max-redirect option. Stream through
 # bounded head processes, while capturing response headers so redirects can be
 # rejected even when the client follows them internally. The status file keeps
@@ -115,6 +137,12 @@ bounded_wget_finish() {
     bounded_wget_cleanup
 }
 
+bounded_wget_abort() {
+    trap - HUP INT TERM EXIT
+    bounded_wget_cleanup
+    exit 143
+}
+
 bounded_wget() {
     bounded_wget_url=$1
     bounded_wget_limit=$2
@@ -127,7 +155,8 @@ bounded_wget() {
     bounded_wget_client_pid=
     bounded_wget_body_reader_pid=
     bounded_wget_header_reader_pid=
-    trap bounded_wget_cleanup HUP INT TERM EXIT
+    trap bounded_wget_abort HUP INT TERM
+    trap bounded_wget_cleanup EXIT
 
     bounded_wget_headers=$("$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-headers.XXXXXX" 2>/dev/null) || return 1
     bounded_wget_body_file=$("$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-body.XXXXXX" 2>/dev/null) || return 1
@@ -144,7 +173,7 @@ bounded_wget() {
     "$timeout_bin" "$timeout_seconds" "$wget_bin" -qS -O- -t 1 -T "$timeout_seconds" "$bounded_wget_url" \
         >"$bounded_wget_body_fifo" 2>"$bounded_wget_header_fifo" &
     bounded_wget_client_pid=$!
-    if wait "$bounded_wget_client_pid"; then
+    if wait_for_child "$bounded_wget_client_pid"; then
         bounded_wget_status=0
     else
         bounded_wget_status=$?
@@ -208,6 +237,12 @@ bounded_curl_finish() {
     bounded_curl_cleanup
 }
 
+bounded_curl_abort() {
+    trap - HUP INT TERM EXIT
+    bounded_curl_cleanup
+    exit 143
+}
+
 bounded_curl() {
     bounded_curl_url=$1
     bounded_curl_limit=$2
@@ -217,7 +252,8 @@ bounded_curl() {
     bounded_curl_body_fifo=
     bounded_curl_client_pid=
     bounded_curl_body_reader_pid=
-    trap bounded_curl_cleanup HUP INT TERM EXIT
+    trap bounded_curl_abort HUP INT TERM
+    trap bounded_curl_cleanup EXIT
     bounded_curl_body_file=$("$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-body.XXXXXX" 2>/dev/null) || return 1
     bounded_curl_status_file=$("$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-status.XXXXXX" 2>/dev/null) || return 1
     bounded_curl_body_fifo=$("$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-body-fifo.XXXXXX" 2>/dev/null) || return 1
@@ -228,7 +264,7 @@ bounded_curl() {
     "$timeout_bin" "$timeout_seconds" "$curl_bin" -fsS --location --max-redirs 0 --max-filesize "$bounded_curl_limit" \
         --max-time "$timeout_seconds" "$bounded_curl_url" >"$bounded_curl_body_fifo" &
     bounded_curl_client_pid=$!
-    if wait "$bounded_curl_client_pid"; then
+    if wait_for_child "$bounded_curl_client_pid"; then
         bounded_curl_status=0
     else
         bounded_curl_status=$?
@@ -286,6 +322,12 @@ bounded_exec_finish() {
     bounded_exec_cleanup
 }
 
+bounded_exec_abort() {
+    trap - HUP INT TERM EXIT
+    bounded_exec_cleanup
+    exit 143
+}
+
 bounded_exec() {
     bounded_exec_limit=$1
     shift
@@ -295,7 +337,8 @@ bounded_exec() {
     bounded_exec_body_fifo=
     bounded_exec_client_pid=
     bounded_exec_reader_pid=
-    trap bounded_exec_cleanup HUP INT TERM EXIT
+    trap bounded_exec_abort HUP INT TERM
+    trap bounded_exec_cleanup EXIT
 
     bounded_exec_body_file=$(
         "$mktemp_bin" "${TMPDIR:-/tmp}/unstract-health-body.XXXXXX" 2>/dev/null
@@ -313,7 +356,7 @@ bounded_exec() {
     bounded_exec_reader_pid=$!
     "$timeout_bin" "$timeout_seconds" "$@" >"$bounded_exec_body_fifo" 2>/dev/null &
     bounded_exec_client_pid=$!
-    if wait "$bounded_exec_client_pid"; then
+    if wait_for_child "$bounded_exec_client_pid"; then
         bounded_exec_status=0
     else
         bounded_exec_status=$?
@@ -342,7 +385,7 @@ bounded_exec() {
 }
 
 probe_weaviate() {
-    bounded_wget "$weaviate_url" 65536 2>/dev/null || fail
+    bounded_wget "$weaviate_url" 65536 || fail
     body=$("$head_bin" -c 65536 "$bounded_wget_result_file") || {
         bounded_wget_finish
         fail
@@ -395,7 +438,7 @@ probe_redis() {
 }
 
 probe_proxy() {
-    bounded_wget "$proxy_url" 65536 2>/dev/null || fail
+    bounded_wget "$proxy_url" 65536 || fail
     body=$("$head_bin" -c 65536 "$bounded_wget_result_file") || {
         bounded_wget_finish
         fail
@@ -416,7 +459,7 @@ probe_minio() {
     # MinIO's unauthenticated readiness endpoint reports cluster readiness and
     # avoids a mutating S3 operation or a dependency on an mc alias file.
     bounded_curl "${MINIO_READY_URL:-http://127.0.0.1:9000/minio/health/ready}" 1024 \
-        >/dev/null 2>&1 || fail
+        || fail
     bounded_curl_finish
 }
 
@@ -493,7 +536,7 @@ with opener.open(request, timeout=float(sys.argv[2])) as response:
 }
 
 probe_frontend() {
-    bounded_curl "$frontend_url" 65536 2>/dev/null || fail
+    bounded_curl "$frontend_url" 65536 || fail
     body=$("$head_bin" -c 65536 "$bounded_curl_result_file") || {
         bounded_curl_finish
         fail

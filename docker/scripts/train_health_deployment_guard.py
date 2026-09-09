@@ -105,6 +105,8 @@ COMPOSE_SETTINGS_FILENAME = "compose-settings.env"
 START_CONFIRM_TOKEN = "START_UNSTRACT_HEALTH"
 LIVE_COMPOSE_TRAIN = "docker/compose.train.yaml"
 LIVE_ENV_RELATIVE = "docker/.env"
+REPLAY_MANIFEST_SCHEMA = "unstract-durable-replay/v1"
+REPLAY_MANIFEST_FILENAME = "durable-replay-manifest.json"
 RUNTIME_GENERATED_ENV_KEYS = frozenset({"HOME", "container"})
 DURATION_TOKEN = re.compile(
     r"(?P<number>(?:\d+(?:\.\d*)?|\.\d+))(?P<unit>ns|us|µs|ms|h|m|s)"
@@ -1004,6 +1006,16 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def write_private_json(path: Path, value: Any, *, description: str) -> None:
+    """Write sanitized replay metadata with the same private contract as overrides."""
+    write_private_text(
+        path,
+        json.dumps(value, indent=2, sort_keys=True) + "\n",
+        replace=True,
+        description=description,
+    )
+
+
 def service_map(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for container in snapshot.get("containers", []):
@@ -1316,6 +1328,27 @@ def compose_config(
     for compose_file in files:
         args.extend(["-f", compose_file])
     args.extend(["config", "--format", "json"])
+    final_settings = verify_compose_inputs_before_run(
+        project_dir=project_dir,
+        live_env_file=live_env_file,
+        expected_source=expected_source,
+        candidate_source=candidate_source,
+        candidate_lock=candidate_lock,
+        probe_source=probe_source,
+        probe_source_sha256=probe_source_sha256,
+        image_override=image_override,
+        image_override_sha256=image_override_sha256,
+        environment_override=environment_override,
+        environment_override_sha256=environment_override_sha256,
+        settings_file=settings_file,
+        settings_file_sha256=settings_file_sha256,
+        candidate_version=candidate_version,
+    )
+    if final_settings:
+        env["VERSION"] = final_settings["VERSION"]
+        env["UNSTRACT_HEALTHCHECK_SOURCE"] = final_settings[
+            "UNSTRACT_HEALTHCHECK_SOURCE"
+        ]
     return parse_json_output(
         run(args, cwd=project_dir, env=env, deadline=deadline), "Compose config"
     )
@@ -1456,6 +1489,133 @@ def validate_compose_settings(
         expected_sha256=values["UNSTRACT_HEALTHCHECK_SOURCE_SHA256"],
     )
     return values
+
+
+def write_replay_manifest(
+    path: Path,
+    *,
+    lock_path: Path,
+    lock: dict[str, Any],
+    image_override: Path,
+    settings_file: Path,
+    runtime_environment_override: Path,
+    probe_source: Path,
+    probe_source_sha256: str,
+) -> None:
+    """Bind every private replay input to a durable, sanitized hash record."""
+    validate_candidate_image_override(image_override)
+    settings = validate_compose_settings(
+        settings_file,
+        candidate_version=lock["candidate_version"],
+        probe_source=probe_source,
+        probe_source_sha256=probe_source_sha256,
+    )
+    validate_private_override(runtime_environment_override)
+    write_private_json(
+        path,
+        {
+            "schema": REPLAY_MANIFEST_SCHEMA,
+            "candidate_version": lock["candidate_version"],
+            "source_commit": lock["source_commit"],
+            "source_tree": lock["source_tree"],
+            "candidate_lock_sha256": sha256_file(lock_path),
+            "probe_source_sha256": probe_source_sha256,
+            "files": {
+                CANDIDATE_IMAGE_FILENAME: sha256_file(image_override),
+                COMPOSE_SETTINGS_FILENAME: sha256_file(settings_file),
+                RUNTIME_ENVIRONMENT_FILENAME: sha256_file(runtime_environment_override),
+            },
+            "runtime_environment_keys": {
+                service: sorted(keys)
+                for service, keys in reviewed_environment_keys_from_override(
+                    runtime_environment_override
+                ).items()
+                if keys
+            },
+            "settings": {
+                "VERSION": settings["VERSION"],
+                "UNSTRACT_HEALTHCHECK_SOURCE_SHA256": settings[
+                    "UNSTRACT_HEALTHCHECK_SOURCE_SHA256"
+                ],
+            },
+        },
+        description="durable replay manifest",
+    )
+
+
+def load_replay_manifest(
+    path: Path,
+    *,
+    lock_path: Path,
+    lock: dict[str, Any],
+    image_override: Path,
+    settings_file: Path,
+    runtime_environment_override: Path,
+    probe_source: Path,
+    probe_source_sha256: str,
+) -> dict[str, Any]:
+    """Verify the persisted private replay files before normal startup."""
+    validate_private_file(path, description="durable replay manifest")
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise GuardError(f"cannot read durable replay manifest {path}: {exc}") from exc
+    if manifest.get("schema") != REPLAY_MANIFEST_SCHEMA:
+        raise GuardError("durable replay manifest has an unsupported schema")
+    if manifest.get("candidate_version") != lock.get("candidate_version"):
+        raise GuardError("durable replay candidate version changed")
+    if manifest.get("source_commit") != lock.get("source_commit"):
+        raise GuardError("durable replay source commit changed")
+    if manifest.get("source_tree") != lock.get("source_tree"):
+        raise GuardError("durable replay source tree changed")
+    expected_lock_sha256 = manifest.get("candidate_lock_sha256")
+    if not isinstance(expected_lock_sha256, str):
+        raise GuardError("durable replay manifest lacks candidate lock digest")
+    if sha256_file(lock_path) != expected_lock_sha256:
+        raise GuardError("candidate lock changed since durable replay was prepared")
+    if manifest.get("probe_source_sha256") != probe_source_sha256:
+        raise GuardError("durable replay probe digest changed")
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        raise GuardError("durable replay manifest lacks private file digests")
+    image_sha256 = files.get(CANDIDATE_IMAGE_FILENAME)
+    settings_sha256 = files.get(COMPOSE_SETTINGS_FILENAME)
+    runtime_sha256 = files.get(RUNTIME_ENVIRONMENT_FILENAME)
+    if not all(isinstance(value, str) for value in (image_sha256, settings_sha256, runtime_sha256)):
+        raise GuardError("durable replay manifest has incomplete private file digests")
+    validate_candidate_image_override(image_override, expected_sha256=image_sha256)
+    settings = validate_compose_settings(
+        settings_file,
+        candidate_version=lock["candidate_version"],
+        probe_source=probe_source,
+        probe_source_sha256=probe_source_sha256,
+        expected_sha256=settings_sha256,
+    )
+    if manifest.get("settings") != {
+        "VERSION": settings["VERSION"],
+        "UNSTRACT_HEALTHCHECK_SOURCE_SHA256": settings[
+            "UNSTRACT_HEALTHCHECK_SOURCE_SHA256"
+        ],
+    }:
+        raise GuardError("durable Compose settings metadata changed")
+    validate_private_override(
+        runtime_environment_override, expected_sha256=runtime_sha256
+    )
+    expected_keys = manifest.get("runtime_environment_keys") or {}
+    if expected_keys != {
+        service: sorted(keys)
+        for service, keys in reviewed_environment_keys_from_override(
+            runtime_environment_override
+        ).items()
+        if keys
+    }:
+        raise GuardError("runtime environment contract changed since durable replay was prepared")
+    return {
+        "image_override_sha256": image_sha256,
+        "settings_sha256": settings_sha256,
+        "runtime_environment_sha256": runtime_sha256,
+        "settings": settings,
+    }
 
 
 def plan_runtime_environment_override(
@@ -1840,6 +2000,52 @@ def verify_live_compose_inputs(
         )
     if expected != actual:
         raise GuardError("ignored live Compose input drifted since baseline capture")
+
+
+def verify_compose_inputs_before_run(
+    *,
+    project_dir: Path,
+    live_env_file: Path | None,
+    expected_source: dict[str, Any] | None,
+    candidate_source: Path | None,
+    candidate_lock: dict[str, Any] | None,
+    probe_source: Path,
+    probe_source_sha256: str | None,
+    image_override: Path | None,
+    image_override_sha256: str | None,
+    environment_override: Path | None,
+    environment_override_sha256: str | None,
+    settings_file: Path | None,
+    settings_file_sha256: str | None,
+    candidate_version: str,
+) -> dict[str, str] | None:
+    """Recheck every mutable Compose input immediately before subprocess start."""
+    verify_candidate_source_state(candidate_source, candidate_lock)
+    verify_live_compose_inputs(
+        project_dir,
+        live_env_file=live_env_file,
+        expected_source=expected_source,
+    )
+    if settings_file:
+        settings = validate_compose_settings(
+            settings_file,
+            candidate_version=candidate_version,
+            probe_source=probe_source,
+            probe_source_sha256=probe_source_sha256,
+            expected_sha256=settings_file_sha256,
+        )
+    else:
+        validate_probe_source(probe_source, expected_sha256=probe_source_sha256)
+        settings = None
+    if image_override:
+        validate_candidate_image_override(
+            image_override, expected_sha256=image_override_sha256
+        )
+    if environment_override:
+        validate_private_override(
+            environment_override, expected_sha256=environment_override_sha256
+        )
+    return settings
 
 
 @contextlib.contextmanager
@@ -2240,6 +2446,27 @@ def targeted_up(
             *services,
         ]
     )
+    final_settings = verify_compose_inputs_before_run(
+        project_dir=project_dir,
+        live_env_file=live_env_file,
+        expected_source=expected_source,
+        candidate_source=candidate_source,
+        candidate_lock=candidate_lock,
+        probe_source=probe_source,
+        probe_source_sha256=probe_source_sha256,
+        image_override=image_override,
+        image_override_sha256=image_override_sha256,
+        environment_override=environment_override,
+        environment_override_sha256=environment_override_sha256,
+        settings_file=settings_file,
+        settings_file_sha256=settings_file_sha256,
+        candidate_version=candidate_version,
+    )
+    if final_settings:
+        env["VERSION"] = final_settings["VERSION"]
+        env["UNSTRACT_HEALTHCHECK_SOURCE"] = final_settings[
+            "UNSTRACT_HEALTHCHECK_SOURCE"
+        ]
     run(args, cwd=project_dir, env=env, deadline=deadline)
 
 
@@ -2288,6 +2515,27 @@ def compose_start(
     files = compose_files + (str(image_override), str(environment_override))
     args = compose_args(files, live_env_file=live_env_file)
     args.extend(["up", "-d", "--no-build", "--pull", "never"])
+    final_settings = verify_compose_inputs_before_run(
+        project_dir=project_dir,
+        live_env_file=live_env_file,
+        expected_source=expected_source,
+        candidate_source=candidate_source,
+        candidate_lock=candidate_lock,
+        probe_source=probe_source,
+        probe_source_sha256=probe_source_sha256,
+        image_override=image_override,
+        image_override_sha256=image_override_sha256,
+        environment_override=environment_override,
+        environment_override_sha256=environment_override_sha256,
+        settings_file=settings_file,
+        settings_file_sha256=settings_file_sha256,
+        candidate_version=candidate_version,
+    )
+    if final_settings:
+        env["VERSION"] = final_settings["VERSION"]
+        env["UNSTRACT_HEALTHCHECK_SOURCE"] = final_settings[
+            "UNSTRACT_HEALTHCHECK_SOURCE"
+        ]
     run(args, cwd=project_dir, env=env, deadline=deadline)
 
 
@@ -2980,6 +3228,23 @@ def command_preflight(args: argparse.Namespace) -> int:
         replace_settings_file=True,
         operation_deadline=deadline,
     )
+    lock = load_lock(Path(args.candidate_lock))
+    probe_source = Path(args.probe_source)
+    probe_source_sha256 = (lock.get("artifacts") or {}).get(
+        "docker/healthchecks/unstract-services.sh"
+    )
+    if not isinstance(probe_source_sha256, str):
+        raise GuardError("candidate lock lacks the guarded probe source digest")
+    write_replay_manifest(
+        state_dir / REPLAY_MANIFEST_FILENAME,
+        lock_path=Path(args.candidate_lock),
+        lock=lock,
+        image_override=image_override,
+        settings_file=settings_file,
+        runtime_environment_override=runtime_environment_override,
+        probe_source=probe_source,
+        probe_source_sha256=probe_source_sha256,
+    )
     print(
         "preflight: candidate source, image lock, Compose identity, runtime, "
         "data, network, environment, queue, and active-job state verified; "
@@ -3014,16 +3279,26 @@ def command_start(args: argparse.Namespace) -> int:
         raise GuardError("candidate lock lacks the guarded probe source digest")
     validate_probe_source(probe_source, expected_sha256=probe_source_sha256)
     validate_candidate_image_override(image_override)
-    validate_private_override(runtime_environment_override)
+    replay_manifest = load_replay_manifest(
+        state_dir / REPLAY_MANIFEST_FILENAME,
+        lock_path=Path(args.candidate_lock),
+        lock=lock,
+        image_override=image_override,
+        settings_file=settings_file,
+        runtime_environment_override=runtime_environment_override,
+        probe_source=probe_source,
+        probe_source_sha256=probe_source_sha256,
+    )
     settings = validate_compose_settings(
         settings_file,
         candidate_version=lock["candidate_version"],
         probe_source=probe_source,
         probe_source_sha256=probe_source_sha256,
+        expected_sha256=replay_manifest["settings_sha256"],
     )
-    image_override_sha256 = sha256_file(image_override)
-    settings_file_sha256 = sha256_file(settings_file)
-    runtime_environment_sha256 = sha256_file(runtime_environment_override)
+    image_override_sha256 = replay_manifest["image_override_sha256"]
+    settings_file_sha256 = replay_manifest["settings_sha256"]
+    runtime_environment_sha256 = replay_manifest["runtime_environment_sha256"]
     candidate_images = candidate_image_snapshot(lock, deadline=operation_deadline)
     if not candidate_images:
         raise GuardError("no candidate images were verified")
@@ -3166,6 +3441,16 @@ def command_apply(args: argparse.Namespace) -> int:
                     probe_source_sha256=probe_source_sha256,
                     deadline=operation_deadline,
                 )
+            write_replay_manifest(
+                backup_dir / REPLAY_MANIFEST_FILENAME,
+                lock_path=Path(args.candidate_lock),
+                lock=lock,
+                image_override=image_override,
+                settings_file=settings_file,
+                runtime_environment_override=runtime_environment_override,
+                probe_source=Path(args.probe_source),
+                probe_source_sha256=probe_source_sha256,
+            )
             rollback_override(backup_images, backup_dir / "rollback.override.yaml")
             write_json(backup_dir / "candidate-images.json", lock["images"])
 

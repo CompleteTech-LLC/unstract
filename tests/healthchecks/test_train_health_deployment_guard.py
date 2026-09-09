@@ -318,6 +318,73 @@ def test_durable_compose_inputs_are_private_and_reusable(tmp_path: Path) -> None
         )
 
 
+def test_replay_manifest_binds_private_runtime_override_hash(tmp_path: Path) -> None:
+    probe = tmp_path / "probe.sh"
+    probe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    probe_sha256 = guard.sha256_file(probe)
+    lock = {
+        "schema": "unstract-health-candidate/v1",
+        "candidate_version": "goal09-test",
+        "source_commit": "a" * 40,
+        "source_tree": "b" * 40,
+        "images": {
+            service: {"reference": f"candidate/{service}"}
+            for service in guard.TARGET_SERVICES
+        },
+    }
+    lock_path = tmp_path / "candidate-lock.json"
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    image_override = guard.candidate_image_override(
+        lock, tmp_path / guard.CANDIDATE_IMAGE_FILENAME
+    )
+    settings = tmp_path / guard.COMPOSE_SETTINGS_FILENAME
+    guard.write_compose_settings(
+        lock["candidate_version"],
+        probe,
+        settings,
+        probe_source_sha256=probe_sha256,
+    )
+    runtime = tmp_path / guard.RUNTIME_ENVIRONMENT_FILENAME
+    guard.write_runtime_environment_override({}, runtime)
+    manifest = tmp_path / guard.REPLAY_MANIFEST_FILENAME
+
+    guard.write_replay_manifest(
+        manifest,
+        lock_path=lock_path,
+        lock=lock,
+        image_override=image_override,
+        settings_file=settings,
+        runtime_environment_override=runtime,
+        probe_source=probe,
+        probe_source_sha256=probe_sha256,
+    )
+    loaded = guard.load_replay_manifest(
+        manifest,
+        lock_path=lock_path,
+        lock=lock,
+        image_override=image_override,
+        settings_file=settings,
+        runtime_environment_override=runtime,
+        probe_source=probe,
+        probe_source_sha256=probe_sha256,
+    )
+    assert loaded["runtime_environment_sha256"] == guard.sha256_file(runtime)
+    assert manifest.stat().st_mode & 0o777 == 0o600
+
+    runtime.write_text(runtime.read_text(encoding="utf-8") + "# changed\n", encoding="utf-8")
+    with pytest.raises(guard.GuardError, match="runtime environment override changed"):
+        guard.load_replay_manifest(
+            manifest,
+            lock_path=lock_path,
+            lock=lock,
+            image_override=image_override,
+            settings_file=settings,
+            runtime_environment_override=runtime,
+            probe_source=probe,
+            probe_source_sha256=probe_sha256,
+        )
+
+
 def test_compose_replay_consumes_durable_settings_and_overrides(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

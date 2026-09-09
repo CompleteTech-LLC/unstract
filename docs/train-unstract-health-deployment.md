@@ -15,12 +15,15 @@ source directory:
   Milvus MinIO, and Milvus services while preserving the local SSL entrypoint
   and volume configuration.
 
-`docker/scripts/train_health_deployment_guard.py` is the transaction guard. Its
-`capture`, `lock`, and `preflight` commands are read-only. Only `apply` and
-`rollback` mutate the host, and both require `--confirm APPLY_UNSTRACT_HEALTH`.
-Every command has a finite subprocess timeout and every operation has a finite
-monotonic deadline. The guard never builds, pulls, deletes source, resets a
-checkout, or runs project-wide `up`/`down` commands.
+`docker/scripts/train_health_deployment_guard.py` is the transaction guard.
+`capture` and `lock` are read-only. `preflight` verifies the candidate and
+refreshes private mode-600 replay files beside the lock, so it is an intentional
+state write. `start`, `apply`, and `rollback` can mutate the running Compose
+project; `start` requires `--confirm START_UNSTRACT_HEALTH`, while `apply` and
+`rollback` require `--confirm APPLY_UNSTRACT_HEALTH`. Every command has a
+finite subprocess timeout and every operation has a finite monotonic deadline.
+The guard never builds, pulls, deletes source, resets a checkout, or runs
+project-wide destructive `down` commands.
 
 The target set is fixed at 24 services: runner plus twelve workers, followed
 by db, Redis, MinIO, reverse proxy, Qdrant, RabbitMQ, Weaviate, x2text,
@@ -89,9 +92,12 @@ be the exact names and IDs already captured from the live stack, unless a
 deliberate static image change has separately been reviewed. The lock also
 contains the candidate commit's tree hash and hashes for the two overlays, the
 core and database probes, and the development essentials Compose file. The
-guard writes a private mode-600 image override and Compose settings file from
+guard writes private mode-600 image, settings, runtime-environment, and
+replay-manifest files from
 this lock, so every health, environment, and image replay uses the same
-immutable references, `VERSION`, and staged probe path. These artifacts remain
+immutable references, `VERSION`, and staged probe path. The replay manifest
+binds those three private files, the candidate lock, source commit/tree, probe
+digest, and reviewed environment-key set. These artifacts remain
 in the preflight state directory and apply backup directory for later startup
 or recovery; the guard validates their SHA-256 values before each Compose
 invocation. Only `runner` and the twelve
@@ -105,7 +111,98 @@ checkout and never use `rsync --delete`. The private Train Compose file and
 all existing `.env` files stay in their current location. The core overlay's
 `UNSTRACT_HEALTHCHECK_SOURCE` points at the staged probe.
 
-## Read-only preflight and bounded apply
+## Existing Train startup owner
+
+The Train user manager currently has two relevant owners. The enabled
+`train-rootless-boot-recovery.service` runs the host's bounded helper, whose
+contract is to validate and start only the exact rows in its private manifest;
+that helper deliberately does not run Compose. The enabled generic
+`podman-restart.service` starts existing containers selected by restart policy.
+That generic path is how Unstract's existing `unless-stopped` containers can
+return after a user-manager restart, but it does not read the candidate lock,
+the staged overlays, or the durable replay files. A deployment that installs
+only the guard therefore still loses its candidate state on ordinary recovery.
+
+This repository now carries the small owner integration:
+
+- `docker/systemd/unstract-durable-replay.service` runs the guarded whole-stack
+  `start` path after the bounded rootless recovery and before generic restart.
+- `docker/systemd/podman-restart.service.d/60-unstract-durable-replay.conf`
+  makes the ordering a requirement even when an operator starts
+  `podman-restart.service` manually.
+- `docker/scripts/unstract_durable_replay.py` validates the mode-600 systemd
+  environment contract and invokes the guard without a shell.
+
+The unit is deliberately separate from the application checkout. Install the
+launcher, unit, and drop-in only after `apply` has produced a verified backup
+directory. The environment file below contains paths and the explicit startup
+confirmation token; it contains no credentials or copied `.env` values:
+
+```sh
+REMOTE_ROOT=/home/completetrain/train-health-coverage-20260908/unstract-build-03404993-2042
+REMOTE_SOURCE="$REMOTE_ROOT/guard-source-4ee386a0"
+REMOTE_LOCK="$REMOTE_ROOT/candidate-lock-4ee386a0.json"
+REMOTE_BACKUP="$REMOTE_ROOT/deployment-backup-4ee386a0"
+LIVE_ROOT=/home/completetrain/etl.home.complete.tech
+LIVE_ENV="$LIVE_ROOT/docker/.env"
+REMOTE_PROBE="$REMOTE_SOURCE/docker/healthchecks/unstract-services.sh"
+
+install -d -m700 "$HOME/.config/unstract" "$HOME/.local/libexec"
+umask 077
+cat >"$HOME/.config/unstract/durable-replay.env.new" <<EOF
+UNSTRACT_GUARD=$REMOTE_SOURCE/docker/scripts/train_health_deployment_guard.py
+UNSTRACT_STATE_DIR=$REMOTE_BACKUP
+UNSTRACT_PROJECT_DIR=$LIVE_ROOT
+UNSTRACT_LIVE_ENV_FILE=$LIVE_ENV
+UNSTRACT_BASELINE=$REMOTE_BACKUP/baseline.json
+UNSTRACT_CANDIDATE_SOURCE=$REMOTE_SOURCE
+UNSTRACT_CANDIDATE_LOCK=$REMOTE_LOCK
+UNSTRACT_PROBE_SOURCE=$REMOTE_PROBE
+UNSTRACT_COMPOSE_BASE=$LIVE_ROOT/docker/docker-compose.yaml
+UNSTRACT_COMPOSE_TRAIN=$LIVE_ROOT/docker/compose.train.yaml
+UNSTRACT_COMPOSE_WORKER_HEALTHCHECKS=$REMOTE_SOURCE/docker/compose.train.worker-healthchecks.yaml
+UNSTRACT_COMPOSE_CORE_HEALTHCHECKS=$REMOTE_SOURCE/docker/compose.train.healthchecks.yaml
+UNSTRACT_COMPOSE_ENV_DIR=$LIVE_ROOT/docker
+UNSTRACT_OPERATION_TIMEOUT=2400
+UNSTRACT_START_CONFIRM=START_UNSTRACT_HEALTH
+EOF
+chmod 600 "$HOME/.config/unstract/durable-replay.env.new"
+mv -f "$HOME/.config/unstract/durable-replay.env.new" "$HOME/.config/unstract/durable-replay.env"
+
+install -m755 "$REMOTE_SOURCE/docker/scripts/unstract_durable_replay.py" \
+  "$HOME/.local/libexec/unstract-durable-replay.py.new"
+mv -f "$HOME/.local/libexec/unstract-durable-replay.py.new" \
+  "$HOME/.local/libexec/unstract-durable-replay.py"
+install -m644 "$REMOTE_SOURCE/docker/systemd/unstract-durable-replay.service" \
+  "$HOME/.config/systemd/user/unstract-durable-replay.service.new"
+mv -f "$HOME/.config/systemd/user/unstract-durable-replay.service.new" \
+  "$HOME/.config/systemd/user/unstract-durable-replay.service"
+install -d -m755 "$HOME/.config/systemd/user/podman-restart.service.d"
+install -m644 "$REMOTE_SOURCE/docker/systemd/podman-restart.service.d/60-unstract-durable-replay.conf" \
+  "$HOME/.config/systemd/user/podman-restart.service.d/60-unstract-durable-replay.conf.new"
+mv -f "$HOME/.config/systemd/user/podman-restart.service.d/60-unstract-durable-replay.conf.new" \
+  "$HOME/.config/systemd/user/podman-restart.service.d/60-unstract-durable-replay.conf"
+systemctl --user daemon-reload
+systemd-analyze --user verify unstract-durable-replay.service podman-restart.service
+systemctl --user enable unstract-durable-replay.service
+```
+
+The launcher sets `PWD` to `UNSTRACT_COMPOSE_ENV_DIR` before `exec`, so the
+existing live `.env` can resolve its `${PWD}` path interpolation even when the
+user manager starts the unit from a different working directory. Manual
+`capture`, `preflight`, and `apply` commands must likewise export
+`PWD=$LIVE_ROOT/docker` as shown below.
+
+The install must preserve fresh backups of any prior env, launcher, unit, and
+drop-in before replacement. If the owner integration must be reverted, stop
+the durable unit, disable it, restore those exact backups, remove the drop-in
+only if it was absent before, and run `systemctl --user daemon-reload`; do not
+fall back to an unguarded `podman-restart.service` while the candidate state is
+uncertain. A failed durable unit intentionally blocks the generic restart path
+until the state or source hashes are repaired. Starting the unit is a normal
+Compose startup mutation and is a separate approved action after installation.
+
+## Preflight and bounded apply
 
 Capture a fresh baseline immediately before preflight, even if the earlier
 runtime snapshot is available. The capture hashes every dirty source file by

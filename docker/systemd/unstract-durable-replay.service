@@ -1,0 +1,22 @@
+[Unit]
+Description=Guarded durable Unstract Compose replay
+Documentation=file:%h/.local/libexec/unstract-durable-replay.py
+Wants=network-online.target podman.socket
+Requires=train-rootless-boot-recovery.service
+After=network-online.target podman.socket train-rootless-boot-recovery.service
+Before=podman-restart.service
+ConditionPathExists=%h/.config/unstract/durable-replay.env
+ConditionPathExists=%h/.local/libexec/unstract-durable-replay.py
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=%h/.config/unstract/durable-replay.env
+ExecStart=/usr/bin/python3 %h/.local/libexec/unstract-durable-replay.py
+# Compose can wait on database and health transitions; do not let the user
+# manager kill the guarded replay while it is within its own deadline.
+TimeoutStartSec=2700
+KillMode=process
+
+[Install]
+WantedBy=default.target
