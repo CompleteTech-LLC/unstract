@@ -475,6 +475,7 @@ def test_durable_compose_inputs_are_private_and_reusable(tmp_path: Path) -> None
 def test_replay_manifest_binds_private_runtime_override_hash(tmp_path: Path) -> None:
     probe = tmp_path / "probe.sh"
     probe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    probe.chmod(0o700)
     probe_sha256 = guard.sha256_file(probe)
     lock = {
         "schema": "unstract-health-candidate/v1",
@@ -566,6 +567,7 @@ def test_compose_replay_consumes_durable_settings_and_overrides(
 ) -> None:
     probe = tmp_path / "probe.sh"
     probe.write_text("#!/bin/sh\nprintf probe\n", encoding="utf-8")
+    probe.chmod(0o700)
     probe_sha256 = guard.sha256_file(probe)
     lock = {
         "images": {
@@ -848,6 +850,27 @@ def test_compose_snapshot_rejects_tampered_retained_input(tmp_path: Path) -> Non
         guard.load_compose_snapshot(snapshot.manifest_path)
 
 
+@pytest.mark.parametrize("mode", [0o500, 0o444, 0o700])
+def test_compose_snapshot_rejects_probe_permissions_unusable_by_service_users(
+    tmp_path: Path, mode: int
+) -> None:
+    (tmp_path / "compose.yaml").write_text("services: {}\n")
+    probe = tmp_path / "probe.sh"
+    probe.write_text("#!/bin/sh\nexit 0\n")
+    probe.chmod(0o700)
+    snapshot = guard.create_compose_snapshot(
+        state_dir=tmp_path / "state", project_dir=tmp_path,
+        compose_files=("compose.yaml",), live_env_file=None,
+        probe_source=probe, probe_source_sha256=guard.sha256_file(probe),
+        image_override=None, image_override_sha256=None,
+        environment_override=None, environment_override_sha256=None,
+    )
+    assert snapshot.probe_path.stat().st_mode & 0o777 == 0o555
+    snapshot.probe_path.chmod(mode)
+    with pytest.raises(guard.GuardError, match="writable or not regular|mode 0555"):
+        guard.load_compose_snapshot(snapshot.manifest_path)
+
+
 def test_real_compose_provider_preserves_snapshot_runner_paths_and_env(
     tmp_path: Path,
 ) -> None:
@@ -1066,7 +1089,7 @@ def _recording_docker_api():
         thread.join(timeout=5)
 
 
-@pytest.mark.parametrize("action", ["targeted_up", "compose_start"])
+@pytest.mark.parametrize("action", ["targeted_up", "compose_start", "rollback", "apply_batch"])
 def test_real_compose_creation_uses_stable_sources_for_all_24_targets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
 ) -> None:
@@ -1131,8 +1154,17 @@ def test_real_compose_creation_uses_stable_sources_for_all_24_targets(
     probe = tmp_path / "probe.sh"
     probe.write_text("#!/bin/sh\nexit 0\n")
     probe.chmod(0o755)
-    lock = {"images": {service: {"reference": f"fixture/{service}:locked"} for service in guard.TARGET_SERVICES}}
+    lock = {"candidate_version": "fixture", "images": {service: {"reference": f"fixture/{service}:locked"} for service in guard.TARGET_SERVICES}}
     image_override = guard.candidate_image_override(lock, tmp_path / guard.CANDIDATE_IMAGE_FILENAME)
+    stop_signals = {service: 2 if service == "db" else 3 if service == "frontend" else 15 for service in guard.TARGET_SERVICES}
+    if action == "rollback":
+        # The recording engine's backup-image Config has no StopSignal, just
+        # like the committed images that caused the actual recovery failure.
+        guard.rollback_override(
+            {"services": {service: {"reference": lock["images"][service]["reference"], "old_options": {"stop_signal": stop_signals[service]}} for service in guard.TARGET_SERVICES}},
+            image_override,
+            guard.TARGET_SERVICES,
+        )
     private_value = "opaque-$value ${literal} # fixture\nsecond line"
     environment_override = tmp_path / guard.RUNTIME_ENVIRONMENT_FILENAME
     guard.write_runtime_environment_override(
@@ -1195,9 +1227,35 @@ def test_real_compose_creation_uses_stable_sources_for_all_24_targets(
             settings_file=settings,
             settings_file_sha256=guard.sha256_file(settings),
         )
-        files = ("docker/docker-compose.yaml", "docker/health.yaml")
-        if action == "targeted_up":
+        files = ("docker/docker-compose.yaml",) if action == "rollback" else ("docker/docker-compose.yaml", "docker/health.yaml")
+        if action in {"targeted_up", "rollback"}:
             guard.targeted_up(project, files, guard.TARGET_SERVICES, **common)
+        elif action == "apply_batch":
+            retained = guard.create_compose_snapshot(
+                state_dir=tmp_path / "retained", project_dir=project,
+                compose_files=files, live_env_file=env_file,
+                probe_source=probe, probe_source_sha256=guard.sha256_file(probe),
+                image_override=image_override, image_override_sha256=guard.sha256_file(image_override),
+                environment_override=environment_override, environment_override_sha256=guard.sha256_file(environment_override),
+            )
+            retained_probe_before = retained.probe_path.stat()
+            baseline = {"source": {"live_inputs": guard.live_compose_inputs(project, live_env_file=env_file)}}
+            monkeypatch.setattr(guard, "advisory_lock", lambda **_kwargs: contextlib.nullcontext())
+            monkeypatch.setattr(guard, "capture", lambda *_args, **_kwargs: {"job_quiescence": {"quiescent": True, "stability": {"stable": True}}})
+            monkeypatch.setattr(guard, "candidate_image_snapshot", lambda *_args, **_kwargs: {})
+            for operation in ("compare_untargeted_runtime", "compare_source_and_quiescence", "verify_untouched_targets", "check_candidate_config", "wait_healthy", "compare_post_apply"):
+                monkeypatch.setattr(guard, operation, lambda *_args, **_kwargs: None)
+            monkeypatch.setattr(guard, "settled_queue_snapshot", lambda *_args, **_kwargs: {"stability": {"stable": True}})
+            monkeypatch.setattr(guard, "record_replacements", lambda *_args, **_kwargs: {"services": {service: {} for service in guard.TARGET_SERVICES}})
+            guard.apply_batch(
+                SimpleNamespace(project_dir=str(project), candidate_source=str(project), probe_source=str(probe), compose_file=files),
+                baseline, lock, tmp_path / "backup", image_override,
+                guard.TARGET_SERVICES, (), (),
+                settings_file=settings, settings_file_sha256=guard.sha256_file(settings),
+                image_override_sha256=guard.sha256_file(image_override), probe_source_sha256=guard.sha256_file(probe),
+                runtime_environment_override=environment_override, runtime_environment_sha256=guard.sha256_file(environment_override),
+                reviewed_environment_keys={}, snapshot=retained, operation_deadline=guard.OperationDeadline(120),
+            )
         else:
             guard.compose_start(project, files, expected_source=None, candidate_source=project, candidate_lock=lock, **common)
 
@@ -1225,14 +1283,43 @@ def test_real_compose_creation_uses_stable_sources_for_all_24_targets(
         if service in bind_files:
             relative, target = bind_files[service]
             assert mounts[target] == [str(docker / relative), target, "ro"]
-        if service in guard.CORE_SERVICES:
+        if action == "rollback":
+            assert request["StopSignal"] == str(stop_signals[service])
+            assert request["Healthcheck"]["Test"] == ["NONE"]
+            assert guard.PROBE_MOUNT_TARGET not in mounts
+        elif service in guard.CORE_SERVICES:
             source, target, mode = mounts[guard.PROBE_MOUNT_TARGET]
             assert Path(source).is_relative_to(next(iter(snapshots)))
+            if action == "apply_batch":
+                assert Path(source) == retained.probe_path
             assert target == guard.PROBE_MOUNT_TARGET and mode == "ro"
             assert request["Healthcheck"]["Test"] == guard._probe_test(service)
     assert set(observed) == set(guard.TARGET_SERVICES)
     assert len(launch_paths) == 1
-    assert all(not path.exists() for path in snapshots | set(launch_paths))
+    assert all(not path.exists() for path in launch_paths)
+    if action == "apply_batch":
+        assert snapshots == {retained.root}
+        assert guard.sha256_file(retained.probe_path) == guard.sha256_file(probe)
+        retained_probe_after = retained.probe_path.stat()
+        assert retained_probe_after.st_mode & 0o777 == 0o555
+        assert (retained_probe_after.st_dev, retained_probe_after.st_ino) == (retained_probe_before.st_dev, retained_probe_before.st_ino)
+        assert guard.load_compose_snapshot(retained.manifest_path) == retained
+    else:
+        assert all(not path.exists() for path in snapshots)
+
+
+@pytest.mark.parametrize("stop_signal", [None, False, 0, -1, 65, "SIGTERM"])
+def test_rollback_override_requires_recorded_runtime_stop_signal(
+    tmp_path: Path, stop_signal: object
+) -> None:
+    path = tmp_path / "rollback.yaml"
+    with pytest.raises(guard.GuardError, match="backup runtime stop signal is missing or invalid"):
+        guard.rollback_override(
+            {"services": {"db": {"reference": "fixture/db:backup", "old_options": {"stop_signal": stop_signal}}}},
+            path,
+            ("db",),
+        )
+    assert not path.exists()
 
 
 def test_compose_config_maps_temporary_runner_data_bind_to_project_tree(
@@ -1580,6 +1667,7 @@ def test_compose_snapshot_reloads_authoritative_bind_source_mapping(
     )
     probe = tmp_path / "probe.sh"
     probe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    probe.chmod(0o700)
 
     snapshot = guard.create_compose_snapshot(
         state_dir=tmp_path / "state",
@@ -2120,3 +2208,44 @@ def test_apply_batch_records_raw_transition_then_requires_strict_settlement(monk
         guard.POST_RECREATION_QUIESCENCE_MAX_WAIT_SECONDS
     )
     assert capture_kwargs[2]["quiescence_phase"] == "post-recreation:runner"
+
+
+def test_compensating_rollback_retains_actual_observation_when_verification_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    actual = {"captured_at": "actual-post-compensation", "containers": [{"id": "actual-restored-id"}]}
+    captures = iter([{"phase": "before"}, {"phase": "locked"}, actual])
+    snapshot = SimpleNamespace(manifest_path=tmp_path / "retained-manifest.json")
+    environment = tmp_path / "runtime.yaml"
+    guard.write_private_text(environment, "services: {}\n", replace=False, description="fixture runtime")
+    monkeypatch.setattr(guard, "capture", lambda *_args, **_kwargs: next(captures))
+    monkeypatch.setattr(guard, "advisory_lock", lambda **_kwargs: contextlib.nullcontext())
+    monkeypatch.setattr(guard, "compare_source_and_quiescence", lambda *_args: None)
+    monkeypatch.setattr(guard, "verify_replacement_ids", lambda *_args: None)
+    monkeypatch.setattr(guard, "create_compose_snapshot", lambda **_kwargs: snapshot)
+    monkeypatch.setattr(guard, "wait_running", lambda *_args, **_kwargs: None)
+
+    def recreate(*_args, **kwargs):
+        assert kwargs["snapshot"] is snapshot
+
+    def fail_verification(_baseline, final, *_args, **_kwargs):
+        assert final is actual
+        assert json.loads((tmp_path / "post-compensating-rollback-observed.json").read_text()) == actual
+        raise guard.GuardError("runtime options changed for db")
+
+    monkeypatch.setattr(guard, "targeted_up", recreate)
+    monkeypatch.setattr(guard, "verify_rollback_result", fail_verification)
+    with pytest.raises(guard.GuardError, match="runtime options changed for db"):
+        guard.compensating_rollback(
+            SimpleNamespace(project_dir=str(tmp_path), probe_source=str(tmp_path / "probe.sh")),
+            {"source": {}},
+            {"services": {"db": {"reference": "fixture/db:backup", "old_options": {"stop_signal": 2}}}},
+            {"services": {"db": {"replacement_container_id": "candidate-id"}}},
+            tmp_path,
+            runtime_environment_override=environment,
+            runtime_environment_sha256=guard.sha256_file(environment),
+            operation_deadline=guard.OperationDeadline(60),
+        )
+    assert json.loads((tmp_path / "post-compensating-rollback-observed.json").read_text()) == actual
+    assert not (tmp_path / "post-compensating-rollback.json").exists()
+    assert not (tmp_path / "compensating-rollback.json").exists()

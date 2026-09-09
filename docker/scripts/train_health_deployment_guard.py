@@ -972,6 +972,10 @@ def load_compose_snapshot(path: Path) -> ComposeSnapshot:
         paths[key] = str(candidate)
     if "__probe_source__" not in paths:
         raise GuardError("Compose snapshot lacks the immutable probe source")
+    # This bind is executed by both root and non-root service users. A retained
+    # inode with the right bytes but owner-only permissions is not usable.
+    if stat.S_IMODE(Path(paths["__probe_source__"]).stat().st_mode) != 0o555:
+        raise GuardError("Compose snapshot probe must remain readable and executable with mode 0555")
     project_dir_value = manifest.get("project_dir")
     if not isinstance(project_dir_value, str) or not project_dir_value:
         raise GuardError("Compose snapshot project directory is invalid")
@@ -3917,10 +3921,17 @@ def rollback_override(
         reference = record.get("reference")
         if not reference:
             raise GuardError(f"backup image reference missing for {service}")
+        # Podman commit can omit image StopSignal metadata. Replaying that
+        # image alone then changes the container's shutdown behavior to TERM.
+        # The original runtime capture is authoritative for this option.
+        stop_signal = (record.get("old_options") or {}).get("stop_signal")
+        if type(stop_signal) is not int or not 1 <= stop_signal <= 64:
+            raise GuardError(f"backup runtime stop signal is missing or invalid for {service}")
         lines.extend(
             [
                 f"  {service}:",
                 f"    image: {json.dumps(reference)}",
+                f"    stop_signal: {json.dumps(str(stop_signal))}",
                 '    healthcheck: {test: ["NONE"]}',
             ]
         )
@@ -4321,6 +4332,10 @@ def compensating_rollback(
         quiescence_max_wait_seconds=POST_RECREATION_QUIESCENCE_MAX_WAIT_SECONDS,
         quiescence_phase=f"post-compensating-rollback:{services[0]}",
     )
+    # Keep the actual comparison input even if a preserved contract fails.
+    # This observation does not claim verified compensation or quiescence
+    # beyond what the captured evidence itself establishes.
+    write_json(backup_dir / "post-compensating-rollback-observed.json", final)
     verify_rollback_result(
         baseline,
         final,
@@ -4437,6 +4452,7 @@ def apply_batch(
             settings_file=settings_file,
             settings_file_sha256=settings_file_sha256,
             probe_source_sha256=probe_source_sha256,
+            snapshot=snapshot,
             deadline=operation_deadline,
         )
         observed = capture(
