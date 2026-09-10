@@ -23,14 +23,95 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
+import threading
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from http.server import HTTPServer
+    from http.server import ThreadingHTTPServer
     from threading import Thread
 
 logger = logging.getLogger(__name__)
+
+_HEALTH_FAILURE_THRESHOLD = 3
+
+
+class DependencyHeartbeat:
+    """Track loop progress together with the dependency operation it drives.
+
+    A loop timestamp alone is insufficient: a PG consumer can stamp the top of
+    every cycle while every database read fails, and a reaper can tick while
+    its lease renewal is broken. begin() is called immediately before
+    dependency work, succeed() only after the required operation returns, and
+    fail() on an exception. The health age is stale when no operation has
+    succeeded, when the loop is stuck in a cycle, or after a short repeated
+    failure streak.
+    """
+
+    def __init__(self, *, failure_threshold: int = _HEALTH_FAILURE_THRESHOLD) -> None:
+        if failure_threshold <= 0:
+            raise ValueError("failure_threshold must be positive")
+        self._failure_threshold = failure_threshold
+        self._lock = threading.Lock()
+        self._last_started: float | None = None
+        self._last_success: float | None = None
+        self._failure_streak = 0
+        self._total_failures = 0
+        self._total_successes = 0
+
+    def begin(self) -> None:
+        with self._lock:
+            self._last_started = time.monotonic()
+
+    def succeed(self) -> None:
+        with self._lock:
+            self._last_success = time.monotonic()
+            self._failure_streak = 0
+            self._total_successes += 1
+
+    def fail(self) -> None:
+        with self._lock:
+            self._failure_streak += 1
+            self._total_failures += 1
+
+    def age(self) -> float:
+        with self._lock:
+            last_started = self._last_started
+            last_success = self._last_success
+            failure_streak = self._failure_streak
+        if last_success is None or failure_streak >= self._failure_threshold:
+            return float("inf")
+        now = time.monotonic()
+        success_age = max(0.0, now - last_success)
+        started_age = (
+            0.0
+            if last_started is None
+            else max(0.0, now - last_started)
+        )
+        # Either a wedged cycle or a missing dependency success is unhealthy.
+        return max(success_age, started_age)
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            last_success = self._last_success
+            failure_streak = self._failure_streak
+            total_failures = self._total_failures
+            total_successes = self._total_successes
+        age = self.age()
+        return {
+            "dependency_ready": last_success is not None
+            and failure_streak < self._failure_threshold
+            and math.isfinite(age),
+            "dependency_failure_streak": failure_streak,
+            "dependency_failures_total": total_failures,
+            "dependency_successes_total": total_successes,
+            "dependency_health_age_seconds": (
+                round(age, 3) if math.isfinite(age) else None
+            ),
+            "dependency_failure_threshold": self._failure_threshold,
+        }
 
 
 class LivenessServer:
@@ -70,8 +151,10 @@ class LivenessServer:
         # Re-validate here (not only at the env boundary): a direct caller could
         # otherwise build an always-503 probe that crash-loops the pod. Mirrors
         # the codebase's load-bearing re-validation convention (PgReaper.__init__).
-        if stale_after <= 0:
+        if not math.isfinite(stale_after) or stale_after <= 0:
             raise ValueError(f"stale_after must be positive, got {stale_after!r}")
+        if not isinstance(port, int) or not 0 <= port <= 65535:
+            raise ValueError(f"port must be an integer in range 0-65535, got {port!r}")
         self._freshness_fn = freshness_fn
         self._stale_after = stale_after
         self._port = port
@@ -84,13 +167,13 @@ class LivenessServer:
         # source process after the consumer/reaper extraction (e.g. "pg-queue
         # consumer" / "pg-queue reaper") — they all log via this module's logger.
         self._log_label = log_label
-        self._httpd: HTTPServer | None = None
+        self._httpd: ThreadingHTTPServer | None = None
         self._thread: Thread | None = None
 
     def start(self) -> None:
         import json
         import threading
-        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         from urllib.parse import urlsplit
 
         if self._httpd is not None:
@@ -108,6 +191,12 @@ class LivenessServer:
         log_label = self._log_label
 
         class _Handler(BaseHTTPRequestHandler):
+            def setup(self) -> None:
+                super().setup()
+                # A client that connects and never finishes its request must
+                # not pin a probe thread forever.
+                self.connection.settimeout(2.0)
+
             def do_GET(self) -> None:
                 # Strip any query string — a probe like /health?foo=bar must match.
                 path = urlsplit(self.path).path
@@ -115,14 +204,17 @@ class LivenessServer:
                     self._serve_metrics()
                     return
                 if path not in paths:
-                    self.send_response(404)
-                    self.end_headers()
+                    try:
+                        self.send_response(404)
+                        self.end_headers()
+                    except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                        pass
                     return
                 # One clock read so age and the healthy/stale verdict share an
                 # instant. The verdict is purely freshness — extra_status_fn
                 # fields are informational and never flip it.
                 age = freshness_fn()
-                stale = age > stale_after
+                stale = not math.isfinite(age) or age > stale_after
                 # Extra fields first, then overlay the core fields — so a caller's
                 # extra_status_fn can NEVER clobber status/check/age_key/
                 # stale_after_seconds (which a monitor reads): core always wins.
@@ -133,7 +225,7 @@ class LivenessServer:
                     {
                         "status": "unhealthy" if stale else "healthy",
                         "check": check_name,
-                        age_key: round(age, 3),
+                        age_key: round(age, 3) if math.isfinite(age) else None,
                         "stale_after_seconds": stale_after,
                     }
                 )
@@ -146,7 +238,7 @@ class LivenessServer:
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
                     self.wfile.write(body)
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, TimeoutError):
                     pass  # client (probe) hung up mid-response — not our problem
 
             def _serve_metrics(self) -> None:
@@ -156,7 +248,9 @@ class LivenessServer:
                     body = metrics_fn()  # type: ignore[misc]  # guarded by caller
                 except Exception:
                     logger.exception("%s: /metrics render failed", log_label)
-                    with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                    with contextlib.suppress(
+                        BrokenPipeError, ConnectionResetError, TimeoutError
+                    ):
                         self.send_response(500)
                         self.end_headers()
                     return
@@ -166,7 +260,7 @@ class LivenessServer:
                     self.send_header("Content-Type", metrics_content_type)
                     self.end_headers()
                     self.wfile.write(body)
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, TimeoutError):
                     pass  # scraper hung up mid-response — not our problem
 
             def log_message(self, *_: object) -> None:
@@ -177,7 +271,7 @@ class LivenessServer:
                 # don't let the pass above swallow them — surface to our logger.
                 logger.warning(f"{log_label} liveness handler: " + fmt, *args)
 
-        def _serve(httpd: HTTPServer) -> None:
+        def _serve(httpd: ThreadingHTTPServer) -> None:
             try:
                 httpd.serve_forever()
             except Exception:
@@ -185,7 +279,11 @@ class LivenessServer:
                 # answering (connection refused) with no breadcrumb.
                 logger.exception("%s liveness server thread crashed", log_label)
 
-        httpd = HTTPServer(("0.0.0.0", self._port), _Handler)
+        # Thread each request so one slow or abandoned client cannot block the
+        # orchestrator's next health GET behind socketserver's serial handler.
+        httpd = ThreadingHTTPServer(("0.0.0.0", self._port), _Handler)
+        httpd.daemon_threads = True
+        httpd.block_on_close = False
         self._httpd = httpd
         self._thread = threading.Thread(
             target=_serve, args=(httpd,), daemon=True, name=self._thread_name

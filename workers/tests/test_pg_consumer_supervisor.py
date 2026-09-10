@@ -7,6 +7,7 @@ children, no worker bootstrap, no signals installed.
 """
 
 import errno
+import math
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -141,12 +142,23 @@ class TestFleet:
             f.record_fork(5, 111)
 
     def test_record_fork_does_not_reseed_heartbeat(self):
-        # The crash-loop fix: a re-fork must NOT refresh the slot, or a child that
-        # never polls looks perpetually fresh.
+        # A replacement child must earn readiness with its own dependency read;
+        # retaining the prior child's timestamp would report a crash-looping
+        # replacement as healthy.
         f = _Fleet(1)
         f._heartbeats[0] = time.time() - 500  # an aged slot
         f.record_fork(0, 111)
-        assert f.oldest_age() > 400  # still aged, not reset to ~0
+        assert f._heartbeats[0] == 0.0
+        assert math.isinf(f.freshness())
+
+    def test_reap_clears_heartbeat_before_replacement(self):
+        f = _Fleet(1)
+        f._heartbeats[0] = time.time()
+        f.record_fork(0, 111)
+        f._heartbeats[0] = time.time()
+        f.reap(0)
+        assert f._heartbeats[0] == 0.0
+        assert math.isinf(f.freshness())
 
     def test_immediate_crash_increments_then_loops(self):
         f = _Fleet(1)
@@ -163,15 +175,19 @@ class TestFleet:
         assert n == 0 and f.is_crash_looping() is False
 
     def test_freshness_is_inf_when_crash_looping(self):
-        import math
-
         f = _Fleet(1)
         for _ in range(_CRASH_LOOP_THRESHOLD):
             f.schedule_restart(0, uptime=0.1)
         assert math.isinf(f.freshness())
 
+    def test_freshness_is_inf_until_each_child_reports_dependency_progress(self):
+        f = _Fleet(2)
+        f._heartbeats[0] = time.time()
+        assert math.isinf(f.freshness())
+
     def test_freshness_is_oldest_age_when_healthy(self):
         f = _Fleet(2)
+        f._heartbeats[0] = time.time()  # slot 0 completed a successful read
         f._heartbeats[1] = time.time() - 100
         assert 99 < f.freshness() < 102
 

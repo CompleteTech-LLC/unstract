@@ -42,6 +42,7 @@ from ..barrier import callback_recovery_identity
 from ..fairness import FAIRNESS_HEADER_NAME
 from .client import PgQueueClient
 from .connection import CONN_DEAD_ERRORS
+from .liveness import DependencyHeartbeat
 from .liveness import LivenessServer as _BaseLivenessServer
 from .result_backend import PgResultBackend
 from .task_payload import to_payload
@@ -361,6 +362,10 @@ class PgQueueConsumer:
         # long-running task (poll_once not returning) goes stale and is caught —
         # something pgrep-based --status and the launch-time check cannot see.
         self._last_poll_monotonic = time.monotonic()
+        # Dependency-aware health state. The poll-loop timestamp above remains
+        # useful for metrics and task-stall detection; this tracker only
+        # succeeds after every queue read in a cycle has returned.
+        self._dependency_health = DependencyHeartbeat()
 
     def poll_once(self) -> int:
         """Claim + process one batch per queue (read once each, in list order);
@@ -372,21 +377,39 @@ class PgQueueConsumer:
         after a partial failure).
         """
         self._last_poll_monotonic = time.monotonic()
+        self._dependency_health.begin()
         total = 0
+        db_cycle_failed = False
         for queue_name in self.queue_names:
             try:
                 messages = self._client.read(
                     queue_name, vt_seconds=self.lease_seconds, qty=self.batch_size
                 )
-                for message in messages:
-                    self._handle(message)
-                total += len(messages)
             except Exception:
+                db_cycle_failed = True
                 logger.exception(
                     "PG-queue consumer: poll failed for queue %r; "
                     "continuing with the other queues",
                     queue_name,
                 )
+                continue
+            try:
+                for message in messages:
+                    self._handle(message)
+                total += len(messages)
+            except Exception:
+                # Task/ack failures are handled by _handle where possible. Keep
+                # them separate from the read dependency: a successful read
+                # proves PG progress even when a customer task is retried.
+                logger.exception(
+                    "PG-queue consumer: task handling failed for queue %r; "
+                    "continuing with the other queues",
+                    queue_name,
+                )
+        if db_cycle_failed:
+            self._dependency_health.fail()
+        else:
+            self._dependency_health.succeed()
         return total
 
     @contextlib.contextmanager
@@ -1016,6 +1039,14 @@ class PgQueueConsumer:
         """Seconds since the last poll attempt (for the liveness heartbeat)."""
         return time.monotonic() - self._last_poll_monotonic
 
+    def seconds_since_dependency_progress(self) -> float:
+        """Age of the last successful PG read, or infinity before one exists."""
+        return self._dependency_health.age()
+
+    def dependency_health_status(self) -> dict[str, Any]:
+        """Machine-readable dependency state for the liveness response."""
+        return self._dependency_health.status()
+
     def run(self, *, install_signals: bool = True, require_tasks: bool = True) -> None:
         """Poll loop with empty-queue backoff and graceful shutdown.
 
@@ -1211,13 +1242,14 @@ class LivenessServer(_BaseLivenessServer):
     ) -> None:
         from .metrics import ConsumerMetrics
 
-        metrics = ConsumerMetrics(freshness_fn=consumer.seconds_since_last_poll)
+        metrics = ConsumerMetrics(freshness_fn=consumer.seconds_since_dependency_progress)
         super().__init__(
-            freshness_fn=consumer.seconds_since_last_poll,
+            freshness_fn=consumer.seconds_since_dependency_progress,
             stale_after=stale_after,
             port=port,
             check_name="pg_queue_poll",
             age_key="seconds_since_last_poll",
+            extra_status_fn=consumer.dependency_health_status,
             metrics_fn=metrics.render,
             thread_name="pg-consumer-liveness",
             log_label="pg-queue consumer",
