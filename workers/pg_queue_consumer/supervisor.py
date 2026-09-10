@@ -143,15 +143,15 @@ class _Fleet:
 
     def __init__(self, concurrency: int) -> None:
         self._n = concurrency
-        # Shared, fork-inherited heartbeat slots (one last-poll wall-time per
-        # child). lock=False is safe: a slot is written either by the parent
-        # (seed, at construction, while no child owns it) OR by that child's
-        # heartbeat thread — never concurrently — and only read by the parent, so
-        # a torn double read just yields one stale sample that self-corrects.
+        # Shared, fork-inherited heartbeat slots (one last-success wall-time per
+        # child). Zero means that no child has completed a dependency read yet;
+        # the probe must stay unhealthy until each live slot earns a real sample.
+        # lock=False is safe: a slot is written by its child heartbeat thread and
+        # only read by the parent, so a torn double read just yields one stale
+        # sample that self-corrects.
         self._heartbeats = multiprocessing.Array("d", concurrency, lock=False)
-        now = time.time()
         for i in range(concurrency):
-            self._heartbeats[i] = now
+            self._heartbeats[i] = 0.0
         self._pids: dict[int, int] = {}
         self._last_fork: dict[int, float] = {}
         self._consecutive_crashes: dict[int, int] = {}
@@ -173,18 +173,25 @@ class _Fleet:
             raise IndexError(f"slot {slot} out of range [0, {self._n})")
 
     def record_fork(self, slot: int, pid: int) -> None:
-        """Mark ``slot`` alive under ``pid``; clears any pending restart. Note the
-        heartbeat is deliberately NOT reseeded here — a re-forked child must earn
-        freshness by actually polling, so a crash-looping slot ages instead of
-        looking perpetually fresh.
+        """Mark ``slot`` alive under ``pid``; clears any pending restart.
+
+        A replacement child must earn readiness with its own completed
+        dependency read. Reset the shared timestamp here because a child can be
+        forked after a prior child left a fresh sample in the same slot.
         """
         self._validate(slot)
         self._pids[slot] = pid
         self._last_fork[slot] = time.monotonic()
+        self._heartbeats[slot] = 0.0
         self._restart_due.pop(slot, None)
 
     def reap(self, slot: int) -> float:
         """Drop the slot's pid + last-fork together; return the child's uptime (s)."""
+        self._validate(slot)
+        # Keep the slot stale during the gap between reaping the old process and
+        # recording its replacement. This also prevents a failed fork from
+        # inheriting the old child's dependency-ready timestamp.
+        self._heartbeats[slot] = 0.0
         forked_at = self._last_fork.pop(slot, time.monotonic())
         self._pids.pop(slot, None)
         return time.monotonic() - forked_at
@@ -233,7 +240,13 @@ class _Fleet:
 
     def oldest_age(self) -> float:
         now = time.time()
-        return max((now - hb for hb in self._heartbeats), default=0.0)
+        ages = (
+            float("inf")
+            if not math.isfinite(hb) or hb <= 0
+            else max(0.0, now - hb)
+            for hb in self._heartbeats
+        )
+        return max(ages, default=0.0)
 
     def freshness(self) -> float:
         """Liveness verdict source: a crash-looping fleet is force-stale (``inf``)
@@ -261,15 +274,15 @@ def _run_child(slot: int, heartbeats) -> None:  # noqa: ANN001 (ctypes array)
     consumer = build_consumer_from_env()
 
     def _publish_heartbeat() -> None:
-        # last-poll wall-time = now − (seconds since last poll). Frozen while a
-        # task runs (the consumer stamps its heartbeat at the top of poll_once),
-        # so a child stuck on a too-long task goes stale exactly as the single
-        # consumer does. Guarded so a transient error (e.g. teardown during
-        # shutdown) logs loudly and the loop continues instead of dying silently
-        # and false-staling a healthy child.
+        # Dependency-aware wall-time. A child that keeps looping while every PG
+        # read fails publishes 0, which the parent treats as infinitely stale;
+        # a task stuck after a poll still ages from the poll start.
         while True:
             try:
-                heartbeats[slot] = time.time() - consumer.seconds_since_last_poll()
+                age = consumer.seconds_since_dependency_progress()
+                heartbeats[slot] = (
+                    0.0 if not math.isfinite(age) else time.time() - age
+                )
             except Exception:
                 logger.exception(
                     "PG-queue consumer: heartbeat publish failed for slot=%s", slot

@@ -89,6 +89,10 @@ That's it!
 - Login with username: `unstract` password: `unstract`
 - Start extracting data!
 
+The Compose quickstart also provisions local Qdrant, pgvector/PostgreSQL,
+Weaviate, and Milvus services. See [local vector database connection
+settings](docker/README.md#local-vector-databases) for the adapter values.
+
 ## 📦 Other Deployment Options
 
 ### Docker Compose

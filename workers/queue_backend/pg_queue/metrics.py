@@ -219,7 +219,8 @@ class ReaperMetrics(_Exporter):
         super().__init__()
         self._function_gauge(
             "pg_reaper_heartbeat_age_seconds",
-            "Seconds since the reaper tick loop last ran (liveness heartbeat)",
+            "Seconds since the reaper last completed required lease/recovery "
+            "work (liveness heartbeat)",
             heartbeat_fn,
         )
         self._function_gauge(
@@ -306,7 +307,8 @@ class ReaperMetrics(_Exporter):
         self.tick_failures = Counter(
             "pg_reaper_tick_failures_total",
             "Reaper cycles that raised (recovery/scheduler SELECT failures — the "
-            "heartbeat stays fresh through these, so alert on this counter)",
+            "dependency heartbeat becomes stale after repeated failures; alert on "
+            "this counter too)",
             registry=self.registry,
         )
         self.gauge_refresh_failures = Counter(

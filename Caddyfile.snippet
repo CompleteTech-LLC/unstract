@@ -1,0 +1,26 @@
+(etl_home_access_log) {
+    log {
+        level INFO
+        format json
+        output file /var/log/caddy/etl-home-access.jsonl {
+            roll_size 50MiB
+            roll_keep 14
+            roll_keep_for 336h
+        }
+    }
+}
+
+etl.home.complete.tech:80 {
+    redir https://etl.home.complete.tech{uri} permanent
+}
+
+etl.home.complete.tech:443 {
+    import etl_home_access_log
+    tls /certs/fullchain.pem /certs/privkey.pem
+
+    reverse_proxy 172.30.88.1:13110 {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto https
+        header_up X-Forwarded-Host {host}
+    }
+}
