@@ -46,6 +46,46 @@ def test_probe_script_is_valid_posix_shell() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_wait_for_child_reaps_timeout_wrapper() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    function_start = source.index("wait_for_child() {")
+    function_end = source.index("\n}\n", function_start) + 3
+    function = source[function_start:function_end]
+
+    # The timeout command already bounds the client.  The shell must wait for
+    # that exact child rather than polling kill(0), which treats BusyBox
+    # zombies as live and leaks one unreaped timeout per health run.
+    assert 'wait "$wait_for_child_pid"' in function
+    assert "kill -0" not in function
+    assert "sleep" not in function
+
+
+def test_successful_probe_reaps_early_timeout_wrapper(tmp_path: Path) -> None:
+    timeout_pid = tmp_path / "timeout.pid"
+    timeout = write_fake(
+        tmp_path,
+        "timeout",
+        f'''
+if [ "$1" = "-s" ] && [ "$2" = "KILL" ]; then
+    shift 2
+fi
+printf "%s" "$$" > "{timeout_pid}"
+shift
+"$@"
+''',
+    )
+    redis_cli = write_fake(tmp_path, "redis-cli", 'printf "PONG\\n"')
+
+    result = run_probe(
+        "redis",
+        {"TIMEOUT_BIN": str(timeout), "REDIS_CLI_BIN": str(redis_cli)},
+    )
+    assert result.returncode == 0, result.stderr
+    child_pid = int(timeout_pid.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+
+
 def test_weaviate_requires_metadata_and_ready_status(tmp_path: Path) -> None:
     wget = write_fake(
         tmp_path,
@@ -81,7 +121,14 @@ def test_timeout_configuration_is_capped(tmp_path: Path) -> None:
     timeout = write_fake(
         tmp_path,
         "timeout",
-        f'printf "%s" "$1" > "{timeout_record}"; shift; "$@"',
+        f'''
+if [ "$1" = "-s" ] && [ "$2" = "KILL" ]; then
+    shift 2
+fi
+printf "%s" "$1" > "{timeout_record}"
+shift
+"$@"
+''',
     )
     redis_cli = write_fake(tmp_path, "redis-cli", 'printf "PONG\\n"')
     result = run_probe(
@@ -94,6 +141,24 @@ def test_timeout_configuration_is_capped(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert timeout_record.read_text(encoding="utf-8") == "30"
+
+
+def test_native_probe_hard_deadline_kills_term_ignoring_client(tmp_path: Path) -> None:
+    redis_cli = write_fake(
+        tmp_path,
+        "redis-cli",
+        'trap "" TERM\nwhile :; do :; done',
+    )
+    started = time.monotonic()
+    result = run_probe(
+        "redis",
+        {
+            "REDIS_CLI_BIN": str(redis_cli),
+            "HEALTHCHECK_TIMEOUT_SECONDS": "1",
+        },
+    )
+    assert result.returncode != 0
+    assert time.monotonic() - started < 3
 
 
 def test_redis_response_and_total_deadline_are_bounded(tmp_path: Path) -> None:

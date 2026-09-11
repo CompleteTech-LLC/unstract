@@ -62,6 +62,9 @@ rabbitmq_diagnostics_bin=${RABBITMQ_DIAGNOSTICS_BIN:-rabbitmq-diagnostics}
 pg_isready_bin=${PG_ISREADY_BIN:-pg_isready}
 psql_bin=${PSQL_BIN:-psql}
 
+# Use an uncatchable deadline signal. The default TERM signal can be ignored by
+# a client, leaving the timeout wrapper alive while wait_for_child waits for it;
+# GNU and BusyBox timeout both support the portable `-s KILL` form.
 # The timeout wrapper starts client commands in their own process group on the
 # supported GNU and BusyBox implementations.  A healthcheck can be signalled
 # while its shell is waiting for that wrapper; terminate both the group and
@@ -77,25 +80,13 @@ terminate_process_group() {
     kill -KILL "$terminate_process_pid" >/dev/null 2>&1 || :
 }
 
-# A trapped signal can remain pending while a POSIX shell is blocked in a
-# foreground `wait`. Poll the child instead, so the shell gets a chance to run
-# its cleanup trap between short sleeps. The final wait only runs after the
-# child has exited and is therefore bounded even when a healthcheck is
-# terminated while its client owns one of the capture FIFOs.
+# The timeout wrapper owns the client deadline, so waiting for that wrapper is
+# bounded by the same deadline and, crucially, reaps it in this shell. Do not
+# poll with `kill -0`: on BusyBox, a child that has exited but is still a
+# zombie continues to satisfy `kill -0`, which can discard its PID without a
+# wait and leak one zombie on every health invocation.
 wait_for_child() {
     wait_for_child_pid=$1
-    wait_for_child_ticks=0
-    wait_for_child_limit=$((timeout_seconds * 20 + 40))
-    while kill -0 "$wait_for_child_pid" >/dev/null 2>&1; do
-        wait_for_child_ticks=$((wait_for_child_ticks + 1))
-        if [ "$wait_for_child_ticks" -ge "$wait_for_child_limit" ]; then
-            terminate_process_group "$wait_for_child_pid"
-            return 124
-        fi
-        # GNU and BusyBox sleep both support sub-second intervals; keeping the
-        # interval short bounds signal latency without a busy loop.
-        sleep 0.05
-    done
     wait "$wait_for_child_pid"
 }
 
@@ -170,7 +161,7 @@ bounded_wget() {
     bounded_wget_body_reader_pid=$!
     "$head_bin" -c 16385 <"$bounded_wget_header_fifo" >"$bounded_wget_headers" &
     bounded_wget_header_reader_pid=$!
-    "$timeout_bin" "$timeout_seconds" "$wget_bin" -qS -O- -t 1 -T "$timeout_seconds" "$bounded_wget_url" \
+    "$timeout_bin" -s KILL "$timeout_seconds" "$wget_bin" -qS -O- -t 1 -T "$timeout_seconds" "$bounded_wget_url" \
         >"$bounded_wget_body_fifo" 2>"$bounded_wget_header_fifo" &
     bounded_wget_client_pid=$!
     if wait_for_child "$bounded_wget_client_pid"; then
@@ -261,7 +252,7 @@ bounded_curl() {
     "$mkfifo_bin" "$bounded_curl_body_fifo" >/dev/null 2>&1 || return 1
     "$head_bin" -c "$((bounded_curl_limit + 1))" <"$bounded_curl_body_fifo" >"$bounded_curl_body_file" &
     bounded_curl_body_reader_pid=$!
-    "$timeout_bin" "$timeout_seconds" "$curl_bin" -fsS --location --max-redirs 0 --max-filesize "$bounded_curl_limit" \
+    "$timeout_bin" -s KILL "$timeout_seconds" "$curl_bin" -fsS --location --max-redirs 0 --max-filesize "$bounded_curl_limit" \
         --max-time "$timeout_seconds" "$bounded_curl_url" >"$bounded_curl_body_fifo" &
     bounded_curl_client_pid=$!
     if wait_for_child "$bounded_curl_client_pid"; then
@@ -354,7 +345,7 @@ bounded_exec() {
     "$head_bin" -c "$((bounded_exec_limit + 1))" <"$bounded_exec_body_fifo" \
         >"$bounded_exec_body_file" &
     bounded_exec_reader_pid=$!
-    "$timeout_bin" "$timeout_seconds" "$@" >"$bounded_exec_body_fifo" 2>/dev/null &
+    "$timeout_bin" -s KILL "$timeout_seconds" "$@" >"$bounded_exec_body_fifo" 2>/dev/null &
     bounded_exec_client_pid=$!
     if wait_for_child "$bounded_exec_client_pid"; then
         bounded_exec_status=0
@@ -405,7 +396,7 @@ probe_vector_db() {
     # The Qdrant image does not ship curl/wget. Its Debian base does ship Bash,
     # so use Bash's TCP client to exercise the real REST health endpoint. The
     # response is bounded and matched on both HTTP status and body semantics.
-    "$timeout_bin" "$timeout_seconds" "$qdrant_bash_bin" -ec '
+    "$timeout_bin" -s KILL "$timeout_seconds" "$qdrant_bash_bin" -ec '
         host=$1
         port=$2
         case "$host" in
@@ -451,8 +442,8 @@ probe_proxy() {
 }
 
 probe_rabbitmq() {
-    "$timeout_bin" "$timeout_seconds" "$rabbitmq_diagnostics_bin" -q check_running >/dev/null 2>&1 || fail
-    "$timeout_bin" "$timeout_seconds" "$rabbitmq_diagnostics_bin" -q check_local_alarms >/dev/null 2>&1 || fail
+    "$timeout_bin" -s KILL "$timeout_seconds" "$rabbitmq_diagnostics_bin" -q check_running >/dev/null 2>&1 || fail
+    "$timeout_bin" -s KILL "$timeout_seconds" "$rabbitmq_diagnostics_bin" -q check_local_alarms >/dev/null 2>&1 || fail
 }
 
 probe_minio() {
@@ -466,7 +457,7 @@ probe_minio() {
 probe_db() {
     db_user=${POSTGRES_USER:-postgres}
     db_name=${POSTGRES_DB:-postgres}
-    "$timeout_bin" "$timeout_seconds" "$pg_isready_bin" -t "$timeout_seconds" -U "$db_user" -d "$db_name" >/dev/null 2>&1 || fail
+    "$timeout_bin" -s KILL "$timeout_seconds" "$pg_isready_bin" -t "$timeout_seconds" -U "$db_user" -d "$db_name" >/dev/null 2>&1 || fail
     bounded_exec 16 "$psql_bin" -XAtqc 'SELECT 1' -U "$db_user" -d "$db_name" || fail
     result=$("$head_bin" -c 16 "$bounded_exec_result_file") || {
         bounded_exec_finish
@@ -479,7 +470,7 @@ probe_db() {
 probe_python_body() {
     url=$1
     expected=$2
-    "$timeout_bin" "$timeout_seconds" "$python_bin" -c '
+    "$timeout_bin" -s KILL "$timeout_seconds" "$python_bin" -c '
 import sys
 import urllib.request
 
@@ -506,7 +497,7 @@ probe_platform() {
 }
 
 probe_backend() {
-    "$timeout_bin" "$timeout_seconds" "$python_bin" -c '
+    "$timeout_bin" -s KILL "$timeout_seconds" "$python_bin" -c '
 import json
 import os
 import sys
