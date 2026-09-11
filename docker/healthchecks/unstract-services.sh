@@ -77,25 +77,13 @@ terminate_process_group() {
     kill -KILL "$terminate_process_pid" >/dev/null 2>&1 || :
 }
 
-# A trapped signal can remain pending while a POSIX shell is blocked in a
-# foreground `wait`. Poll the child instead, so the shell gets a chance to run
-# its cleanup trap between short sleeps. The final wait only runs after the
-# child has exited and is therefore bounded even when a healthcheck is
-# terminated while its client owns one of the capture FIFOs.
+# The timeout wrapper owns the client deadline, so waiting for that wrapper is
+# bounded by the same deadline and, crucially, reaps it in this shell. Do not
+# poll with `kill -0`: on BusyBox, a child that has exited but is still a
+# zombie continues to satisfy `kill -0`, which can discard its PID without a
+# wait and leak one zombie on every health invocation.
 wait_for_child() {
     wait_for_child_pid=$1
-    wait_for_child_ticks=0
-    wait_for_child_limit=$((timeout_seconds * 20 + 40))
-    while kill -0 "$wait_for_child_pid" >/dev/null 2>&1; do
-        wait_for_child_ticks=$((wait_for_child_ticks + 1))
-        if [ "$wait_for_child_ticks" -ge "$wait_for_child_limit" ]; then
-            terminate_process_group "$wait_for_child_pid"
-            return 124
-        fi
-        # GNU and BusyBox sleep both support sub-second intervals; keeping the
-        # interval short bounds signal latency without a busy loop.
-        sleep 0.05
-    done
     wait "$wait_for_child_pid"
 }
 

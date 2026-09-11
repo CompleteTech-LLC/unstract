@@ -46,6 +46,39 @@ def test_probe_script_is_valid_posix_shell() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_wait_for_child_reaps_timeout_wrapper() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    function_start = source.index("wait_for_child() {")
+    function_end = source.index("\n}\n", function_start) + 3
+    function = source[function_start:function_end]
+
+    # The timeout command already bounds the client.  The shell must wait for
+    # that exact child rather than polling kill(0), which treats BusyBox
+    # zombies as live and leaks one unreaped timeout per health run.
+    assert 'wait "$wait_for_child_pid"' in function
+    assert "kill -0" not in function
+    assert "sleep" not in function
+
+
+def test_successful_probe_reaps_early_timeout_wrapper(tmp_path: Path) -> None:
+    timeout_pid = tmp_path / "timeout.pid"
+    timeout = write_fake(
+        tmp_path,
+        "timeout",
+        f'printf "%s" "$$" > "{timeout_pid}"; shift; "$@"',
+    )
+    redis_cli = write_fake(tmp_path, "redis-cli", 'printf "PONG\\n"')
+
+    result = run_probe(
+        "redis",
+        {"TIMEOUT_BIN": str(timeout), "REDIS_CLI_BIN": str(redis_cli)},
+    )
+    assert result.returncode == 0, result.stderr
+    child_pid = int(timeout_pid.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+
+
 def test_weaviate_requires_metadata_and_ready_status(tmp_path: Path) -> None:
     wget = write_fake(
         tmp_path,
