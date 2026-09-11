@@ -65,7 +65,14 @@ def test_successful_probe_reaps_early_timeout_wrapper(tmp_path: Path) -> None:
     timeout = write_fake(
         tmp_path,
         "timeout",
-        f'printf "%s" "$$" > "{timeout_pid}"; shift; "$@"',
+        f'''
+if [ "$1" = "-s" ] && [ "$2" = "KILL" ]; then
+    shift 2
+fi
+printf "%s" "$$" > "{timeout_pid}"
+shift
+"$@"
+''',
     )
     redis_cli = write_fake(tmp_path, "redis-cli", 'printf "PONG\\n"')
 
@@ -114,7 +121,14 @@ def test_timeout_configuration_is_capped(tmp_path: Path) -> None:
     timeout = write_fake(
         tmp_path,
         "timeout",
-        f'printf "%s" "$1" > "{timeout_record}"; shift; "$@"',
+        f'''
+if [ "$1" = "-s" ] && [ "$2" = "KILL" ]; then
+    shift 2
+fi
+printf "%s" "$1" > "{timeout_record}"
+shift
+"$@"
+''',
     )
     redis_cli = write_fake(tmp_path, "redis-cli", 'printf "PONG\\n"')
     result = run_probe(
@@ -127,6 +141,24 @@ def test_timeout_configuration_is_capped(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert timeout_record.read_text(encoding="utf-8") == "30"
+
+
+def test_native_probe_hard_deadline_kills_term_ignoring_client(tmp_path: Path) -> None:
+    redis_cli = write_fake(
+        tmp_path,
+        "redis-cli",
+        'trap "" TERM\nwhile :; do :; done',
+    )
+    started = time.monotonic()
+    result = run_probe(
+        "redis",
+        {
+            "REDIS_CLI_BIN": str(redis_cli),
+            "HEALTHCHECK_TIMEOUT_SECONDS": "1",
+        },
+    )
+    assert result.returncode != 0
+    assert time.monotonic() - started < 3
 
 
 def test_redis_response_and_total_deadline_are_bounded(tmp_path: Path) -> None:
