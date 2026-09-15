@@ -697,7 +697,10 @@ class TestPollHeartbeat:
 
         from queue_backend.pg_queue.consumer import LivenessServer
 
-        consumer = PgQueueConsumer(["q"], client=MagicMock())
+        client = MagicMock()
+        client.read.return_value = []
+        consumer = PgQueueConsumer(["q"], client=client)
+        consumer.poll_once()  # readiness requires one completed PG read
         server = LivenessServer(consumer, port=0, stale_after=60)
         server.start()
         try:
@@ -707,6 +710,7 @@ class TestPollHeartbeat:
                 assert json.loads(resp.read())["status"] == "healthy"
 
             consumer._last_poll_monotonic -= 120  # force the loop stale
+            consumer._dependency_health._last_success -= 120  # force PG age stale
             with pytest.raises(urllib.error.HTTPError) as ei:
                 urllib.request.urlopen(url, timeout=5)
             assert ei.value.code == 503
@@ -723,7 +727,10 @@ class TestPollHeartbeat:
 
         from queue_backend.pg_queue.consumer import LivenessServer
 
-        consumer = PgQueueConsumer(["q"], client=MagicMock())
+        client = MagicMock()
+        client.read.return_value = []
+        consumer = PgQueueConsumer(["q"], client=client)
+        consumer.poll_once()  # readiness requires one completed PG read
         server = LivenessServer(consumer, port=0, stale_after=60)
         server.start()
         try:

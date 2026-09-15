@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import Enum
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import psutil
@@ -40,6 +40,91 @@ class HealthCheckResult:
     details: dict[str, Any] | None = None
     execution_time: float | None = None
     timestamp: datetime | None = None
+
+
+class WorkerHeartbeat:
+    """Readiness state bound to a real Celery worker heartbeat.
+
+    A worker process can remain alive after its broker connection is gone. This
+    state is marked ready only by the ``worker_ready`` signal and refreshed by
+    Celery's ``heartbeat_sent`` signal, so the HTTP endpoint cannot turn process
+    existence or merely constructed client configuration into readiness.
+    """
+
+    def __init__(self, stale_after_seconds: float) -> None:
+        if stale_after_seconds <= 0:
+            raise ValueError("stale_after_seconds must be positive")
+        self._stale_after_seconds = stale_after_seconds
+        self._lock = threading.Lock()
+        self._ready = False
+        self._stopped = False
+        self._last_heartbeat: float | None = None
+
+    def mark_ready(self) -> None:
+        with self._lock:
+            self._ready = True
+            self._stopped = False
+            # worker_ready follows the broker connection handshake. Treat it as
+            # the first heartbeat so the endpoint is useful immediately while
+            # subsequent heartbeat_sent signals continue to refresh freshness.
+            self._last_heartbeat = time.monotonic()
+
+    def mark_heartbeat(self) -> None:
+        with self._lock:
+            if self._ready and not self._stopped:
+                self._last_heartbeat = time.monotonic()
+
+    def mark_stopped(self) -> None:
+        with self._lock:
+            self._stopped = True
+
+    def check(self) -> HealthCheckResult:
+        with self._lock:
+            ready = self._ready
+            stopped = self._stopped
+            last_heartbeat = self._last_heartbeat
+
+        now = time.monotonic()
+        age = None if last_heartbeat is None else max(0.0, now - last_heartbeat)
+        details: dict[str, Any] = {
+            "ready": ready,
+            "stopped": stopped,
+            "stale_after_seconds": self._stale_after_seconds,
+        }
+        if age is not None:
+            details["heartbeat_age_seconds"] = round(age, 3)
+
+        if stopped:
+            return HealthCheckResult(
+                name="worker_heartbeat",
+                status=HealthStatus.UNHEALTHY,
+                message="Worker shutdown has started",
+                details=details,
+                timestamp=datetime.now(UTC),
+            )
+        if not ready or age is None:
+            return HealthCheckResult(
+                name="worker_heartbeat",
+                status=HealthStatus.UNHEALTHY,
+                message="Worker broker readiness has not been established",
+                details=details,
+                timestamp=datetime.now(UTC),
+            )
+        if age > self._stale_after_seconds:
+            return HealthCheckResult(
+                name="worker_heartbeat",
+                status=HealthStatus.UNHEALTHY,
+                message="Worker heartbeat is stale",
+                details=details,
+                timestamp=datetime.now(UTC),
+            )
+        return HealthCheckResult(
+            name="worker_heartbeat",
+            status=HealthStatus.HEALTHY,
+            message="Worker broker heartbeat is fresh",
+            details=details,
+            timestamp=datetime.now(UTC),
+        )
 
 
 @dataclass
@@ -102,25 +187,44 @@ class HealthChecker:
         start_time = time.time()
 
         try:
+            # This check is intentionally configuration-only. A health GET must
+            # not publish work or invoke an unknown application endpoint, but it
+            # must still reject a worker that has no internal API target/key.
+            api_base_url = getattr(self.config, "internal_api_base_url", "")
+            api_key = getattr(self.config, "internal_api_key", "")
+            if not api_base_url or not api_key:
+                return HealthCheckResult(
+                    name="api_connectivity",
+                    status=HealthStatus.UNHEALTHY,
+                    message="Internal API configuration is incomplete",
+                    details={
+                        "base_url_configured": bool(api_base_url),
+                        "service_key_configured": bool(api_key),
+                    },
+                    execution_time=time.time() - start_time,
+                    timestamp=datetime.now(UTC),
+                )
+
             if not self.api_client:
-                # Use singleton API client to reduce initialization noise
-                from .api_client_singleton import get_singleton_api_client
+                # Use singleton API client to reduce initialization noise. This
+                # only constructs the local client; no task-producing API call is
+                # made by the health endpoint.
+                from ...utils.api_client_singleton import get_singleton_api_client
 
                 self.api_client = get_singleton_api_client(self.config)
 
-            # Simply check if API client can be configured properly
-            # Avoid making actual API calls that might hit non-existent endpoints
             execution_time = time.time() - start_time
 
-            # If we can create the client without errors, consider API connectivity healthy
+            # Client construction proves only that local configuration can be
+            # parsed; the broker heartbeat and task-specific checks provide the
+            # runtime readiness signal without making a task-producing request.
             return HealthCheckResult(
                 name="api_connectivity",
                 status=HealthStatus.HEALTHY,
                 message="API client configuration successful",
                 details={
-                    "api_base_url": getattr(
-                        self.config, "internal_api_base_url", "unknown"
-                    )
+                    "base_url_configured": True,
+                    "service_key_configured": True,
                 },
                 execution_time=execution_time,
                 timestamp=datetime.now(UTC),
@@ -131,8 +235,8 @@ class HealthChecker:
             return HealthCheckResult(
                 name="api_connectivity",
                 status=HealthStatus.UNHEALTHY,
-                message=f"API request failed: {str(e)}",
-                details={"error": str(e)},
+                message="API client configuration failed",
+                details={"error": type(e).__name__},
                 execution_time=execution_time,
                 timestamp=datetime.now(UTC),
             )
@@ -141,8 +245,8 @@ class HealthChecker:
             return HealthCheckResult(
                 name="api_connectivity",
                 status=HealthStatus.UNHEALTHY,
-                message=f"Unexpected error: {str(e)}",
-                details={"error": str(e)},
+                message="API client configuration failed",
+                details={"error": type(e).__name__},
                 execution_time=execution_time,
                 timestamp=datetime.now(UTC),
             )
@@ -206,8 +310,8 @@ class HealthChecker:
             return HealthCheckResult(
                 name="system_resources",
                 status=HealthStatus.UNHEALTHY,
-                message=f"Failed to check system resources: {str(e)}",
-                details={"error": str(e)},
+                message="Failed to check system resources",
+                details={"error": type(e).__name__},
                 execution_time=execution_time,
                 timestamp=datetime.now(UTC),
             )
@@ -255,8 +359,8 @@ class HealthChecker:
             return HealthCheckResult(
                 name="worker_process",
                 status=HealthStatus.UNHEALTHY,
-                message=f"Failed to check worker process: {str(e)}",
-                details={"error": str(e)},
+                message="Failed to check worker process",
+                details={"error": type(e).__name__},
                 execution_time=execution_time,
                 timestamp=datetime.now(UTC),
             )
@@ -286,8 +390,8 @@ class HealthChecker:
                     HealthCheckResult(
                         name=name,
                         status=HealthStatus.UNHEALTHY,
-                        message=f"Custom check failed: {str(e)}",
-                        details={"error": str(e)},
+                        message="Custom check failed",
+                        details={"error": type(e).__name__},
                         timestamp=datetime.now(UTC),
                     )
                 )
@@ -387,6 +491,12 @@ class HealthHTTPHandler(BaseHTTPRequestHandler):
         self.health_checker = health_checker
         super().__init__(*args, **kwargs)
 
+    def setup(self) -> None:
+        super().setup()
+        # A client that opens a health connection and then stops sending must
+        # not consume the only server thread or keep shutdown waiting forever.
+        self.connection.settimeout(2.0)
+
     def do_GET(self):
         """Handle GET requests."""
         try:
@@ -425,18 +535,25 @@ class HealthHTTPHandler(BaseHTTPRequestHandler):
                 self._send_json_response({"error": "Not found"}, 404)
 
         except Exception as e:
-            logger.error(f"Health check endpoint error: {e}")
+            logger.error("Health check endpoint error: %s", type(e).__name__)
             self._send_json_response(
-                {"error": "Internal server error", "detail": str(e)}, 500
+                {"error": "Internal server error", "detail": type(e).__name__}, 500
             )
 
     def _send_json_response(self, data: dict[str, Any], status_code: int):
         """Send JSON response."""
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
         response_data = json.dumps(data, default=str, indent=2)
-        self.wfile.write(response_data.encode("utf-8"))
+        body = response_data.encode("utf-8")
+        try:
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            # Probe clients may disappear after a timeout. This is not a
+            # server failure and should not produce a secondary traceback.
+            pass
 
     def log_message(self, format, *args):
         """Override to suppress routine health check request logs."""
@@ -466,7 +583,9 @@ class HealthServer:
             def handler_factory(*args, **kwargs):
                 return HealthHTTPHandler(self.health_checker, *args, **kwargs)
 
-            self.server = HTTPServer(("0.0.0.0", self.port), handler_factory)
+            self.server = ThreadingHTTPServer(("0.0.0.0", self.port), handler_factory)
+            self.server.daemon_threads = True
+            self.server.block_on_close = False
 
             # Start server in background thread
             self.server_thread = threading.Thread(
@@ -477,7 +596,9 @@ class HealthServer:
             logger.debug(f"Health check server started on port {self.port}")
 
         except Exception as e:
-            logger.error(f"Failed to start health check server: {e}")
+            logger.error(
+                "Failed to start health check server: %s", type(e).__name__
+            )
             raise
 
     def stop(self):

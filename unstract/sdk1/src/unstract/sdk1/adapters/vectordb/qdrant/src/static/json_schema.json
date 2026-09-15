@@ -1,5 +1,6 @@
 {
   "title": "Qdrant Vector DB",
+  "description": "Local Docker defaults are pre-filled for the bundled Qdrant service. Replace them when connecting to another Qdrant server.",
   "type": "object",
   "required": [
     "adapter_name",
@@ -9,12 +10,13 @@
     "adapter_name": {
       "type": "string",
       "title": "Name",
-      "default": "",
+      "default": "qdrant-local",
       "description": "Provide a unique name for this adapter instance. Example: qdrant-vdb-1"
     },
     "url": {
       "type": "string",
       "title": "URL",
+      "default": "http://qdrant:6333",
       "pattern": "(http|https)?[\\w\\d\\-\\.:]+"
     },
     "api_key": {

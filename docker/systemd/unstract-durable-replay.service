@@ -1,0 +1,24 @@
+[Unit]
+Description=Guarded durable Unstract Compose replay
+Documentation=file:%h/.local/libexec/unstract-durable-replay.py
+Wants=network-online.target podman.socket
+Requires=train-rootless-boot-recovery.service
+After=network-online.target podman.socket train-rootless-boot-recovery.service
+Before=podman-restart.service
+# A restart of the generic owner must stop this settled oneshot first. Its
+# Requires edge in the podman-restart drop-in then schedules a fresh replay in
+# the same restart transaction instead of reusing RemainAfterExit state.
+PartOf=podman-restart.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=%h/.config/unstract/durable-replay.env
+ExecStart=/usr/bin/python3 %h/.local/libexec/unstract-durable-replay.py
+# Compose can wait on database and health transitions; do not let the user
+# manager kill the guarded replay while it is within its own deadline.
+TimeoutStartSec=2700
+KillMode=process
+
+[Install]
+WantedBy=default.target

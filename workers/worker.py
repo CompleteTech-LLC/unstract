@@ -7,6 +7,7 @@ It uses WorkerBuilder to ensure proper configuration including chord retry setti
 
 import importlib.util
 import logging
+import math
 import os
 import sys
 import threading
@@ -28,6 +29,7 @@ from shared.api.internal_client import InternalAPIClient  # noqa: E402
 from shared.enums.worker_enums import WorkerType  # noqa: E402
 from shared.infrastructure import initialize_worker_infrastructure  # noqa: E402
 from shared.infrastructure.config.builder import WorkerBuilder  # noqa: E402
+from shared.infrastructure.monitoring.health import WorkerHeartbeat  # noqa: E402
 from shared.models.worker_models import get_celery_setting  # noqa: E402
 from shared.patterns.factory.client_factory import ClientFactory  # noqa: E402
 
@@ -532,6 +534,57 @@ if not any(not name.startswith("celery.") for name in app.tasks):
             f"{_empty_registry_msg} The worker would start but process nothing — "
             "check the worker task registration."
         )
+
+
+def _worker_health_stale_seconds() -> float:
+    """Resolve the broker-heartbeat freshness bound from deployment settings."""
+    default = max(30.0, float(config.health_check_interval * 3))
+    raw = os.getenv("WORKER_HEALTH_STALE_SECONDS")
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"WORKER_HEALTH_STALE_SECONDS={raw!r} is not numeric") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"WORKER_HEALTH_STALE_SECONDS={value} must be positive")
+    return value
+
+
+# The generic HealthServer was previously only constructed by the unused builder
+# convenience path. Wire it to the actual Celery lifecycle here, after task loading
+# has registered all worker-specific checks. The server starts only after
+# worker_ready, so an importing process or a pre-broker worker cannot report green.
+_worker_heartbeat = WorkerHeartbeat(_worker_health_stale_seconds())
+_worker_health_checker, _worker_health_server = WorkerBuilder.setup_health_monitoring(
+    worker_type, config
+)
+_worker_health_checker.add_custom_check("worker_heartbeat", _worker_heartbeat.check)
+
+
+@signals.worker_ready.connect
+def on_worker_ready(**_kwargs):
+    """Start the probe after Celery has completed its broker readiness handshake."""
+    _worker_heartbeat.mark_ready()
+    try:
+        _worker_health_server.start()
+    except OSError:
+        # A health bind failure must be visible as probe absence, but must not
+        # kill a worker that can still drain its queue.
+        logger.exception("Worker health server could not bind; continuing without it")
+
+
+@signals.heartbeat_sent.connect
+def on_heartbeat_sent(**_kwargs):
+    """Refresh the readiness signal only when Celery emits a broker heartbeat."""
+    _worker_heartbeat.mark_heartbeat()
+
+
+@signals.worker_shutdown.connect
+def on_worker_shutdown(**_kwargs):
+    """Stop the local endpoint before the worker process exits."""
+    _worker_heartbeat.mark_stopped()
+    _worker_health_server.stop()
 
 # Log successful configuration
 logger.info(f"✅ Successfully loaded {worker_type} worker using WorkerBuilder")

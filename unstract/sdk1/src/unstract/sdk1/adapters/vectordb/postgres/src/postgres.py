@@ -6,6 +6,7 @@ from urllib.parse import quote_plus
 
 import psycopg2
 from llama_index.vector_stores.postgres import PGVectorStore
+
 from unstract.sdk1.adapters.exceptions import AdapterError
 from unstract.sdk1.adapters.vectordb.constants import VectorDbConstants
 from unstract.sdk1.adapters.vectordb.helper import VectorDBHelper
@@ -81,20 +82,31 @@ class Postgres(VectorDBAdapter):
                 Constants.SCHEMA,
                 VectorDbConstants.DEFAULT_VECTOR_DB_NAME,
             )
+            ssl_mode = (
+                "require"
+                if self._config.get(Constants.ENABLE_SSL, True)
+                else "disable"
+            )
+            connection_suffix = f"?sslmode={ssl_mode}"
+            connection_string = (
+                f"postgresql+psycopg2://"
+                f"{self._config.get(Constants.USER)}:{encoded_password}"
+                f"@{self._config.get(Constants.HOST)}:{self._config.get(Constants.PORT)}"
+                f"/{self._config.get(Constants.DATABASE)}{connection_suffix}"
+            )
+            async_connection_string = (
+                f"postgresql+asyncpg://"
+                f"{self._config.get(Constants.USER)}:{encoded_password}"
+                f"@{self._config.get(Constants.HOST)}:{self._config.get(Constants.PORT)}"
+                f"/{self._config.get(Constants.DATABASE)}{connection_suffix}"
+            )
             vector_db: BasePydanticVectorStore = PGVectorStore.from_params(
-                database=self._config.get(Constants.DATABASE),
+                connection_string=connection_string,
+                async_connection_string=async_connection_string,
                 schema_name=self._schema_name,
-                host=self._config.get(Constants.HOST),
-                password=encoded_password,
-                port=str(self._config.get(Constants.PORT)),
-                user=self._config.get(Constants.USER),
                 table_name=self._collection_name,
                 embed_dim=dimension,
             )
-            if self._config.get(Constants.ENABLE_SSL, True):
-                ssl_mode = "require"
-            else:
-                ssl_mode = "disable"
             self._client = psycopg2.connect(
                 database=self._config.get(Constants.DATABASE),
                 host=self._config.get(Constants.HOST),

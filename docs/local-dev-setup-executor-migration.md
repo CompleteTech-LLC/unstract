@@ -364,6 +364,11 @@ cd workers && ./run-worker.sh all
 | MinIO S3 API | 9000 | http://localhost:9000 |
 | MinIO Console | 9001 | http://localhost:9001 (minio/minio123) |
 | Qdrant | 6333 | http://localhost:6333 |
+| Postgres vector DB | 5433 | `psql -h localhost -p 5433 -U unstract_dev -d unstract_db` |
+| Weaviate HTTP API | 8084 | http://localhost:8084 |
+| Weaviate gRPC API | 50051 | localhost:50051 |
+| Milvus client API | 19530 | http://localhost:19530 |
+| Milvus WebUI | 9091 | http://localhost:9091/webui/ |
 | Traefik Dashboard | 8080 | http://localhost:8080 |
 
 ### Application

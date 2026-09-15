@@ -1185,6 +1185,7 @@ class TestLivenessServer:
         reaper = PgReaper(
             _FakeLease(acquires=False), interval_seconds=0.01, sweep_conn=object()
         )
+        reaper.tick()  # readiness requires one completed lease operation
         server = self._server(reaper)
         try:
             status, body = _http_get(server)
@@ -1194,6 +1195,8 @@ class TestLivenessServer:
         assert body["status"] == "healthy"
         assert body["check"] == "pg_reaper_tick"
         assert body["is_leader"] is False
+        assert "seconds_since_dependency_progress" in body
+        assert "seconds_since_last_tick" in body
 
     def test_stale_returns_503(self):
         reaper = PgReaper(_FakeLease(), interval_seconds=0.01, sweep_conn=object())
@@ -1272,7 +1275,7 @@ class TestHealthEnv:
         monkeypatch.setenv("WORKER_PG_REAPER_HEALTH_STALE_SECONDS", "10")
         assert reaper_mod._reaper_health_stale_from_env() == pytest.approx(10.0)
 
-    @pytest.mark.parametrize("bad", ["0", "-1", "x"])
+    @pytest.mark.parametrize("bad", ["0", "-1", "x", "nan", "inf", "-inf"])
     def test_stale_invalid_raises(self, monkeypatch, bad):
         monkeypatch.setenv("WORKER_PG_REAPER_HEALTH_STALE_SECONDS", bad)
         with pytest.raises(ValueError):

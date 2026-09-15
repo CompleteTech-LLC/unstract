@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import os
 import signal
 import threading
@@ -68,6 +69,7 @@ from unstract.core.data_models import ExecutionStatus, QueueMessageState
 from ..barrier import barrier_stuck_timeout_seconds
 from .connection import create_pg_connection
 from .leader_election import LeaderLease, default_worker_id
+from .liveness import DependencyHeartbeat
 from .liveness import LivenessServer as _BaseLivenessServer
 from .metrics import ReaperMetrics
 from .pg_scheduler import dispatch_due_periodic_tasks, dispatch_due_schedules
@@ -1147,11 +1149,20 @@ class PgReaper:
         # standby tick counts as progress too (the loop is alive), so this tracks
         # loop liveness, not leadership.
         self._last_tick_monotonic = time.monotonic()
+        # A tick timestamp alone can stay fresh through an unavailable DB or
+        # lease. This tracker is advanced only after the lease operation and
+        # required leader work complete successfully.
+        self._dependency_health = DependencyHeartbeat()
+        self._tick_health_failed = False
         # Queue-wide metrics snapshot cadence (same None-sentinel pattern as the
         # sweep gate: first leader tick refreshes immediately).
         self._last_gauge_refresh_monotonic: float | None = None
         self._metrics = ReaperMetrics(
-            heartbeat_fn=self.seconds_since_last_tick,
+            # Export the same dependency-aware age used by /health. The loop
+            # start timestamp remains useful for diagnostics, but publishing it
+            # here would let /metrics report fresh while /health is stale after
+            # repeated lease/DB failures.
+            heartbeat_fn=self.seconds_since_dependency_progress,
             is_leader_fn=lambda: self._is_leader,
         )
 
@@ -1168,6 +1179,17 @@ class PgReaper:
     def seconds_since_last_tick(self) -> float:
         """Seconds since the last tick started — the liveness heartbeat age."""
         return time.monotonic() - self._last_tick_monotonic
+
+    def seconds_since_dependency_progress(self) -> float:
+        """Age of the last successful lease/recovery cycle."""
+        return self._dependency_health.age()
+
+    def dependency_health_status(self) -> dict[str, object]:
+        """Machine-readable DB/lease state for the liveness response."""
+        return self._dependency_health.status()
+
+    def _mark_tick_health_failure(self) -> None:
+        self._tick_health_failed = True
 
     def _get_sweep_conn(self) -> PgConnection:
         # Recreate only an OWNED missing/closed connection; an injected one is the
@@ -1202,122 +1224,127 @@ class PgReaper:
 
     def tick(self) -> TickOutcome:
         """One cycle: maintain leadership, then sweep iff leader."""
-        # Heartbeat at the START of the cycle: a tick that begins but then errors
-        # still proves the loop is running (the error path is caught by run()).
+        # Record the loop start before any lease or DB work. A cycle that later
+        # blocks is stale even if the previous cycle was healthy.
         self._last_tick_monotonic = time.monotonic()
-        if self._is_leader:
+        self._dependency_health.begin()
+        self._tick_health_failed = False
+        try:
+            if self._is_leader:
+                try:
+                    still_leader = self._lease.renew()
+                except Exception:
+                    # A raised renew means leadership is unknown: stop acting
+                    # before letting it propagate.
+                    self._is_leader = False
+                    self._step_down_metrics()
+                    self._mark_tick_health_failure()
+                    raise
+                if not still_leader:
+                    logger.warning(
+                        "Reaper: lost leadership (lease taken over) — stepping "
+                        "down to standby"
+                    )
+                    self._is_leader = False
+                    self._step_down_metrics()
+            if not self._is_leader:
+                try:
+                    acquired = self._lease.try_acquire()
+                except Exception:
+                    self._mark_tick_health_failure()
+                    raise
+                if acquired:
+                    self._is_leader = True
+                    logger.info("Reaper: acquired leadership")
+            if not self._is_leader:
+                # A completed lease read still proves the DB path is alive for a
+                # standby; leadership is surfaced separately in the payload.
+                self._dependency_health.succeed()
+                return TickOutcome(was_leader=False, reclaimed=0)
+
             try:
-                still_leader = self._lease.renew()
+                reclaimed = len(
+                    recover_expired_barriers(
+                        self._get_sweep_conn(),
+                        self._get_api_client(),
+                        self._stuck_timeout_seconds,
+                        metrics=self._metrics,
+                    )
+                )
             except Exception:
-                # A raised renew == "leadership unknown": stop acting (honour the
-                # lease's documented contract) before letting it propagate.
-                self._is_leader = False
-                self._step_down_metrics()
+                self._mark_tick_health_failure()
+                self._discard_owned_sweep_conn()
                 raise
-            if not still_leader:
-                logger.warning(
-                    "Reaper: lost leadership (lease taken over) — stepping down "
-                    "to standby"
+
+            # Crash-redelivery: re-arm queue messages whose owning worker died.
+            try:
+                rearmed = rearm_expired_claims(self._get_sweep_conn())
+                if rearmed:
+                    self._metrics.queue_rearmed.inc(rearmed)
+                    logger.info(
+                        "Reaper: re-armed %s expired in-flight queue message(s) "
+                        "to 'ready' (crashed-worker redelivery)",
+                        rearmed,
+                    )
+            except Exception:
+                self._mark_tick_health_failure()
+                self._metrics.queue_rearm_failures.inc()
+                logger.exception(
+                    "Reaper: re-arm sweep failed — crashed-worker queue redelivery "
+                    "is stalled this tick (see pg_reaper_queue_rearm_failures_total)"
                 )
-                self._is_leader = False
-                self._step_down_metrics()
-        if not self._is_leader and self._lease.try_acquire():
-            self._is_leader = True
-            logger.info("Reaper: acquired leadership")
-        if not self._is_leader:
-            return TickOutcome(was_leader=False, reclaimed=0)
-        try:
-            reclaimed = len(
-                recover_expired_barriers(
-                    self._get_sweep_conn(),
-                    self._get_api_client(),
-                    self._stuck_timeout_seconds,
-                    metrics=self._metrics,
+                self._discard_owned_sweep_conn()
+                raise
+
+            # Delayed-visibility delivery: promote due scheduled rows.
+            try:
+                promoted = promote_due_scheduled(self._get_sweep_conn())
+                if promoted:
+                    self._metrics.queue_promoted.inc(promoted)
+                    logger.info(
+                        "Reaper: promoted %s due scheduled queue message(s) to "
+                        "'ready' (delayed-visibility delivery)",
+                        promoted,
+                    )
+            except Exception:
+                self._mark_tick_health_failure()
+                self._metrics.queue_promote_failures.inc()
+                logger.exception(
+                    "Reaper: promotion sweep failed — delayed messages will not "
+                    "become claimable this tick "
+                    "(see pg_reaper_queue_promote_failures_total)"
                 )
-            )
+                self._discard_owned_sweep_conn()
+                raise
+
+            # Fire due PG-owned schedules.
+            try:
+                dispatch_due_schedules(self._get_sweep_conn())
+            except Exception:
+                self._mark_tick_health_failure()
+                self._discard_owned_sweep_conn()
+                raise
+
+            # Fire non-pipeline periodics.
+            try:
+                dispatch_due_periodic_tasks(self._get_sweep_conn())
+            except Exception:
+                self._mark_tick_health_failure()
+                self._discard_owned_sweep_conn()
+                raise
+
+            # Retention and gauge sweeps are best-effort and intentionally do
+            # not gate the required lease/recovery readiness signal.
+            self._maybe_sweep()
+            self._maybe_refresh_gauges()
+            if self._tick_health_failed:
+                self._dependency_health.fail()
+            else:
+                self._dependency_health.succeed()
+            return TickOutcome(was_leader=True, reclaimed=reclaimed)
         except Exception:
-            self._discard_owned_sweep_conn()
+            self._dependency_health.fail()
             raise
-        # Crash-redelivery: re-arm queue messages whose owning worker
-        # died (state='claimed', vt expired) back to 'ready'. Runs EVERY leader tick
-        # (the redelivery cadence), like barrier recovery above and NOT the
-        # retention sweep — a crashed batch must not wait the 5-min sweep interval.
-        # Cheap (partial claimed-index scoped). On failure it increments a DEDICATED
-        # counter (so a persistent redelivery outage is distinguishable from a
-        # barrier/scheduler fault) then re-raises + discards the conn — SAME
-        # semantics as barrier recovery above (recovery work is critical, not
-        # swallow-and-continue like the retention sweeps). A re-arm fault therefore
-        # also defers this tick's schedule dispatch; both recover next tick.
-        try:
-            rearmed = rearm_expired_claims(self._get_sweep_conn())
-            if rearmed:
-                self._metrics.queue_rearmed.inc(rearmed)
-                logger.info(
-                    "Reaper: re-armed %s expired in-flight queue message(s) "
-                    "to 'ready' (crashed-worker redelivery)",
-                    rearmed,
-                )
-        except Exception:
-            self._metrics.queue_rearm_failures.inc()
-            logger.exception(
-                "Reaper: re-arm sweep failed — crashed-worker queue redelivery "
-                "is stalled this tick (see pg_reaper_queue_rearm_failures_total)"
-            )
-            self._discard_owned_sweep_conn()
-            raise
-        # Delayed-visibility delivery (UN-3843): promote due 'scheduled' rows so
-        # consumers can claim them. Placed with the re-arm sweep because it shares
-        # its cadence requirement — this is the DELIVERY path for delayed messages,
-        # so a slower interval would directly add latency to every countdown/eta
-        # dispatch. Same failure posture as the re-arm above (dedicated counter,
-        # re-raise, discard the conn): a stalled promotion sweep means delayed
-        # messages silently never fire, which must not be swallowed.
-        try:
-            promoted = promote_due_scheduled(self._get_sweep_conn())
-            if promoted:
-                self._metrics.queue_promoted.inc(promoted)
-                logger.info(
-                    "Reaper: promoted %s due scheduled queue message(s) to 'ready' "
-                    "(delayed-visibility delivery)",
-                    promoted,
-                )
-        except Exception:
-            self._metrics.queue_promote_failures.inc()
-            logger.exception(
-                "Reaper: promotion sweep failed — delayed (countdown/eta) queue "
-                "messages will not become claimable this tick "
-                "(see pg_reaper_queue_promote_failures_total)"
-            )
-            self._discard_owned_sweep_conn()
-            raise
-        # Orchestrator's second job: fire due PG-owned schedules (Beat
-        # replacement). Ordered AFTER recovery so this cycle's recovery has
-        # already completed before any scheduler error can propagate (the except
-        # below still re-raises + discards the conn). Dark by default — fires
-        # nothing until rows are pg_owned.
-        try:
-            dispatch_due_schedules(self._get_sweep_conn())
-        except Exception:
-            self._discard_owned_sweep_conn()
-            raise
-        # ...and the non-pipeline periodics (UN-3796): dashboard_metrics.*,
-        # log-history, audit, anything an operator adds. Separate call because each
-        # row carries its own task/args/queue rather than the pipeline trigger's one
-        # fixed shape; same leader gating, same dark-by-default posture (nothing
-        # fires until a row is pg_owned). Ordered after the pipeline dispatch so a
-        # fault here cannot stop pipelines, which are the customer-visible ones.
-        try:
-            dispatch_due_periodic_tasks(self._get_sweep_conn())
-        except Exception:
-            self._discard_owned_sweep_conn()
-            raise
-        # Orchestrator's third job: retention cleanup (cadence-gated, so it does
-        # NOT run every tick). Last so a sweep error can't skip recovery/schedules.
-        self._maybe_sweep()
-        # Queue-wide metrics snapshot (cadence-gated, best-effort — a metrics
-        # failure must never fail the tick). After all real work.
-        self._maybe_refresh_gauges()
-        return TickOutcome(was_leader=True, reclaimed=reclaimed)
 
     def _maybe_sweep(self) -> None:
         """Run the retention sweep at most once per ``_sweep_interval``.
@@ -1614,19 +1641,26 @@ _DEFAULT_HEALTH_STALE_SECONDS = 30.0
 class ReaperLivenessServer(_BaseLivenessServer):
     """Reaper tick-loop liveness — a thin wrapper over the shared
     :class:`queue_backend.pg_queue.liveness.LivenessServer`, bound to the reaper's
-    heartbeat (``seconds_since_last_tick``) and surfacing ``is_leader`` (which pod
-    holds the lease — informational; the 200/503 verdict is purely the heartbeat,
-    so a standby is healthy).
+    dependency heartbeat (``seconds_since_dependency_progress``) and surfacing
+    ``is_leader`` (which pod holds the lease — informational; the 200/503 verdict
+    is based on completed lease/recovery progress, so a standby is healthy after a
+    successful lease operation).
     """
 
     def __init__(self, reaper: PgReaper, *, port: int, stale_after: float) -> None:
         super().__init__(
-            freshness_fn=reaper.seconds_since_last_tick,
+            freshness_fn=reaper.seconds_since_dependency_progress,
             stale_after=stale_after,
             port=port,
             check_name="pg_reaper_tick",
-            age_key="seconds_since_last_tick",
-            extra_status_fn=lambda: {"is_leader": reaper.is_leader},
+            age_key="seconds_since_dependency_progress",
+            extra_status_fn=lambda: {
+                "is_leader": reaper.is_leader,
+                "seconds_since_last_tick": round(
+                    reaper.seconds_since_last_tick(), 3
+                ),
+                **reaper.dependency_health_status(),
+            },
             metrics_fn=reaper.metrics.render,
             thread_name="pg-reaper-liveness",
             log_label="pg-queue reaper",
@@ -1643,9 +1677,10 @@ def _reaper_health_stale_from_env() -> float:
         raise ValueError(
             f"WORKER_PG_REAPER_HEALTH_STALE_SECONDS={raw!r} is not a number."
         ) from exc
-    if value <= 0:
+    if not math.isfinite(value) or value <= 0:
         raise ValueError(
-            f"WORKER_PG_REAPER_HEALTH_STALE_SECONDS={value} must be positive."
+            "WORKER_PG_REAPER_HEALTH_STALE_SECONDS="
+            f"{value} must be finite and positive."
         )
     return value
 

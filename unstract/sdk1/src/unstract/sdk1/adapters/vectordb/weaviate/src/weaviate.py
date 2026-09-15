@@ -1,5 +1,6 @@
 import logging
 import os
+from urllib.parse import urlparse
 
 import weaviate
 from llama_index.core.vector_stores.types import BasePydanticVectorStore
@@ -58,6 +59,39 @@ class Weaviate(VectorDBAdapter):
     def get_vector_db_instance(self) -> BasePydanticVectorStore:
         return self._vector_db_instance
 
+    def _connect(self) -> weaviate.Client:
+        """Connect to either a local Weaviate server or Weaviate Cloud.
+
+        The adapter historically used the cloud connector for every URL. Local
+        Docker deployments use a different gRPC endpoint and can be reached
+        without a cloud cluster URL, so route plain HTTP URLs through
+        ``connect_to_local`` while preserving the existing HTTPS cloud path.
+        """
+        configured_url = str(self._config.get(Constants.URL, "")).strip()
+        if not configured_url:
+            raise ValueError("Weaviate URL is required")
+
+        api_key = str(self._config.get(Constants.API_KEY) or "").strip()
+        auth_credentials = Auth.api_key(api_key) if api_key else None
+        parsed_url = urlparse(
+            configured_url if "://" in configured_url else f"https://{configured_url}"
+        )
+
+        if parsed_url.scheme == "http":
+            if parsed_url.hostname is None:
+                raise ValueError("Weaviate URL must include a hostname")
+            return weaviate.connect_to_local(
+                host=parsed_url.hostname,
+                port=parsed_url.port or 8080,
+                grpc_port=50051,
+                auth_credentials=auth_credentials,
+            )
+
+        return weaviate.connect_to_weaviate_cloud(
+            cluster_url=configured_url,
+            auth_credentials=auth_credentials,
+        )
+
     def _get_vector_db_instance(self) -> BasePydanticVectorStore:
         try:
             collection_name = VectorDBHelper.get_collection_name(
@@ -68,10 +102,7 @@ class Weaviate(VectorDBAdapter):
             # LLama-index throws the error if not capitalised while using
             # Weaviate
             self._collection_name = collection_name.capitalize()
-            self._client = weaviate.connect_to_weaviate_cloud(
-                cluster_url=str(self._config.get(Constants.URL)),
-                auth_credentials=Auth.api_key(str(self._config.get(Constants.API_KEY))),
-            )
+            self._client = self._connect()
 
             try:
                 # Class definition object. Weaviate's autoschema

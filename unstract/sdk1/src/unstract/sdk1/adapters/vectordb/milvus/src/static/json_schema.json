@@ -1,5 +1,6 @@
 {
   "title": "Milvus Vector DB",
+  "description": "Local Docker defaults are pre-filled for the bundled Milvus service. Replace them when connecting to Zilliz Cloud or another Milvus server.",
   "type": "object",
   "required": [
     "adapter_name",
@@ -9,15 +10,15 @@
     "adapter_name": {
       "type": "string",
       "title": "Name",
-      "default": "",
+      "default": "milvus-local",
       "description": "Provide a unique name for this adapter instance. Example: milvus-vdb-1"
     },
     "uri": {
       "type": "string",
       "title": "URI",
       "format": "uri",
-      "default": "localhost:19530",
-      "description": "Provide the URI of the Milvus server. Example: `https://<instance-id>.api.gcp-us-west1.zillizcloud.com`"
+      "default": "http://milvus:19530",
+      "description": "Provide the URI of the Milvus server. Local Docker: http://milvus:19530. Cloud example: `https://<instance-id>.api.gcp-us-west1.zillizcloud.com`"
     },
     "token": {
       "type": "string",

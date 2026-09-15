@@ -47,8 +47,8 @@ def check_log_consumer_health():
         return HealthCheckResult(
             name="log_consumer_health",
             status=HealthStatus.DEGRADED,
-            message=f"Health check failed: {e}",
-            details={"error": str(e)},
+            message="Log consumer health check failed",
+            details={"error": type(e).__name__},
         )
 
 

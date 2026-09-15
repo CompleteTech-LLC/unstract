@@ -535,8 +535,8 @@ class TestReaperTickWiring:
         ) == pytest.approx(1.0)
 
     def test_run_counts_tick_failures(self):
-        # The heartbeat is stamped at tick START, so /health stays 200 through
-        # every-tick failures — this counter is the only machine-readable signal.
+        # Tick failures remain counted separately from the dependency-aware
+        # heartbeat, which now makes both /health and /metrics stale.
         reaper = self._reaper(_FakeLease(acquires=True))
         with patch.object(
             reaper_mod,
