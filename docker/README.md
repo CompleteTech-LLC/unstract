@@ -191,7 +191,9 @@ python3 docker/benchmarks/embedding_benchmark.py --mode both \
 
 The harness waits for health, warms each endpoint, measures single-request
 and batch latency/throughput, checks the expected dimensions, and reports
-fixture retrieval metrics. Replace
+fixture retrieval metrics. Embeddings are matched to input texts using each
+response item's OpenAI-compatible `index`; missing, repeated, or invalid indices
+fail the endpoint instead of silently corrupting retrieval scores. Replace
 docker/benchmarks/qwen3_smoke_dataset.json with a representative corpus and
 labeled queries before using quality scores to select a production model.
 When `--mode both` is used, the JSON report also contains one comparison per
