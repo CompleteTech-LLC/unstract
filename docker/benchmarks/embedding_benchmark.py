@@ -117,12 +117,20 @@ def embed(
         raise ValueError(
             f"expected {len(texts)} embeddings from {base_url}, got {data!r}"
         )
-    vectors: list[list[float]] = []
+    vectors: dict[int, list[float]] = {}
     for item in data:
         if not isinstance(item, dict) or not isinstance(item.get("embedding"), list):
             raise ValueError(f"invalid embedding response from {base_url}")
-        vectors.append(item["embedding"])
-    return vectors
+        index = item.get("index")
+        if (
+            not isinstance(index, int)
+            or isinstance(index, bool)
+            or not 0 <= index < len(texts)
+            or index in vectors
+        ):
+            raise ValueError(f"invalid or duplicate embedding index from {base_url}")
+        vectors[index] = item["embedding"]
+    return [vectors[index] for index in range(len(texts))]
 
 
 def embed_in_batches(
